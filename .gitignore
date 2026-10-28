@@ -1,0 +1,16 @@
+node_modules/
+.next/
+out/
+next-env.d.ts
+.claude/
+.env
+.env*.local
+!.env.example
+*.log
+__pycache__/
+.pytest_cache/
+.venv/
+test-results/
+playwright-report/
+spike-output/
+.DS_Store
