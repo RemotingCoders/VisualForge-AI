@@ -1,6 +1,6 @@
 # AI Integration — Phase 0 status
 
-**Status: 🟡 APPROVED by Damian 2026-10-28 (max 6 paid calls, report cost of each). Providers IMPLEMENTED from the official docs he pasted 2026-10-28 (`/docs/sam/segmenting`, `/docs/sam/reading-segmentation`, `/docs/structured-output`, saved in `~/Documents/metadocs`). Spike NOT yet executed: per his order, Vitest + pytest + Playwright must pass and phases be committed first. Zero paid calls made so far.**
+**Status: ✅ SPIKE COMPLETE 2026-10-29 — 5/6 paid calls used (1 reserve unspent). Full loop validated end-to-end: SAM segment → Spark plan → Muse crop edit → feathered composite → pixel-diff measurement → Spark verify. Full-image editing REJECTED with evidence (regenerates the scene). Tests green (Vitest 17/17, pytest 2/2, Playwright 1/1). Next: wire the real providers into the async job pipeline (AI_PROVIDER=meta) behind the same limits.**
 
 ## Verified API reference (dev.meta.ai/docs, pasted by Damian 2026-10-28)
 - **Base URL:** `https://api.meta.ai/v1` · **Auth:** `Authorization: Bearer $MODEL_API_KEY` (key set by Damian in `.env.local`, never via chat)
@@ -11,17 +11,19 @@
 - **SAM mask → raster:** `decodeMaskToRaster` exists ONLY in the official client libraries (`@meta-sam/parser` ≥ 0.0.13 / `meta-sam-parser` ≥ 0.0.6; details on `/docs/sam/client-libraries`, **not yet pasted**). Our `decodeMaskToRaster` stays a loud stub — the pipeline does not need it: real masks/bboxes are measured from pixel diff, SAM boxes seed the crop.
 - **Muse Spark structured output:** Responses API → `text:{format:{type:"json_schema", name, schema, strict:true}}` (Chat Completions uses `response_format` instead; a parameter from the other endpoint does not configure it). Result is a JSON string in `output_text`. Schemas must satisfy the strict subset: root object, `additionalProperties:false`, `required` lists every property, no recursion, depth ≤ 10. Implemented: `sparkStructured` + `SPARK_SCHEMAS` in [providers.ts](../src/lib/engine/providers.ts) (moderation / concepts / plan / verification).
 - **Muse Spark scene → SAM workflow (per docs):** Spark lists segmentable concepts → SAM segments each concept. Implemented in `MetaProvider.segment` (max 8 concepts).
-- **Still unverified (not guessed):** Muse Image *generation* request shape (scene generation stays `MetaNotConfiguredError`); Muse Image edit *response* shape (spike step 3/4 saves the raw response); Spark image parts use the verified Responses `input_image` shape.
+- **Still unverified (not guessed):** Muse Image *generation* request shape (scene generation stays `MetaNotConfiguredError`); Spark image parts use the verified Responses `input_image` shape. ~~Muse Image edit response shape~~ → verified call 3/6: `data[0].b64_json`, 1600×1600 WebP output.
 
 ## Spike plan (ledger-enforced, [scripts/meta-spike.mjs](../scripts/meta-spike.mjs) + `spike-ledger.json`, one step per run)
 | # | Call | Purpose | Cost |
 |---|------|---------|------|
-| 1 | SAM 3.1 segment (`--step=1 --concept=...`) | regions + masks on 1 test image | _after run_ |
-| 2 | Muse Spark JSON plan (`--step=2`) | structured plan reusing step-1 boxes | _after run_ |
-| 3 | Muse Image edit crop (`--step=3`) | masked-region strategy validation | _after run_ |
-| 4 | Muse Image edit full image (`--step=4`) | does it respect untouched pixels? compare | _after run_ |
-| 5 | Muse Spark verify (`--step=5`) | original vs edited per region | _after run_ |
-| 6 | reserve | one retry only | — |
+| 1 | SAM 3.1 segment (`--step=1 --concept=...`) | regions + masks on 1 test image | **DONE 2026-10-29: HTTP 200 · 2657 ms · usage=null (API returns none) · $ = see Meta dashboard.** 9 objects for "pink flower" on 554×554 test.jpeg; main flower box (174,78)-(537,404) c=0.922. Mask payload alphabet = 85 custom chars (excludes grammar delimiters) → decoding only via official `@meta-sam/parser`; not needed (pixel-diff measurement). |
+| 2 | Muse Spark JSON plan (`--step=2`) | structured plan reusing step-1 boxes | **DONE 2026-10-29: HTTP 200 · 7078 ms · usage 637 in / 1789 out (1511 reasoning) = 2426 tokens · $ = see dashboard.** 3 changes planned; 2/3 regions grounded correctly (Spark misassigned the "yellow disk" change to a wrong box → verifier step is justified). ⚠️ Raw REST has NO top-level `output_text`: JSON lives in `output[].content[].text` — `sparkStructured` fixed + test updated to the real shape. |
+| 3 | Muse Image edit crop (`--step=3`) | masked-region strategy validation | **DONE 2026-10-29: HTTP 200 · 17486 ms · usage 26273 in / 1527 out = 27800 tokens · $ = see dashboard.** ✅ Strategy VALIDATED: blurred magenta flower fully removed, bokeh fill realistic; composited back with feathered SAM-box mask, rest pixel-identical; measured diff bbox (27,11,115×126) vs SAM box (32,15)-(139,133). Response shape: `{created, data:[{b64_json}], output_format, background, usage}` — returned **1600×1600 WebP** regardless of crop size → worker resizes edited crop back before compositing. |
+| 4 | Muse Image edit full image (`--step=4`) | does it respect untouched pixels? compare | **DONE 2026-10-29: HTTP 200 · 13924 ms · usage 17815 in / 833 out = 18648 tokens · $ = see dashboard.** ❌ Full edit does NOT respect untouched regions: target flower removed but whole scene regenerated (main flower shifted/redrawn, **9.0% of pixels changed OUTSIDE the target region** after resize-back; diff is global, not localizable). → Crop+composite (step 3) is the required strategy; full edit is unusable for verified differences. |
+| 5 | Muse Spark verify (`--step=5`) | original vs edited per region | **DONE 2026-10-29: HTTP 200 · 8438 ms · usage 771 in / 1237 out (1171 reasoning) = 2008 tokens · $ = see dashboard.** ✅ `{"ok": true, "notes": "Top-left blurred magenta flower is fully removed... No halos, remnants, or spillover outside target region."}` Verifier is accurate against the measured change. |
+| 6 | reserve | one retry only | **UNUSED** — 5/6 calls spent, 1 kept in reserve |
+
+**Spike totals:** 49,583 ms across 5 calls · tokens: SAM usage=null; 2,426 (plan) + 27,800 (crop edit) + 18,648 (full edit, research-only) + 2,008 (verify) = **50,882 tokens** (excl. SAM). Dollar cost is NOT returned by the API — read it in the Meta dashboard. **Production per-level recipe** (from these measurements): 1 Spark concepts + N SAM segmentations + 1 Spark plan + 1 Muse edit + 1 Spark verify per change; endpoint latencies ~3–17 s per call, so levels must generate as async jobs (as designed). Muse Image always returns 1600×1600 WebP; inputs sent as data URLs.
 
 Note: if the API does not return dollar cost, each call's latency/usage is logged and the $ figure must be read from the Meta dashboard — reported, never invented. Step 1 saves the raw SSE (`spike-output/sam-raw.txt`) so mask-decoding experiments offline are free.
 

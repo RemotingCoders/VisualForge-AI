@@ -19,20 +19,26 @@ TOKEN = re.compile(r"<\|mask;x=0;y=0(?:;c=[\d.]+)?;data=(\d+),(\d+),([~!])([^|]*
 
 
 def candidates(payload: str, h: int, w: int):
-    try:
-        raw = base64.b85decode(payload)
-    except Exception as e:  # noqa: BLE001
-        print(f"  b85decode failed: {e}")
-        return
-    yield "one_bit: b85 -> bits MSB-first", [(byte >> (7 - i)) & 1 for byte in raw for i in range(8)]
-    yield "one_bit: b85 -> bits LSB-first", [(byte >> i) & 1 for byte in raw for i in range(8)]
-    for name, blob in (("zlib", None),):
+    raw = None
+    for name, fn in (("b85decode", lambda: base64.b85decode(payload)), ("a85decode", lambda: base64.a85decode(payload, adobe=False))):
         try:
-            dec = zlib.decompress(raw)
-            yield f"lossless: b85 -> {name} -> bytes as bits MSB", [(b >> (7 - i)) & 1 for b in dec for i in range(8)]
-            yield f"lossless: b85 -> {name} -> bytes 0/1", [1 if b else 0 for b in dec]
+            raw = fn()
+            print(f"  {name}: {len(raw)} bytes")
+            break
         except Exception as e:  # noqa: BLE001
-            print(f"  {name} decompress failed: {e}")
+            print(f"  {name} failed: {e}")
+    if raw is None:
+        return
+    yield "bytes -> bits MSB-first", [(byte >> (7 - i)) & 1 for byte in raw for i in range(8)]
+    yield "bytes -> bits LSB-first", [(byte >> i) & 1 for byte in raw for i in range(8)]
+    for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+        try:
+            dec = zlib.decompress(raw, wbits)
+            print(f"  zlib(wbits={wbits}): {len(dec)} bytes")
+            yield f"zlib({wbits}) -> bits MSB-first", [(b >> (7 - i)) & 1 for b in dec for i in range(8)]
+            yield f"zlib({wbits}) -> bytes 0/1", [1 if b else 0 for b in dec]
+        except Exception as e:  # noqa: BLE001
+            print(f"  zlib(wbits={wbits}) failed: {e}")
 
 
 def main() -> int:

@@ -76,10 +76,11 @@ describe('Meta verified shapes (no paid calls)', () => {
     expect(seen.init.headers.Authorization).toBe('Bearer test-key');
     expect(out).toHaveLength(1); expect(out[0].bbox).toEqual({ x: 10, y: 20, width: 100, height: 50 });
   });
-  it('Spark structured output uses text.format (Responses) and parses output_text JSON', async () => {
+  it('Spark structured output uses text.format (Responses) and parses the real REST shape', async () => {
     const { sparkStructured, SPARK_SCHEMAS } = await import('../src/lib/engine/providers');
     let seen: any;
-    const fakeFetch = async (url: string, init: any) => { seen = { url, init }; return { ok: true, json: async () => ({ output_text: '{"ok":true,"reason":"safe"}' }) }; };
+    // Real REST shape (spike call 2/6): NO top-level output_text — JSON is in output[].content[].text
+    const fakeFetch = async (url: string, init: any) => { seen = { url, init }; return { ok: true, json: async () => ({ output: [{ type: 'reasoning' }, { type: 'message', content: [{ type: 'output_text', text: '{"ok":true,"reason":"safe"}' }] }] }) }; };
     const out = await sparkStructured<{ ok: boolean; reason: string }>({ prompt: 'check', images: ['data:image/png;base64,AA'], schemaName: 'Moderation', schema: SPARK_SCHEMAS.moderation, env: { META_REAL_CALLS_ENABLED: 'true', MODEL_API_KEY: 'test-key' }, fetchFn: fakeFetch as any });
     expect(out).toEqual({ ok: true, reason: 'safe' });
     const body = JSON.parse(seen.init.body);
@@ -94,6 +95,11 @@ describe('Meta verified shapes (no paid calls)', () => {
     expect(seen.url).toBe('https://api.meta.ai/v1/images/edits');
     expect(JSON.parse(seen.init.body)).toEqual({ model: 'muse-image-1.0', prompt: 'make it red', images: [{ image_url: 'data:image/png;base64,AA' }], n: 1 });
     expect(seen.init.headers.Authorization).toBe('Bearer test-key');
+  });
+  it('extracts the edited image from the verified b64_json response (spike 3/6)', async () => {
+    const { extractEditedImage } = await import('../src/lib/engine/providers');
+    expect(extractEditedImage({ data: [{ b64_json: 'QUJD' }], output_format: 'webp' })).toBe('data:image/webp;base64,QUJD');
+    expect(() => extractEditedImage({ data: [] })).toThrow();
   });
 });
 describe('COCO/YOLO export', () => {

@@ -1,0 +1,87 @@
+{
+  "calls": [
+    {
+      "n": 1,
+      "step": 1,
+      "label": "SAM 3.1 segment",
+      "path": "/responses",
+      "http": 200,
+      "latency_ms": 2657,
+      "usage": null,
+      "dollar_cost": "NOT RETURNED BY API — check Meta dashboard",
+      "at": "2026-10-29T07:05:47.913Z"
+    },
+    {
+      "n": 2,
+      "step": 2,
+      "label": "Muse Spark structured plan",
+      "path": "/responses",
+      "http": 200,
+      "latency_ms": 7078,
+      "usage": {
+        "input_tokens": 637,
+        "input_tokens_details": {
+          "cached_tokens": 0
+        },
+        "output_tokens": 1789,
+        "output_tokens_details": {
+          "reasoning_tokens": 1511
+        },
+        "total_tokens": 2426
+      },
+      "dollar_cost": "NOT RETURNED BY API — check Meta dashboard",
+      "at": "2026-10-29T07:08:53.499Z"
+    },
+    {
+      "n": 3,
+      "step": 3,
+      "label": "Muse Image edit CROP",
+      "path": "/images/edits",
+      "http": 200,
+      "latency_ms": 17486,
+      "usage": {
+        "input_tokens": 26273,
+        "output_tokens": 1527,
+        "total_tokens": 27800
+      },
+      "dollar_cost": "NOT RETURNED BY API — check Meta dashboard",
+      "at": "2026-10-29T07:12:33.313Z"
+    },
+    {
+      "n": 4,
+      "step": 4,
+      "label": "Muse Image edit FULL image",
+      "path": "/images/edits",
+      "http": 200,
+      "latency_ms": 13924,
+      "usage": {
+        "input_tokens": 17815,
+        "output_tokens": 833,
+        "total_tokens": 18648
+      },
+      "dollar_cost": "NOT RETURNED BY API — check Meta dashboard",
+      "at": "2026-10-29T07:15:54.013Z"
+    },
+    {
+      "n": 5,
+      "step": 5,
+      "label": "Muse Spark verify",
+      "path": "/responses",
+      "http": 200,
+      "latency_ms": 8438,
+      "usage": {
+        "input_tokens": 771,
+        "input_tokens_details": {
+          "cached_tokens": 0
+        },
+        "output_tokens": 1237,
+        "output_tokens_details": {
+          "reasoning_tokens": 1171
+        },
+        "total_tokens": 2008
+      },
+      "dollar_cost": "NOT RETURNED BY API — check Meta dashboard",
+      "at": "2026-10-29T07:17:39.426Z"
+    }
+  ]
+}

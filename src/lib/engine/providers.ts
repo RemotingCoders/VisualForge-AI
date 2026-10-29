@@ -17,9 +17,18 @@ export async function metaPost(path: string, body: unknown, env: Record<string, 
   return res.json();
 }
 
-/** Real Muse Image edit — VERIFIED shape: POST /v1/images/edits {model, prompt, images:[{image_url:"data:..."}], n}. No mask param in docs (crop+composite strategy in pipeline). */
+/** Real Muse Image edit — VERIFIED shape: POST /images/edits {model, prompt, images:[{image_url:"data:..."}], n}. No mask param in docs (crop+composite strategy in pipeline). */
 export async function museImageEdit(dataUrl: string, prompt: string, n = 1, env: Record<string, string | undefined> = process.env, fetchFn: FetchFn = fetch): Promise<unknown> {
   return metaPost(META_ENDPOINTS.imageEdits, { model: META_MODELS.image, prompt, images: [{ image_url: dataUrl }], n }, env, fetchFn);
+}
+
+/** Edit response VERIFIED in spike call 3/6 (2026-10-29): {created, data:[{b64_json}], output_format:"webp", background, usage}.
+ *  Output came back 1600x1600 WebP regardless of input crop — caller resizes back before compositing. */
+export function extractEditedImage(res: unknown): string {
+  const r = res as { data?: { b64_json?: string }[]; output_format?: string };
+  const b64 = r?.data?.[0]?.b64_json;
+  if (!b64) throw new Error('Muse Image: no data[0].b64_json in edit response');
+  return `data:image/${r.output_format ?? 'webp'};base64,${b64}`;
 }
 
 /**
@@ -87,8 +96,9 @@ export const SPARK_SCHEMAS = {
 
 /**
  * Muse Spark structured output — VERIFIED (https://dev.meta.ai/docs/structured-output):
- * Responses API uses `text.format` (NOT `response_format`); result is a JSON string in `output_text`.
- * Image parts use the verified Responses shape ({type:"input_image", image_url}) from the SAM docs.
+ * Responses API uses `text.format` (NOT `response_format`). In the RAW REST response there is
+ * NO top-level `output_text` (the SDK adds it): the JSON string lives in
+ * output[] -> {type:"message"} -> content[] -> {type:"output_text", text} (spike call 2/6, 2026-10-29).
  */
 export async function sparkStructured<T>(opts: {
   prompt: string; images?: string[]; schemaName: string; schema: object;
@@ -101,9 +111,14 @@ export async function sparkStructured<T>(opts: {
     model: META_MODELS.spark,
     input: [{ type: 'message', role: 'user', content }],
     text: { format: { type: 'json_schema', name: opts.schemaName, schema: opts.schema, strict: true } },
-  }, env, opts.fetchFn ?? fetch) as { output_text?: string };
-  if (!res?.output_text) throw new Error('Muse Spark: no output_text in Responses result');
-  return JSON.parse(res.output_text) as T;
+  }, env, opts.fetchFn ?? fetch) as {
+    output_text?: string;
+    output?: { type?: string; content?: { type?: string; text?: string }[] }[];
+  };
+  const text = res?.output_text
+    ?? res?.output?.find(o => o.type === 'message')?.content?.find(c => c.type === 'output_text')?.text;
+  if (!text) throw new Error('Muse Spark: no output_text in Responses result');
+  return JSON.parse(text) as T;
 }
 
 class MetaProvider implements Providers['segmentation'], Providers['vision'], Providers['imageEdit'] {
@@ -149,10 +164,9 @@ class MetaProvider implements Providers['segmentation'], Providers['vision'], Pr
     });
   }
   async editMaskedRegion(imageRef: string, _r: Region, prompt: string): Promise<string> {
-    // Crop+margin -> edit crop -> feathered composite happens in the worker (worker/composite.py);
-    // the verified Muse Image call itself has no mask parameter. Response shape is spike-verified.
-    await museImageEdit(imageRef, prompt);
-    return imageRef;
+    // Crop+margin -> edit crop -> resize back -> feathered composite happens in the worker (worker/composite.py);
+    // the verified Muse Image call itself has no mask parameter and returns 1600x1600 WebP (spike 3/6).
+    return extractEditedImage(await museImageEdit(imageRef, prompt));
   }
   async generateScene(_theme: string): Promise<string> {
     assertMetaConfigured();
