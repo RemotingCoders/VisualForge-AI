@@ -115,7 +115,7 @@ export async function loadLevelPayload(levelId: string) {
     const { count } = await sb.from('visualforge_differences').select('id', { count: 'exact', head: true }).eq('level_id', levelId);
     return {
       levelId, original: publicStorageUrl(orig.storage_path), modified: publicStorageUrl(mod.storage_path),
-      width: orig.width, height: orig.height, total: count ?? 0, isMock: level.is_mock,
+      width: orig.width, height: orig.height, total: count ?? 0, isMock: level.is_mock, mode: level.mode as Mode,
     };
   } catch (e) { console.error('[db] loadLevelPayload failed:', e); return null; }
 }

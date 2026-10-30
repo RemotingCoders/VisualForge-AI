@@ -13,3 +13,36 @@ export function toYOLO(bbox: BBox, imgW: number, imgH: number, classId: number):
   const cx = (bbox.x + bbox.width / 2) / imgW, cy = (bbox.y + bbox.height / 2) / imgH;
   return `${classId} ${cx.toFixed(6)} ${cy.toFixed(6)} ${(bbox.width / imgW).toFixed(6)} ${(bbox.height / imgH).toFixed(6)}`;
 }
+
+export const QC_DEFECT_CATEGORIES = ['scratch', 'crack', 'dent', 'missing component', 'corrosion', 'misalignment', 'wrong color', 'foreign object'];
+
+/** Category table for a set of differences: known QC defects first (stable ids), then any extras. */
+export function qcCategories(diffs: { type: string }[]): { id: number; name: string }[] {
+  const names = [...QC_DEFECT_CATEGORIES];
+  for (const d of diffs) if (!names.includes(d.type)) names.push(d.type);
+  return names.map((name, i) => ({ id: i + 1, name }));
+}
+
+type ExportableDiff = { type: string; bbox: BBox; verification_status: string };
+
+/**
+ * QC dataset from a REAL generated level. Only `verified` differences are exported, and the
+ * bbox is the MEASURED defect bbox (from the pixel-diff mask), never the edit crop box.
+ */
+export function buildQCCoco(diffs: ExportableDiff[], width: number, height: number, fileName: string) {
+  const verified = diffs.filter(d => d.verification_status === 'verified');
+  const categories = qcCategories(verified);
+  const catId = new Map(categories.map(c => [c.name, c.id]));
+  return toCOCO(
+    [{ id: 1, file_name: fileName, width, height }],
+    verified.map(d => ({ imageId: 1, categoryId: catId.get(d.type)!, bbox: d.bbox })),
+    categories,
+  );
+}
+
+export function buildQCYolo(diffs: ExportableDiff[], width: number, height: number): string {
+  const verified = diffs.filter(d => d.verification_status === 'verified');
+  const categories = qcCategories(verified);
+  const classIdx = new Map(categories.map((c, i) => [c.name, i])); // YOLO classes are 0-based
+  return verified.map(d => toYOLO(d.bbox, width, height, classIdx.get(d.type)!)).join('\n');
+}

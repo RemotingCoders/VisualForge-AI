@@ -5,6 +5,7 @@ import { maskToBBox, maskCentroid } from '../src/lib/engine/geometry';
 import { createJob, getJob, runGeneration } from '../src/lib/server/jobs';
 import { getDifferences, getLevelPayload } from '../src/lib/serverStore';
 import type { Providers } from '../src/lib/engine/types';
+import { buildQCCoco, buildQCYolo } from '../src/lib/coco';
 
 const solidPng = async (w: number, h: number, rgb: [number, number, number]) =>
   bufferToDataUrl(await sharp({ create: { width: w, height: h, channels: 3, background: { r: rgb[0], g: rgb[1], b: rgb[2] } } }).png().toBuffer());
@@ -60,6 +61,27 @@ describe('recolorCrop (deterministic color change)', () => {
     const [r, g, b] = at(0);
     expect(g).toBeGreaterThan(r); // red rotated +120deg -> green-dominant
     expect([r, g, b]).not.toEqual([220, 30, 30]);
+  });
+});
+
+describe('G: QC dataset export (measured defect bbox, verified only)', () => {
+  const diffs = [
+    { type: 'scratch', bbox: { x: 10, y: 10, width: 5, height: 2 }, verification_status: 'verified' },
+    { type: 'crack', bbox: { x: 50, y: 50, width: 9, height: 9 }, verification_status: 'needs_review' },
+    { type: 'dent', bbox: { x: 20, y: 30, width: 7, height: 7 }, verification_status: 'verified' },
+  ];
+  it('COCO contains only verified defects with their measured bboxes', () => {
+    const coco = buildQCCoco(diffs, 400, 300, 'unit-modified.png');
+    expect(coco.annotations).toHaveLength(2);
+    expect(coco.annotations[0].bbox).toEqual([10, 10, 5, 2]);
+    expect(coco.categories.map(c => c.name)).toContain('scratch');
+    const crackId = coco.categories.find(c => c.name === 'crack')!.id;
+    expect(coco.annotations.some(a => a.category_id === crackId)).toBe(false); // unverified never enters the dataset
+  });
+  it('YOLO lines match the same verified-only set', () => {
+    const lines = buildQCYolo(diffs, 400, 300).split('\n');
+    expect(lines).toHaveLength(2);
+    expect(lines[0].startsWith('0 ')).toBe(true); // scratch = class 0
   });
 });
 
@@ -266,6 +288,27 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
     expect(editCalls).toBe(2);   // initial edit + exactly one re-edit
     expect(verifyCalls).toBe(2); // verified the NEW edit, not the same one twice
     expect(getDifferences(job.levelId!)![0].verifier_notes).toBe('gone now');
+  });
+
+  it('F: spacing runs on the FINAL paste boxes — overlapping pastes drop the later region', async () => {
+    const fake: Providers = {
+      // bboxes are 8px apart (passes bbox spacing), but paste boxes (+15%) overlap: 34..86 vs 82..134.
+      segmentation: { name: 'fake', isMock: true, segment: async () => [
+        { id: 'r1', bbox: { x: 40, y: 40, width: 40, height: 30 } },
+        { id: 'r2', bbox: { x: 88, y: 40, width: 40, height: 30 } },
+      ] },
+      vision: {
+        name: 'fake', isMock: true,
+        moderate: async () => ({ ok: true, reason: 'ok' }),
+        plan: async (_i, regions) => regions.map(r => ({ id: `c-${r.id}`, regionId: r.id, type: 'change color', description: `change in ${r.id}`, editPrompt: 'edit' })),
+        verify: async () => ({ ok: true, notes: 'ok' }),
+      },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async (imageRef: string, region: { bbox: { x: number; y: number; width: number; height: number } }) => paintPatternBlue(imageRef, region), generateScene: async () => '' },
+    };
+    const job = createJob('game', true);
+    await runGeneration(job, await solidPng(400, 300, [120, 120, 120]), 2, fake);
+    expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
+    expect(getDifferences(job.levelId!)!.map(d => d.id)).toEqual(['c-r1']); // r2 dropped before planning
   });
 
   it('marks the job failed when moderation rejects (no silent fallback)', async () => {

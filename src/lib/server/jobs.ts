@@ -70,7 +70,12 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
       const cx = r.bbox.x + r.bbox.width / 2, cy = r.bbox.y + r.bbox.height / 2;
       return { ...r, bbox: clampBox({ x: cx - w / 2, y: cy - h / 2, width: w, height: h }, width, height), wholeObject: false };
     };
-    const regions = enforceSpacing(rawRegions.map(capRegion));
+    // F: spacing is enforced on the FINAL PASTE boxes (object + 15% margin), not the raw
+    // bboxes — expanded paste boxes can overlap even when bboxes don't, and a later paste
+    // would re-cover part of an earlier change. (This is also what makes future parallel
+    // edits safe.) Context boxes may overlap freely: they are read-only input to Muse.
+    const capped = rawRegions.map(capRegion);
+    const regions = enforceSpacing(capped.map(r => ({ region: r, bbox: expandBox(r.bbox, 0.15, width, height) }))).map(x => x.region);
     if (!regions.length) throw new Error('segmentation found no usable regions');
 
     setStage('planning');
