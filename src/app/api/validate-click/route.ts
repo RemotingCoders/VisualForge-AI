@@ -10,5 +10,5 @@ export async function POST(req: Request) {
   const hit = diffs.find(d => !(foundIds as string[]).includes(d.id) && clickHits({ x, y }, d.bbox, 16));
   if (!hit) return NextResponse.json({ hit: false });
   // Reveal ONLY the found difference, after validation.
-  return NextResponse.json({ hit: true, difference: { id: hit.id, description: hit.description, bbox: hit.bbox } });
+  return NextResponse.json({ hit: true, difference: { id: hit.id, description: hit.description, bbox: hit.bbox, centroid: hit.centroid ?? null } });
 }

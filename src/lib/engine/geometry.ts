@@ -30,6 +30,15 @@ export function enforceSpacing<T extends { bbox: BBox }>(items: T[], pad = 8): T
   return kept;
 }
 
+/** Center of mass of a boolean diff mask — where the change visually IS (bbox center can
+ *  fall outside an irregular change). Used to center the found-marker circle. */
+export function maskCentroid(mask: Uint8Array | boolean[], w: number, h: number): { x: number; y: number } | null {
+  if (mask.length !== w * h) throw new Error(`mask size ${mask.length} != ${w}x${h}`);
+  let sx = 0, sy = 0, n = 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (mask[y * w + x]) { sx += x; sy += y; n++; }
+  return n ? { x: sx / n, y: sy / n } : null;
+}
+
 /** Click hit-test against the REAL bbox, expanded by tolerance (pixels). */
 export function clickHits(click: { x: number; y: number }, bbox: BBox, tolerance = 14): boolean {
   return click.x >= bbox.x - tolerance && click.x <= bbox.x + bbox.width + tolerance &&

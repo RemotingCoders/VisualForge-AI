@@ -1,4 +1,4 @@
-import { enforceSpacing, maskToBBox, normalizeBBox } from '../engine/geometry';
+import { enforceSpacing, maskToBBox, maskCentroid, normalizeBBox } from '../engine/geometry';
 import type { Providers, Mode, Difference, Region } from '../engine/types';
 import { normalizeImage, cropDataUrl, expandBox, compositeCrop, diffMask, providerImage, clampBox } from './imageOps';
 import { saveImageLevel } from '../serverStore';
@@ -97,6 +97,7 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
       if (!verdict.ok) verdict = await providers.vision.verify(aiImg, vMod, ch, bbox); // retry ONCE
       differences.push({
         id: ch.id, type: ch.type, description: ch.description, bbox, bbox_normalized: normalizeBBox(bbox, width, height),
+        centroid: maskCentroid(mask, width, height) ?? { x: bbox.x + bbox.width / 2, y: bbox.y + bbox.height / 2 },
         mask_url: null, severity: ch.severity ?? 'medium',
         verification_status: verdict.ok ? 'verified' : 'needs_review', verifier_notes: verdict.notes,
       });

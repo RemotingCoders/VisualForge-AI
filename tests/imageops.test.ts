@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import sharp from 'sharp';
 import { compositeCrop, diffMask, bufferToDataUrl } from '../src/lib/server/imageOps';
-import { maskToBBox } from '../src/lib/engine/geometry';
+import { maskToBBox, maskCentroid } from '../src/lib/engine/geometry';
 import { createJob, getJob, runGeneration } from '../src/lib/server/jobs';
 import { getDifferences, getLevelPayload } from '../src/lib/serverStore';
 import type { Providers } from '../src/lib/engine/types';
@@ -32,6 +32,15 @@ describe('server imageOps (sharp)', () => {
       .png().toBuffer();
     const mask = await diffMask(a, bufferToDataUrl(bBuf), 30, 20);
     expect(maskToBBox(mask, 30, 20)).toEqual({ x: 7, y: 5, width: 6, height: 4 });
+  });
+});
+
+describe('maskCentroid', () => {
+  it('returns the center of mass, not the bbox center', () => {
+    const mask = new Array<boolean>(25).fill(false);
+    mask[1 * 5 + 0] = true; mask[1 * 5 + 1] = true; mask[1 * 5 + 2] = true; mask[2 * 5 + 0] = true; // L shape in 5x5
+    expect(maskCentroid(mask, 5, 5)).toEqual({ x: 0.75, y: 1.25 });
+    expect(maskCentroid(new Array<boolean>(25).fill(false), 5, 5)).toBeNull();
   });
 });
 

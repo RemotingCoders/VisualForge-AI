@@ -1,10 +1,12 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
+import confetti from 'canvas-confetti';
 import type { Shape } from '@/lib/demoScene';
 import { renderShapes } from '@/lib/demoScene';
 import { scoreGame } from '@/lib/engine/geometry';
+import { playFound, playMiss, playFanfare } from '@/lib/sounds';
 
-type Found = { id: string; description: string; bbox: { x: number; y: number; width: number; height: number } };
+type Found = { id: string; description: string; bbox: { x: number; y: number; width: number; height: number }; centroid?: { x: number; y: number } | null };
 type ImgLevel = { levelId: string; original: string; modified: string; width: number; height: number; total: number; isMock: boolean };
 
 export default function Play() {
@@ -46,7 +48,7 @@ export default function Play() {
 
   const validate = async (x: number, y: number) => {
     const res = await (await fetch('/api/validate-click', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ levelId, x, y, foundIds: found.map(f => f.id) }) })).json();
-    if (res.hit) { setFound(f => [...f, res.difference]); setMsg(`✅ ${res.difference.description}`); } else { setMistakes(m => m + 1); setMsg('❌ Not there — mistake!'); }
+    if (res.hit) { setFound(f => [...f, res.difference]); playFound(); setMsg(`✅ ${res.difference.description}`); } else { setMistakes(m => m + 1); playMiss(); setMsg('❌ Not there — mistake!'); }
   };
   const clickSvg = (e: React.MouseEvent) => {
     if (!svgRef.current || found.length >= total || mistakes >= 5) return;
@@ -60,13 +62,34 @@ export default function Play() {
   };
 
   const done = total > 0 && found.length >= total; const elapsed = Math.round((Date.now() - start) / 1000);
+  const celebrated = useRef(false);
+  useEffect(() => {
+    if (!done || celebrated.current) return;
+    celebrated.current = true;
+    playFanfare();
+    const colors = ['#6366f1', '#22c55e', '#fbbf24', '#06b6d4', '#f472b6'];
+    confetti({ particleCount: 130, spread: 80, origin: { y: 0.6 }, colors });
+    const end = Date.now() + 1100; // side cannons, ~1s of party
+    (function frame() {
+      confetti({ particleCount: 4, angle: 60, spread: 60, startVelocity: 55, origin: { x: 0, y: 0.7 }, colors });
+      confetti({ particleCount: 4, angle: 120, spread: 60, startVelocity: 55, origin: { x: 1, y: 0.7 }, colors });
+      if (Date.now() < end) requestAnimationFrame(frame);
+    })();
+  }, [done]);
+  useEffect(() => { if (!done) celebrated.current = false; }, [done]);
   const Panel = ({ shapes, onClick, marks }: { shapes: Shape[]; onClick?: (e: React.MouseEvent) => void; marks?: Found[] }) => (
-    <svg ref={onClick ? svgRef : undefined} onClick={onClick} viewBox="0 0 400 300" className={`w-full rounded-xl bg-gradient-to-br from-slate-800 to-slate-950 ${onClick ? 'cursor-crosshair' : ''}`} dangerouslySetInnerHTML={{ __html: renderShapes(shapes) + (marks ?? []).map(f => `<ellipse cx="${f.bbox.x + f.bbox.width / 2}" cy="${f.bbox.y + f.bbox.height / 2}" rx="${f.bbox.width / 2}" ry="${f.bbox.height / 2}" fill="none" stroke="#22c55e" stroke-width="3"/>`).join('') }} />);
+    <svg ref={onClick ? svgRef : undefined} onClick={onClick} viewBox="0 0 400 300" className={`w-full rounded-xl bg-gradient-to-br from-slate-800 to-slate-950 ${onClick ? 'cursor-crosshair' : ''}`} dangerouslySetInnerHTML={{ __html: renderShapes(shapes) + (marks ?? []).map(f => `<circle cx="${f.bbox.x + f.bbox.width / 2}" cy="${f.bbox.y + f.bbox.height / 2}" r="${Math.max(f.bbox.width, f.bbox.height) * 0.58}" fill="none" stroke="#22c55e" stroke-width="3"/>`).join('') }} />);
   const ImgPanel = ({ src, clickable }: { src: string; clickable?: boolean }) => (
     <div className="relative w-full">
       {/* eslint-disable-next-line @next/next/no-img-element */}
       <img ref={clickable ? imgRef : undefined} src={src} alt={clickable ? 'Modified — click differences' : 'Original'} onClick={clickable ? clickImg : undefined} className={`w-full rounded-xl ${clickable ? 'cursor-crosshair' : ''}`} />
-      {clickable && img && found.map(f => (<div key={f.id} className="absolute border-[3px] border-green-500 rounded-[50%] pointer-events-none" style={{ left: `${(f.bbox.x / img.width) * 100}%`, top: `${(f.bbox.y / img.height) * 100}%`, width: `${(f.bbox.width / img.width) * 100}%`, height: `${(f.bbox.height / img.height) * 100}%` }} />))}
+      {clickable && img && found.map(f => {
+        // Circle centered on the MEASURED center of the change (centroid), not the bbox corner box.
+        const cx = f.centroid?.x ?? (f.bbox.x + f.bbox.width / 2);
+        const cy = f.centroid?.y ?? (f.bbox.y + f.bbox.height / 2);
+        const d = Math.max(f.bbox.width, f.bbox.height) * 1.15;
+        return (<div key={f.id} className="absolute border-[3px] border-green-500 rounded-full aspect-square pointer-events-none" style={{ left: `${(cx / img.width) * 100}%`, top: `${(cy / img.height) * 100}%`, width: `${(d / img.width) * 100}%`, transform: 'translate(-50%, -50%)' }} />);
+      })}
     </div>);
 
   return (<main className="max-w-6xl mx-auto px-5 py-8">

@@ -10,6 +10,7 @@ export interface PlannedChange {
 export interface Difference {
   id: string; type: string; description: string;
   bbox: BBox; bbox_normalized: BBox; mask_url: string | null;
+  centroid?: { x: number; y: number }; // center of mass of the measured diff — marker circles center here
   severity: 'low' | 'medium' | 'high';
   verification_status: 'verified' | 'needs_review' | 'rejected';
   verifier_notes: string;
