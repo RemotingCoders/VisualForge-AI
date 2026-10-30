@@ -1,6 +1,6 @@
 import { enforceSpacing, maskToBBox, normalizeBBox } from '../engine/geometry';
 import type { Providers, Mode, Difference } from '../engine/types';
-import { normalizeImage, cropDataUrl, expandBox, compositeCrop, diffMask } from './imageOps';
+import { normalizeImage, cropDataUrl, expandBox, compositeCrop, diffMask, providerImage } from './imageOps';
 import { saveImageLevel } from '../serverStore';
 
 export type JobStatus = 'queued' | 'running' | 'done' | 'failed';
@@ -25,24 +25,25 @@ export function createJob(mode: Mode, isMock: boolean): Job {
  * Providers are injected so the whole loop is testable offline with fakes — no paid calls in tests.
  */
 export async function runGeneration(job: Job, imageDataUrl: string, count: number, providers: Providers): Promise<void> {
-  const setStage = (s: string) => { job.stage = s; job.updatedAt = Date.now(); };
+  const setStage = (s: string) => { job.stage = s; job.updatedAt = Date.now(); console.info(`[generate ${job.id}] stage: ${s}`); };
   try {
     job.status = 'running';
     setStage('normalizing');
     const img = await normalizeImage(imageDataUrl, 1024);
     const { width, height } = img;
     let current = img.dataUrl;
+    const aiImg = await providerImage(img.dataUrl); // light JPEG twin for API calls (same dimensions)
 
     setStage('moderating');
-    const mod = await providers.vision.moderate(current);
+    const mod = await providers.vision.moderate(aiImg);
     if (!mod.ok) throw new Error(`moderation rejected: ${mod.reason}`);
 
     setStage('segmenting');
-    const regions = enforceSpacing(await providers.segmentation.segment(current, width, height));
+    const regions = enforceSpacing(await providers.segmentation.segment(aiImg, width, height));
     if (!regions.length) throw new Error('segmentation found no usable regions');
 
     setStage('planning');
-    const plan = (await providers.vision.plan(current, regions, job.mode, count)).slice(0, count);
+    const plan = (await providers.vision.plan(aiImg, regions, job.mode, count)).slice(0, count);
     if (!plan.length) throw new Error('planner returned no changes');
 
     setStage('editing');
@@ -55,13 +56,14 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
       setStage(`editing ${editIdx}/${plan.length}`);
       const cropBox = expandBox(region.bbox, 0.25, width, height);
       const { cropDataUrl: cropUrl } = await cropDataUrl(current, cropBox);
-      const edited = await providers.imageEdit.editMaskedRegion(cropUrl, { id: region.id, bbox: cropBox }, ch.editPrompt);
+      const edited = await providers.imageEdit.editMaskedRegion(await providerImage(cropUrl), { id: region.id, bbox: cropBox }, ch.editPrompt);
       const next = await compositeCrop(current, edited, cropBox);
       masks.set(ch.id, await diffMask(current, next, width, height));
       current = next;
     }
 
     setStage('verifying');
+    const vMod = await providerImage(current);
     const differences: Difference[] = [];
     let verifyIdx = 0;
     for (const ch of plan) {
@@ -69,8 +71,8 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
       const mask = masks.get(ch.id); if (!mask) continue;
       setStage(`verifying ${verifyIdx}/${plan.length}`);
       const bbox = maskToBBox(mask, width, height); if (!bbox) continue;
-      let verdict = await providers.vision.verify(img.dataUrl, current, ch, bbox);
-      if (!verdict.ok) verdict = await providers.vision.verify(img.dataUrl, current, ch, bbox); // retry ONCE
+      let verdict = await providers.vision.verify(aiImg, vMod, ch, bbox);
+      if (!verdict.ok) verdict = await providers.vision.verify(aiImg, vMod, ch, bbox); // retry ONCE
       differences.push({
         id: ch.id, type: ch.type, description: ch.description, bbox, bbox_normalized: normalizeBBox(bbox, width, height),
         mask_url: null, severity: ch.severity ?? 'medium',
@@ -82,6 +84,7 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
     job.levelId = saveImageLevel({ differences, original: img.dataUrl, modified: current, width, height, isMock: providers.segmentation.isMock });
     job.status = 'done'; setStage('done');
   } catch (e) {
-    job.status = 'failed'; job.error = e instanceof Error ? e.message : String(e); setStage('failed');
+    job.status = 'failed'; job.error = e instanceof Error ? e.message : String(e); job.updatedAt = Date.now(); // keep job.stage = where it failed
+    console.error(`[generate ${job.id}] FAILED at stage "${job.stage}":`, e);
   }
 }

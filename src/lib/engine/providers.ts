@@ -15,7 +15,13 @@ type FetchFn = typeof fetch;
 export const META_CALL_TIMEOUT_MS = 180_000;
 export async function metaPost(path: string, body: unknown, env: Record<string, string | undefined> = process.env, fetchFn: FetchFn = fetch): Promise<unknown> {
   assertMetaConfigured(env);
-  const res = await fetchFn(`${META_BASE_URL}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${metaApiKey(env)}` }, body: JSON.stringify(body), signal: AbortSignal.timeout(META_CALL_TIMEOUT_MS) });
+  let res: Response;
+  try {
+    res = await fetchFn(`${META_BASE_URL}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${metaApiKey(env)}` }, body: JSON.stringify(body), signal: AbortSignal.timeout(META_CALL_TIMEOUT_MS) });
+  } catch (e) {
+    const cause = (e as { cause?: { code?: string; message?: string } })?.cause;
+    throw new Error(`Meta ${path} fetch failed: ${(e as Error).message}${cause ? ` (cause: ${cause.code ?? cause.message ?? 'unknown'})` : ''}`);
+  }
   if (!res.ok) throw new Error(`Meta API ${path} → HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`);
   return res.json();
 }
@@ -41,17 +47,23 @@ export function extractEditedImage(res: unknown): string {
  */
 export async function samSegmentConcept(imageUrl: string, concept: string, env: Record<string, string | undefined> = process.env, fetchFn: FetchFn = fetch): Promise<SamObject[]> {
   assertMetaConfigured(env);
-  const res = await fetchFn(`${META_BASE_URL}${META_ENDPOINTS.responses}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream', Authorization: `Bearer ${metaApiKey(env)}` },
-    body: JSON.stringify({
-      model: META_MODELS.sam,
-      input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: concept }, { type: 'input_image', image_url: imageUrl }] }],
-      stream: true,
-      metadata: { include_confidence: 'true', mask_encoding: 'one_bit' },
-    }),
-    signal: AbortSignal.timeout(META_CALL_TIMEOUT_MS),
-  });
+  let res: Response;
+  try {
+    res = await fetchFn(`${META_BASE_URL}${META_ENDPOINTS.responses}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream', Authorization: `Bearer ${metaApiKey(env)}` },
+      body: JSON.stringify({
+        model: META_MODELS.sam,
+        input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: concept }, { type: 'input_image', image_url: imageUrl }] }],
+        stream: true,
+        metadata: { include_confidence: 'true', mask_encoding: 'one_bit' },
+      }),
+      signal: AbortSignal.timeout(META_CALL_TIMEOUT_MS),
+    });
+  } catch (e) {
+    const cause = (e as { cause?: { code?: string; message?: string } })?.cause;
+    throw new Error(`Meta SAM fetch failed: ${(e as Error).message}${cause ? ` (cause: ${cause.code ?? cause.message ?? 'unknown'})` : ''}`);
+  }
   if (!res.ok) throw new Error(`Meta API SAM → HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`);
   const raw = await res.text();
   let outputText = parseSseOutputText(raw);

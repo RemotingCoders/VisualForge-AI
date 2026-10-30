@@ -30,7 +30,7 @@ export default function Play() {
     for (let i = 0; i < 600; i++) {
       const s = await (await fetch(`/api/generate?id=${data.jobId}`)).json();
       setJob(`job ${s.status}${s.stage ? ` · ${s.stage}` : ''}${s.isMock ? ' · MOCK' : ''} · ${s.elapsedSec ?? '?'}s elapsed (each AI call takes 3-60s; a full level can take several minutes)`);
-      if (s.status === 'failed') { setJob(''); setMsg(`❌ Generation failed: ${s.error ?? 'unknown error'}`); return; }
+      if (s.status === 'failed') { setJob(''); setMsg(`❌ Generation failed at stage "${s.stage}": ${s.error ?? 'unknown error'}`); return; }
       if (s.status === 'done' && s.level) {
         const lv = s.level;
         setLevelId(lv.levelId); resetGame(lv.total); setJob('');

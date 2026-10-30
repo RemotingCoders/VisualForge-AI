@@ -68,6 +68,14 @@ export async function compositeCrop(originalDataUrl: string, editedDataUrl: stri
   return bufferToDataUrl(out);
 }
 
+/** JPEG copy for PROVIDER calls only (same dimensions, ~10x smaller than a photo PNG — large
+ *  base64 PNG bodies risk connection resets). Internal masters stay lossless PNG so the
+ *  composite/diff measurement is never polluted by recompression artifacts. */
+export async function providerImage(dataUrl: string, quality = 82): Promise<string> {
+  const buf = await sharp(dataUrlToBuffer(dataUrl)).jpeg({ quality }).toBuffer();
+  return `data:image/jpeg;base64,${buf.toString('base64')}`;
+}
+
 /** Boolean per-pixel diff mask (row-major w*h) between two same-size images. */
 export async function diffMask(aDataUrl: string, bDataUrl: string, width: number, height: number, threshold = 12): Promise<boolean[]> {
   const raw = async (d: string) => sharp(dataUrlToBuffer(d)).resize(width, height, { fit: 'fill' }).removeAlpha().raw().toBuffer();
