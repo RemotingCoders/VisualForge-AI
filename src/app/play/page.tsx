@@ -30,7 +30,7 @@ export default function Play() {
     for (let i = 0; i < 600; i++) {
       const s = await (await fetch(`/api/generate?id=${data.jobId}`)).json();
       setJob(`job ${s.status}${s.stage ? ` · ${s.stage}` : ''}${s.isMock ? ' · MOCK' : ''} · ${s.elapsedSec ?? '?'}s elapsed (each AI call takes 3-60s; a full level can take several minutes)`);
-      if (s.status === 'failed') { setMsg(`❌ Generation failed: ${s.error ?? 'unknown error'}`); return; }
+      if (s.status === 'failed') { setJob(''); setMsg(`❌ Generation failed: ${s.error ?? 'unknown error'}`); return; }
       if (s.status === 'done' && s.level) {
         const lv = s.level;
         setLevelId(lv.levelId); resetGame(lv.total); setJob('');
@@ -40,7 +40,8 @@ export default function Play() {
       }
       await new Promise(r => setTimeout(r, 1000));
     }
-    setMsg('❌ Generation timed out — try a smaller image or fewer changes.');
+    setJob('');
+    setMsg('❌ Generation timed out after 10 minutes — check the Meta dashboard usage before retrying (calls may have been billed), then try fewer changes.');
   };
 
   const validate = async (x: number, y: number) => {
