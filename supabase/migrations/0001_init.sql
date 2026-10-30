@@ -17,9 +17,23 @@ create table if not exists VisualForge_qc_responses (id uuid primary key default
 create table if not exists VisualForge_datasets (id uuid primary key default gen_random_uuid(), name text not null, note text default 'synthetic — validate before industrial use', created_at timestamptz default now());
 create table if not exists VisualForge_dataset_samples (id uuid primary key default gen_random_uuid(), dataset_id uuid references VisualForge_datasets(id) on delete cascade, level_id uuid references VisualForge_levels(id), approved boolean, verified boolean not null default false);
 create table if not exists VisualForge_ai_calls (id uuid primary key default gen_random_uuid(), job_id uuid, model text not null, operation text not null, latency_ms int, estimated_cost_usd numeric, is_mock boolean not null default false, created_at timestamptz default now());
+-- RLS enabled on EVERY table: no policies = deny-by-default for anon/authenticated keys.
+-- The server uses the service-role key (bypasses RLS) and enforces anti-cheat in the API.
+-- Public-read policies are added only where the product needs them (below, and later migrations for multiplayer).
 alter table VisualForge_images enable row level security;
-alter table VisualForge_differences enable row level security;
+alter table VisualForge_generation_jobs enable row level security;
 alter table VisualForge_levels enable row level security;
+alter table VisualForge_differences enable row level security;
+alter table VisualForge_game_sessions enable row level security;
+alter table VisualForge_rooms enable row level security;
+alter table VisualForge_room_players enable row level security;
+alter table VisualForge_rounds enable row level security;
+alter table VisualForge_round_finds enable row level security;
+alter table VisualForge_qc_sessions enable row level security;
+alter table VisualForge_qc_responses enable row level security;
+alter table VisualForge_datasets enable row level security;
+alter table VisualForge_dataset_samples enable row level security;
+alter table VisualForge_ai_calls enable row level security;
 -- Deliberately restrictive default: no anon select on differences (server role only, validated click API).
 create policy "levels public read if published" on VisualForge_levels for select using (published = true);
 create policy "images public read" on VisualForge_images for select using (true);
