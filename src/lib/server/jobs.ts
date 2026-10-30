@@ -4,12 +4,12 @@ import { normalizeImage, cropDataUrl, expandBox, compositeCrop, diffMask, provid
 import { saveImageLevel } from '../serverStore';
 
 export type JobStatus = 'queued' | 'running' | 'done' | 'failed';
-/** Differences must stay SMALL and localized: candidate regions are shrunk to at most this
- *  fraction of the image side, and a measured diff larger than MEASURED_CAP is discarded.
- *  MEASURED_CAP must exceed region cap x crop expansion (0.20 x 1.5 = 0.30) or every
+/** Differences must stay SMALL, localized and subtle: candidate regions are shrunk to at most
+ *  this fraction of the image side, and a measured diff larger than MEASURED_CAP is discarded.
+ *  MEASURED_CAP must exceed region cap x crop expansion (0.10 x 1.5 = 0.15) or every
  *  max-size change is discarded by construction. */
-export const MAX_REGION_FRACTION = 0.2;
-export const MAX_MEASURED_FRACTION = 0.32;
+export const MAX_REGION_FRACTION = 0.1;
+export const MAX_MEASURED_FRACTION = 0.17;
 export interface Job {
   id: string; status: JobStatus; stage: string; mode: Mode; isMock: boolean;
   error?: string; levelId?: string; createdAt: number; updatedAt: number;

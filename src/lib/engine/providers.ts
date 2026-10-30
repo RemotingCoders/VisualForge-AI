@@ -165,10 +165,10 @@ class MetaProvider implements SegmentationProvider, VisionReasoningProvider, Ima
   }
   async plan(imageRef: string, regions: Region[], mode: Mode, count: number): Promise<PlannedChange[]> {
     const rules = mode === 'qc'
-      ? 'Change types allowed (QC defects): scratch, crack, dent, missing component, corrosion, misalignment, wrong color, foreign object.'
-      : 'Change types allowed (game): remove object, change color, add object, alter shape. Vary difficulty: some obvious, some subtle.';
+      ? 'Change types allowed (QC defects): scratch, crack, dent, missing component, corrosion, misalignment, wrong color, foreign object. Defects must be localized and realistic, not covering the whole part.'
+      : 'Change types allowed (game): remove object, change color, add object, alter shape. Difficulty: every change must be SUBTLE and hard to spot at a glance — a slight shade or hue shift, removing one small detail, a minor shape tweak. Never repaint a whole object into a drastically different look, never add large new elements.';
     const out = await sparkStructured<{ changes: PlannedChange[] }>({
-      prompt: `Plan exactly ${count} realistic, localized visual changes to this image. ${rules} Use ONLY these regionIds, at most one change per region, regions must not overlap: ${JSON.stringify(regions.map(r => ({ regionId: r.id, bbox: r.bbox, label: r.label ?? '' })))}. Each editPrompt must describe a precise image edit confined to that region.`,
+      prompt: `Plan exactly ${count} realistic, localized visual changes to this image. ${rules} Use ONLY these regionIds, at most one change per region, regions must not overlap: ${JSON.stringify(regions.map(r => ({ regionId: r.id, bbox: r.bbox, label: r.label ?? '' })))}. Each editPrompt must describe a precise, subtle image edit confined to that region, preserving the region's overall appearance except for the one small change.`,
       images: [imageRef], schemaName: 'ChangePlan', schema: SPARK_SCHEMAS.plan,
     });
     return out.changes.slice(0, count);

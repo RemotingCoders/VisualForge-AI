@@ -39,7 +39,7 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
   it('produces a playable level with a measured, verified difference', async () => {
     const edited = await solidPng(24, 24, [30, 30, 220]);
     const fake: Providers = {
-      segmentation: { name: 'fake', isMock: true, segment: async () => [{ id: 'r1', bbox: { x: 16, y: 10, width: 6, height: 5 } }] },
+      segmentation: { name: 'fake', isMock: true, segment: async () => [{ id: 'r1', bbox: { x: 40, y: 25, width: 10, height: 8 } }] },
       vision: {
         name: 'fake', isMock: true,
         moderate: async () => ({ ok: true, reason: 'ok' }),
@@ -49,17 +49,17 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
       imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => edited, generateScene: async () => { throw new Error('not used'); } },
     };
     const job = createJob('game', true);
-    await runGeneration(job, await solidPng(40, 30, [120, 120, 120]), 1, fake);
+    await runGeneration(job, await solidPng(100, 80, [120, 120, 120]), 1, fake);
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     const diffs = getDifferences(job.levelId!)!;
     expect(diffs).toHaveLength(1);
     expect(diffs[0].verification_status).toBe('verified');
     expect(diffs[0].bbox.width).toBeGreaterThan(0);
-    // Measured bbox must sit inside the expanded crop region (16,10,6x5 @ +25% -> ~14,8,9x8)
-    expect(diffs[0].bbox.x).toBeGreaterThanOrEqual(14);
-    expect(diffs[0].bbox.y).toBeGreaterThanOrEqual(8);
-    expect(diffs[0].bbox.x + diffs[0].bbox.width).toBeLessThanOrEqual(23);
-    expect(diffs[0].bbox.y + diffs[0].bbox.height).toBeLessThanOrEqual(16);
+    // Measured bbox must sit inside the expanded crop region (40,25,10x8 @ +25% -> 37,23,15x12)
+    expect(diffs[0].bbox.x).toBeGreaterThanOrEqual(37);
+    expect(diffs[0].bbox.y).toBeGreaterThanOrEqual(23);
+    expect(diffs[0].bbox.x + diffs[0].bbox.width).toBeLessThanOrEqual(52);
+    expect(diffs[0].bbox.y + diffs[0].bbox.height).toBeLessThanOrEqual(35);
     const payload = getLevelPayload(job.levelId!)!;
     expect(payload.total).toBe(1);
     expect(payload).not.toHaveProperty('differences'); // anti-cheat: annotations never in the client payload
@@ -71,7 +71,7 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
       segmentation: {
         name: 'fake', isMock: true,
         segment: async () => [
-          { id: 'big', bbox: { x: 0, y: 0, width: 99, height: 79 } },  // ~whole 100x80 image — must be shrunk to the 20% cap (20x16)
+          { id: 'big', bbox: { x: 0, y: 0, width: 99, height: 79 } },  // ~whole 100x80 image — must be shrunk to the 10% cap (10x8)
           { id: 'small', bbox: { x: 5, y: 5, width: 10, height: 8 } },  // already within cap
         ],
       },
@@ -89,8 +89,8 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
     const diffs = getDifferences(job.levelId!)!;
     expect(diffs.map(d => d.id).sort()).toEqual(['c-big', 'c-small']);
     for (const d of diffs) {
-      expect(d.bbox.width).toBeLessThanOrEqual(100 * 0.32);  // no difference may span the photo
-      expect(d.bbox.height).toBeLessThanOrEqual(80 * 0.32);
+      expect(d.bbox.width).toBeLessThanOrEqual(100 * 0.17);  // no difference may span the photo
+      expect(d.bbox.height).toBeLessThanOrEqual(80 * 0.17);
     }
   });
 
