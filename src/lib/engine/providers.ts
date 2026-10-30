@@ -188,7 +188,7 @@ class MetaProvider implements SegmentationProvider, VisionReasoningProvider, Ima
     // Crop+margin -> edit crop -> resize back -> feathered composite happens in the worker (worker/composite.py);
     // the verified Muse Image call itself has no mask parameter and returns 1600x1600 WebP (spike 3/6).
     // Preservation clause: Muse repaints what it returns, so the prompt must pin everything else down.
-    const guarded = `${prompt}. IMPORTANT: change ONLY what is described, and apply it to the object COMPLETELY and cleanly — a fully removed object with naturally filled background, or a fully replaced object; never a half-changed, split, torn or broken-looking object. Keep every other element exactly the same — identical shapes, positions, colors, lighting, shadows and photographic style. Do not redraw, move or deform anything else.`;
+    const guarded = `${prompt}. IMPORTANT: change ONLY what is described and keep every other element exactly the same — identical shapes, positions, colors, lighting, shadows and photographic style. If the described change removes or replaces an object, apply it to the object COMPLETELY and cleanly (fully removed with naturally filled background, or fully replaced) — never a half-changed or split object. If the described change is instead a localized surface defect (scratch, crack, dent, corrosion or similar damage), render that defect realistically and confined to the described area only. Do not redraw, move or deform anything else.`;
     return extractEditedImage(await museImageEdit(imageRef, guarded));
   }
   async generateScene(_theme: string): Promise<string> {
@@ -207,8 +207,10 @@ export class MockProviders implements SegmentationProvider, VisionReasoningProvi
     return out;
   }
   async moderate() { return { ok: true, reason: 'MOCK moderation — not a real safety check' }; }
-  async plan(_i: string, regions: Region[], _m: string, count: number): Promise<PlannedChange[]> {
-    const types = ['remove object', 'change color', 'replace object'];
+  async plan(_i: string, regions: Region[], mode: Mode, count: number): Promise<PlannedChange[]> {
+    const types = mode === 'qc'
+      ? ['scratch', 'crack', 'dent', 'missing component', 'corrosion']
+      : ['remove object', 'change color', 'replace object'];
     return regions.slice(0, count).map((r, i) => ({ id: `change-${i + 1}`, regionId: r.id, type: types[i % types.length], description: `MOCK change ${i + 1}: ${types[i % types.length]}`, editPrompt: `mock edit ${i + 1}` }));
   }
   async verify() { return { ok: true, notes: 'MOCK verification — not real visual verification' }; }

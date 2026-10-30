@@ -166,6 +166,26 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
     expect(getDifferences(job.levelId!)![0].type).toBe('change color');
   });
 
+  it('QC mode keeps localized defects on fragments (scratch on part of a part is the point)', async () => {
+    let museCalled = false;
+    const edited = await solidPng(24, 24, [30, 30, 220]);
+    const fake: Providers = {
+      segmentation: { name: 'fake', isMock: true, segment: async () => [{ id: 'big', bbox: { x: 0, y: 0, width: 99, height: 79 } }] }, // fragment after shrink
+      vision: {
+        name: 'fake', isMock: true,
+        moderate: async () => ({ ok: true, reason: 'ok' }),
+        plan: async () => [{ id: 'c1', regionId: 'big', type: 'scratch', description: 'scratch across the surface', editPrompt: 'add a realistic scratch' }],
+        verify: async () => ({ ok: true, notes: 'ok' }),
+      },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { museCalled = true; return edited; }, generateScene: async () => '' },
+    };
+    const job = createJob('qc', true);
+    await runGeneration(job, await solidPng(100, 80, [120, 120, 120]), 1, fake);
+    expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
+    expect(museCalled).toBe(true); // NOT downgraded to a local recolor
+    expect(getDifferences(job.levelId!)![0].type).toBe('scratch');
+  });
+
   it('marks the job failed when moderation rejects (no silent fallback)', async () => {
     const fake: Providers = {
       segmentation: { name: 'fake', isMock: true, segment: async () => [] },

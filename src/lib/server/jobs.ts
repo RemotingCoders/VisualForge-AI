@@ -76,11 +76,12 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
     setStage('planning');
     const planned = (await providers.vision.plan(aiImg, regions, job.mode, count)).slice(0, count);
     if (!planned.length) throw new Error('planner returned no changes');
-    // Hard rule (not just a prompt wish): remove/replace on a FRAGMENT makes objects look broken.
-    // Downgrade those to a color change, which is always safe on any region.
+    // Hard rule (GAME mode only): remove/replace on a FRAGMENT makes objects look broken,
+    // so downgrade those to a color change. In QC mode this must NOT apply — scratch/crack/
+    // dent defects are intentionally localized ON a fragment of a part.
     const plan = planned.map(ch => {
       const r = regions.find(x => x.id === ch.regionId);
-      return r && r.wholeObject === false && !/colou?r/i.test(ch.type) ? { ...ch, type: 'change color' } : ch;
+      return job.mode === 'game' && r && r.wholeObject === false && !/colou?r/i.test(ch.type) ? { ...ch, type: 'change color' } : ch;
     });
 
     setStage('editing');
