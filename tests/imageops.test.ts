@@ -490,8 +490,8 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
     expect(Math.abs(data[o] - data[o + 2])).toBeLessThan(30);
   });
 
-  it('one-pass is the main game path: 1 full-image call + 1 batched review, no segmentation', async () => {
-    let fullImageCalls = 0, segmentCalls = 0, reviewCalls = 0;
+  it('one-pass is the main game path: 1 full-image call + 1 batched review, crop executor never runs', async () => {
+    let fullImageCalls = 0, segmentCalls = 0, reviewCalls = 0, cropEditCalls = 0;
     // Fake Muse full-image edit: paint a solid red square at (60,50,14x12) on the gray scene.
     const editFull = async (imageRef: string) => {
       fullImageCalls++;
@@ -508,14 +508,15 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
         plan: async () => [], verify: async () => ({ ok: true, notes: 'ok' }),
         reviewDifferences: async (pairs: { index: number }[]) => { reviewCalls++; return pairs.map(p => ({ index: p.index, ok: true, description: 'A red square appeared', type: 'add object', notes: 'fake review ok' })); },
       },
-      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { throw new Error('crop edit must not run when one-pass delivers'); }, editFullImage: editFull, generateScene: async () => '' },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { cropEditCalls++; throw new Error('crop edit must not run when one-pass delivers'); }, editFullImage: editFull, generateScene: async () => '' },
     };
     const job = createJob('game', true);
     await runGeneration(job, await solidPng(100, 80, [120, 120, 120]), 1, fake);
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     expect(fullImageCalls).toBe(1);
     expect(reviewCalls).toBe(1);
-    expect(segmentCalls).toBe(0); // crop pipeline never ran
+    expect(cropEditCalls).toBe(0); // crop executor never ran
+    expect(segmentCalls).toBe(1); // segmentation+planning launched in parallel, result unused
     const diffs = getDifferences(job.levelId!)!;
     expect(diffs).toHaveLength(1);
     expect(diffs[0].id).toContain('onepass');

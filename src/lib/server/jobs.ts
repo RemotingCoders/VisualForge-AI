@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { enforceSpacing, maskToBBox, maskCentroid, normalizeBBox, overlaps } from '../engine/geometry';
-import type { Providers, Mode, Difficulty, Difference, Region } from '../engine/types';
+import type { Providers, Mode, Difficulty, Difference, Region, PlannedChange } from '../engine/types';
 import { normalizeImage, cropDataUrl, expandBox, expandMask, diffMask, providerImage, clampBox, recolorCrop, squareContextBox, compositeMaskedEdit, estimateAlignment, alignEditedCrop, ALIGNMENT_MAX_RESIDUAL, cropColorStats, colorDeltaE, targetHueFromColor, cropDominantHue, transformObjectInPaste, duplicateObjectInPaste, extractOnePassComponents, compositeOnePassComponents, type OnePassComponent, type LocalTransformKind } from './imageOps';
 import { saveImageLevel } from '../serverStore';
 import { persistJob, loadJob } from './db';
@@ -69,11 +69,62 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
     const differences: Difference[] = [];
     const difficulty = job.difficulty ?? 'medium';
 
+    // ============ CROP PREP: segmentation + planning, launched IN PARALLEL with the
+    // one-pass Muse call below — both depend only on the ORIGINAL image. The resulting
+    // plan is used only if one-pass delivers less than N (game top-up/fallback) or in QC.
+    const prepareCropPlan = async (): Promise<{ regions: Region[]; plan: PlannedChange[] }> => {
+      setStage('segmenting');
+      const rawRegions = await providers.segmentation.segment(aiImg, width, height); calls.sam++;
+      // wholeObject is decided by SAM's box AREA: <= 8% of the image = whole object. Only
+      // above that do we center-crop (aspect preserved, scaled to the area cap) and mark it
+      // fragment (wholeObject=false: color/add only in game mode — removing, replacing or
+      // geometrically transforming a fragment is what made objects look "broken/split").
+      const areaCap = width * height * MAX_REGION_AREA_FRACTION;
+      const capRegion = (r: Region): Region => {
+        if (r.bbox.width * r.bbox.height <= areaCap) return { ...r, wholeObject: true };
+        const s = Math.sqrt(areaCap / (r.bbox.width * r.bbox.height));
+        const w = Math.max(8, Math.floor(r.bbox.width * s)), h = Math.max(8, Math.floor(r.bbox.height * s));
+        const cx = r.bbox.x + r.bbox.width / 2, cy = r.bbox.y + r.bbox.height / 2;
+        return { ...r, bbox: clampBox({ x: cx - w / 2, y: cy - h / 2, width: w, height: h }, width, height), wholeObject: false };
+      };
+      // F: spacing is enforced on the FINAL PASTE boxes (object + 15% margin), not the raw
+      // bboxes — expanded paste boxes can overlap even when bboxes don't, and a later paste
+      // would re-cover part of an earlier change. (This is also what makes future parallel
+      // edits safe.) Context boxes may overlap freely: they are read-only input to Muse.
+      const capped = rawRegions.map(capRegion);
+      const regions = enforceSpacing(capped.map(r => ({ region: r, bbox: expandBox(r.bbox, 0.15, width, height) }))).map(x => x.region);
+      if (!regions.length) throw new Error('segmentation found no usable regions');
+
+      setStage('planning');
+      // Ask for MORE candidates than needed (count + 3, priority-ordered, with the variety
+      // quota in the planner prompt): the executor walks the list and stops at `count`
+      // achieved — discarded candidates no longer sink the whole level.
+      const planned = await providers.vision.plan(aiImg, regions, job.mode, count + 3, difficulty); calls.spark++;
+      if (!planned.length) throw new Error('planner returned no changes');
+      // Hard rule (GAME mode only): remove/replace/geometric transforms on a FRAGMENT make
+      // objects look broken, so downgrade those to a color change. "add object" stays: it puts
+      // a NEW element in empty space, it does not tear an existing one. In QC mode none of this
+      // applies — scratch/crack/dent defects intentionally live ON a fragment of a part.
+      const WHOLE_OBJECT_ONLY = /remove|replace|flip|resize|rotate|duplicate/i;
+      const plan = planned.map(ch => {
+        const r = regions.find(x => x.id === ch.regionId);
+        return job.mode === 'game' && r && r.wholeObject === false && WHOLE_OBJECT_ONLY.test(ch.type) ? { ...ch, type: 'change color' } : ch;
+      });
+      // One line per planned change (post-downgrade) so console logs explain the level's mix.
+      for (const ch of plan) {
+        const r = regions.find(x => x.id === ch.regionId);
+        console.info(`[generate ${job.id}] planned ${ch.id}: type=${ch.type} region=${ch.regionId} label="${r?.label ?? ''}" wholeObject=${r?.wholeObject ?? '?'} targetColor=${ch.targetColor ?? ''}`);
+      }
+      return { regions, plan };
+    };
+    const cropPrep = prepareCropPlan();
+    void cropPrep.catch(() => { /* rejection surfaces only if the executor awaits it */ });
+
     // ================= ONE-PASS (game mode main path) =================
     // One full-image Muse call -> global alignment compensation -> low-pass/new-edge
     // extraction (calibrated offline) -> compose ONLY the chosen components over the
-    // original -> re-measure -> ONE batched Spark review. Second pass for the missing
-    // count, then the crop pipeline below tops up whatever is still missing.
+    // original -> re-measure -> ONE batched Spark review. If it delivers less than N,
+    // the crop pipeline below tops up directly (no second one-pass pass).
     type Measured = { mask: boolean[]; bbox: NonNullable<ReturnType<typeof maskToBBox>> };
     const measureComposed = async (composed: string, comps: OnePassComponent[]): Promise<(Measured & { comp: OnePassComponent })[]> => {
       const fullMask = await diffMask(img.dataUrl, composed, width, height);
@@ -118,11 +169,26 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
       if (!est.aligned) { console.info(`[generate ${job.id}] onepass ${label} discarded: residual alignment error ${est.error.toFixed(1)} exceeds ${ALIGNMENT_MAX_RESIDUAL}`); return null; }
       const aligned = await alignEditedCrop(passBase, edited, est);
       const { components, discarded } = await extractOnePassComponents(passBase, aligned);
-      for (const d of discarded) console.info(`[generate ${job.id}] onepass ${label} discarded component: ${d.area}px amp ${d.meanAmp.toFixed(1)} bbox (${d.bbox.x},${d.bbox.y}) ${d.bbox.width}x${d.bbox.height} — ${d.reason}`);
+      // Aggregate discard log: one summary line (specks by area + re-render noise total);
+      // individually list only discards >= 24px, top 10 by score (area x meanAmp).
+      const specks = discarded.filter(d => d.area < 24);
+      const bigDiscards = discarded.filter(d => d.area >= 24).sort((a, b) => b.area * b.meanAmp - a.area * a.meanAmp);
+      console.info(`[generate ${job.id}] onepass ${label} discards: ${specks.length} specks by area (<24px) · ${discarded.length - specks.length} re-render noise components`);
+      for (const d of bigDiscards.slice(0, 10)) console.info(`[generate ${job.id}] onepass ${label} discarded component: ${d.area}px amp ${d.meanAmp.toFixed(1)} bbox (${d.bbox.x},${d.bbox.y}) ${d.bbox.width}x${d.bbox.height} — ${d.reason}`);
       for (const c of components) console.info(`[generate ${job.id}] onepass ${label} component: ${c.area}px amp ${c.meanAmp.toFixed(1)} meanLp ${c.meanLp.toFixed(1)} newEdge ${c.meanNewEdge.toFixed(1)} tex ${c.meanTex.toFixed(1)} score ${Math.round(c.score)} bbox (${c.bbox.x},${c.bbox.y}) ${c.bbox.width}x${c.bbox.height}`);
       const fresh = components.filter(c => !differences.some(d => overlaps(d.bbox, c.bbox, 4)));
-      const chosen = fresh.slice(0, want);
-      console.info(`[generate ${job.id}] onepass ${label}: chose ${chosen.length}/${components.length} components (${fresh.length} not overlapping existing differences)`);
+      // Shape gate BEFORE the Spark review: a real difference is LOCAL — reject bboxes
+      // spanning >40% of the image width/height or with aspect ratio > 6.
+      const local = fresh.filter(c => {
+        const aspect = Math.max(c.bbox.width / c.bbox.height, c.bbox.height / c.bbox.width);
+        if (c.bbox.width > width * 0.4 || c.bbox.height > height * 0.4 || aspect > 6) {
+          console.info(`[generate ${job.id}] onepass ${label} discarded component: ${c.area}px amp ${c.meanAmp.toFixed(1)} bbox (${c.bbox.x},${c.bbox.y}) ${c.bbox.width}x${c.bbox.height} — forma no local (bbox ${Math.round(c.bbox.width / width * 100)}% del ancho, ${Math.round(c.bbox.height / height * 100)}% del alto, aspecto ${aspect.toFixed(1)})`);
+          return false;
+        }
+        return true;
+      });
+      const chosen = local.slice(0, want);
+      console.info(`[generate ${job.id}] onepass ${label}: chose ${chosen.length}/${components.length} components (${local.length} local, not overlapping existing differences)`);
       if (!chosen.length) return null;
       let composed = await compositeOnePassComponents(passBase, aligned, chosen);
       let kept = await reviewMeasured(composed, await measureComposed(composed, chosen));
@@ -149,62 +215,19 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
         setStage('one-pass: editing full image (Muse)');
         const afterPass1 = await runOnePassPass(img.dataUrl, count, 'pass1');
         if (afterPass1) { current = afterPass1; modeUsed = 'one-pass'; }
-        if (differences.length > 0 && differences.length < count) {
-          setStage(`one-pass: second pass · ${differences.length}/${count} done`);
-          const afterPass2 = await runOnePassPass(current, count - differences.length, 'pass2');
-          if (afterPass2) current = afterPass2;
-        }
+        // No second one-pass pass: if pass 1 delivered less than N, the crop pipeline
+        // (already segmented + planned in parallel, below) tops up directly.
       } catch (e) {
         console.info(`[generate ${job.id}] one-pass failed (${e instanceof Error ? e.message : String(e)}) — falling back to crop pipeline`);
       }
       if (differences.length) console.info(`[generate ${job.id}] one-pass delivered ${differences.length}/${count} — ${differences.length < count ? 'crop pipeline will top up' : 'no crop pipeline needed'}`);
     }
 
-    // ================= CROP PIPELINE (QC always; game top-up / fallback) =================
+    // ================= CROP EXECUTOR (QC always; game top-up / fallback) =================
+    // Consumes the segmentation + plan prepared in parallel above (already done by now in
+    // the common case, so topping up after one-pass costs no extra SAM/Spark latency).
     const cropTopUp = async (): Promise<void> => {
-    setStage('segmenting');
-    const rawRegions = await providers.segmentation.segment(aiImg, width, height); calls.sam++;
-    // wholeObject is decided by SAM's box AREA: <= 8% of the image = whole object. Only
-    // above that do we center-crop (aspect preserved, scaled to the area cap) and mark it
-    // fragment (wholeObject=false: color/add only in game mode — removing, replacing or
-    // geometrically transforming a fragment is what made objects look "broken/split").
-    const areaCap = width * height * MAX_REGION_AREA_FRACTION;
-    const capRegion = (r: Region): Region => {
-      if (r.bbox.width * r.bbox.height <= areaCap) return { ...r, wholeObject: true };
-      const s = Math.sqrt(areaCap / (r.bbox.width * r.bbox.height));
-      const w = Math.max(8, Math.floor(r.bbox.width * s)), h = Math.max(8, Math.floor(r.bbox.height * s));
-      const cx = r.bbox.x + r.bbox.width / 2, cy = r.bbox.y + r.bbox.height / 2;
-      return { ...r, bbox: clampBox({ x: cx - w / 2, y: cy - h / 2, width: w, height: h }, width, height), wholeObject: false };
-    };
-    // F: spacing is enforced on the FINAL PASTE boxes (object + 15% margin), not the raw
-    // bboxes — expanded paste boxes can overlap even when bboxes don't, and a later paste
-    // would re-cover part of an earlier change. (This is also what makes future parallel
-    // edits safe.) Context boxes may overlap freely: they are read-only input to Muse.
-    const capped = rawRegions.map(capRegion);
-    const regions = enforceSpacing(capped.map(r => ({ region: r, bbox: expandBox(r.bbox, 0.15, width, height) }))).map(x => x.region);
-    if (!regions.length) throw new Error('segmentation found no usable regions');
-
-    setStage('planning');
-    // Ask for MORE candidates than needed (count + 3, priority-ordered, with the variety
-    // quota in the planner prompt): the executor walks the list and stops at `count`
-    // achieved — discarded candidates no longer sink the whole level.
-    const want = Math.max(1, count - differences.length);
-    const planned = await providers.vision.plan(aiImg, regions, job.mode, want + 3, difficulty); calls.spark++;
-    if (!planned.length) throw new Error('planner returned no changes');
-    // Hard rule (GAME mode only): remove/replace/geometric transforms on a FRAGMENT make
-    // objects look broken, so downgrade those to a color change. "add object" stays: it puts
-    // a NEW element in empty space, it does not tear an existing one. In QC mode none of this
-    // applies — scratch/crack/dent defects intentionally live ON a fragment of a part.
-    const WHOLE_OBJECT_ONLY = /remove|replace|flip|resize|rotate|duplicate/i;
-    const plan = planned.map(ch => {
-      const r = regions.find(x => x.id === ch.regionId);
-      return job.mode === 'game' && r && r.wholeObject === false && WHOLE_OBJECT_ONLY.test(ch.type) ? { ...ch, type: 'change color' } : ch;
-    });
-    // One line per planned change (post-downgrade) so console logs explain the level's mix.
-    for (const ch of plan) {
-      const r = regions.find(x => x.id === ch.regionId);
-      console.info(`[generate ${job.id}] planned ${ch.id}: type=${ch.type} region=${ch.regionId} label="${r?.label ?? ''}" wholeObject=${r?.wholeObject ?? '?'} targetColor=${ch.targetColor ?? ''}`);
-    }
+    const { regions, plan } = await cropPrep;
 
     // --- Per-change edit -> measure -> verify (E: no identical verifier retry — a failed
     // verification re-edits ONCE with Muse, then discards. Deterministic color changes are
