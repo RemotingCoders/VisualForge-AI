@@ -1,7 +1,9 @@
+import { randomUUID } from 'node:crypto';
 import { enforceSpacing, maskToBBox, maskCentroid, normalizeBBox } from '../engine/geometry';
 import type { Providers, Mode, Difference, Region } from '../engine/types';
 import { normalizeImage, cropDataUrl, expandBox, compositeCrop, diffMask, providerImage, clampBox } from './imageOps';
 import { saveImageLevel } from '../serverStore';
+import { persistJob, loadJob } from './db';
 
 export type JobStatus = 'queued' | 'running' | 'done' | 'failed';
 /** Differences must stay SMALL, localized and subtle: candidate regions are shrunk to at most
@@ -12,15 +14,24 @@ export const MAX_REGION_FRACTION = 0.1;
 export const MAX_MEASURED_FRACTION = 0.17;
 export interface Job {
   id: string; status: JobStatus; stage: string; mode: Mode; isMock: boolean;
-  error?: string; levelId?: string; createdAt: number; updatedAt: number;
+  error?: string; levelId?: string; requestedChanges?: number; createdAt: number; updatedAt: number;
 }
 const g = globalThis as unknown as { __vfJobs?: Map<string, Job> };
 if (!g.__vfJobs) g.__vfJobs = new Map();
 export const getJob = (id: string) => g.__vfJobs!.get(id) ?? null;
-export const jobsToday = () => { const day = new Date().toDateString(); return [...g.__vfJobs!.values()].filter(j => new Date(j.createdAt).toDateString() === day).length; };
-export function createJob(mode: Mode, isMock: boolean): Job {
-  const job: Job = { id: `job-${Math.random().toString(36).slice(2, 10)}`, status: 'queued', stage: 'queued', mode, isMock, createdAt: Date.now(), updatedAt: Date.now() };
+/** Memory first; on a miss (e.g. another server instance on Vercel) read through from Supabase. */
+export async function resolveJob(id: string): Promise<Job | null> {
+  const mem = getJob(id); if (mem) return mem;
+  const row = await loadJob(id); if (!row) return null;
+  const job: Job = { ...row, status: row.status as JobStatus };
   g.__vfJobs!.set(job.id, job);
+  return job;
+}
+export const jobsToday = () => { const day = new Date().toDateString(); return [...g.__vfJobs!.values()].filter(j => new Date(j.createdAt).toDateString() === day).length; };
+export function createJob(mode: Mode, isMock: boolean, requestedChanges?: number): Job {
+  const job: Job = { id: randomUUID(), status: 'queued', stage: 'queued', mode, isMock, requestedChanges, createdAt: Date.now(), updatedAt: Date.now() };
+  g.__vfJobs!.set(job.id, job);
+  void persistJob(job);
   return job;
 }
 
@@ -31,7 +42,7 @@ export function createJob(mode: Mode, isMock: boolean): Job {
  * Providers are injected so the whole loop is testable offline with fakes — no paid calls in tests.
  */
 export async function runGeneration(job: Job, imageDataUrl: string, count: number, providers: Providers): Promise<void> {
-  const setStage = (s: string) => { job.stage = s; job.updatedAt = Date.now(); console.info(`[generate ${job.id}] stage: ${s}`); };
+  const setStage = (s: string) => { job.stage = s; job.updatedAt = Date.now(); console.info(`[generate ${job.id}] stage: ${s}`); void persistJob(job); };
   try {
     job.status = 'running';
     setStage('normalizing');
@@ -104,10 +115,10 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
     }
     if (!differences.length) throw new Error('no change survived measurement/verification');
 
-    job.levelId = saveImageLevel({ differences, original: img.dataUrl, modified: current, width, height, isMock: providers.segmentation.isMock });
+    job.levelId = saveImageLevel({ differences, original: img.dataUrl, modified: current, width, height, isMock: providers.segmentation.isMock, mode: job.mode, jobId: job.id });
     job.status = 'done'; setStage('done');
   } catch (e) {
-    job.status = 'failed'; job.error = e instanceof Error ? e.message : String(e); job.updatedAt = Date.now(); // keep job.stage = where it failed
+    job.status = 'failed'; job.error = e instanceof Error ? e.message : String(e); job.updatedAt = Date.now(); void persistJob(job); // keep job.stage = where it failed
     console.error(`[generate ${job.id}] FAILED at stage "${job.stage}":`, e);
   }
 }

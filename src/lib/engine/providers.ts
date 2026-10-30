@@ -1,5 +1,6 @@
 import type { Providers, Region, PlannedChange, Mode, BBox, SegmentationProvider, VisionReasoningProvider, ImageEditProvider } from './types';
 import { META_BASE_URL, META_MODELS, META_ENDPOINTS, metaApiKey, parseSamOutput, parseSseOutputText, type SamObject } from './meta';
+import { logAiCall } from '../server/db';
 
 export class MetaNotConfiguredError extends Error {
   constructor(missing: string[]) { super(`Meta provider not configured (missing: ${missing.join(', ')})`); this.name = 'MetaNotConfiguredError'; }
@@ -15,6 +16,7 @@ type FetchFn = typeof fetch;
 export const META_CALL_TIMEOUT_MS = 180_000;
 export async function metaPost(path: string, body: unknown, env: Record<string, string | undefined> = process.env, fetchFn: FetchFn = fetch): Promise<unknown> {
   assertMetaConfigured(env);
+  const t0 = Date.now();
   let res: Response;
   try {
     res = await fetchFn(`${META_BASE_URL}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${metaApiKey(env)}` }, body: JSON.stringify(body), signal: AbortSignal.timeout(META_CALL_TIMEOUT_MS) });
@@ -22,6 +24,7 @@ export async function metaPost(path: string, body: unknown, env: Record<string, 
     const cause = (e as { cause?: { code?: string; message?: string } })?.cause;
     throw new Error(`Meta ${path} fetch failed: ${(e as Error).message}${cause ? ` (cause: ${cause.code ?? cause.message ?? 'unknown'})` : ''}`);
   }
+  void logAiCall(path.includes('images') ? META_MODELS.image : META_MODELS.spark, path, Date.now() - t0);
   if (!res.ok) throw new Error(`Meta API ${path} → HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`);
   return res.json();
 }
@@ -47,6 +50,7 @@ export function extractEditedImage(res: unknown): string {
  */
 export async function samSegmentConcept(imageUrl: string, concept: string, env: Record<string, string | undefined> = process.env, fetchFn: FetchFn = fetch): Promise<SamObject[]> {
   assertMetaConfigured(env);
+  const t0 = Date.now();
   let res: Response;
   try {
     res = await fetchFn(`${META_BASE_URL}${META_ENDPOINTS.responses}`, {
@@ -65,6 +69,7 @@ export async function samSegmentConcept(imageUrl: string, concept: string, env: 
     throw new Error(`Meta SAM fetch failed: ${(e as Error).message}${cause ? ` (cause: ${cause.code ?? cause.message ?? 'unknown'})` : ''}`);
   }
   if (!res.ok) throw new Error(`Meta API SAM → HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`);
+  void logAiCall(META_MODELS.sam, 'sam.segment', Date.now() - t0);
   const raw = await res.text();
   let outputText = parseSseOutputText(raw);
   if (!outputText && raw.trim().startsWith('{')) {

@@ -4,9 +4,9 @@ export const META_MODELS = { image: 'muse-image-1.0', sam: 'sam-3.1', spark: 'mu
 // META_BASE_URL already ends in /v1 — endpoints must NOT repeat it (tests caught a /v1/v1 double-prefix).
 export const META_ENDPOINTS = { imageEdits: '/images/edits', responses: '/responses', chatCompletions: '/chat/completions' } as const;
 
-/** Key name is MODEL_API_KEY in .env.local (Damian's choice). Never NEXT_PUBLIC_. */
+/** Key lives in .env.local as MODEL_API_KEY (docs naming) or META_API_KEY (alias). Never NEXT_PUBLIC_. */
 export function metaApiKey(env: Record<string, string | undefined> = process.env): string | null {
-  return env.MODEL_API_KEY || null;
+  return env.MODEL_API_KEY || env.META_API_KEY || null;
 }
 
 export interface SamMask {

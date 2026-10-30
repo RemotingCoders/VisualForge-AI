@@ -1,5 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import { generateDemoScene } from './demoScene';
-import type { Difference } from './engine/types';
+import { persistImageLevel } from './server/db';
+import type { Difference, Mode } from './engine/types';
 /** Server-only store: difference annotations live here, NEVER in the client payload. */
 const g = globalThis as unknown as {
   __vfLevels?: Map<string, Difference[]>;
@@ -22,10 +24,11 @@ export function getDemoPayload(levelId: string) {
   if (!scene || !diffs) return null;
   return { levelId, demo: true as const, original: scene.original, modified: scene.modified, total: diffs.length, isMock: true };
 }
-export function saveImageLevel(level: { differences: Difference[]; original: string; modified: string; width: number; height: number; isMock: boolean }): string {
-  const id = `lvl-${Math.random().toString(36).slice(2, 10)}`;
+export function saveImageLevel(level: { differences: Difference[]; original: string; modified: string; width: number; height: number; isMock: boolean; mode?: Mode; jobId?: string }): string {
+  const id = randomUUID();
   g.__vfLevels!.set(id, level.differences);
   g.__vfImageLevels!.set(id, { original: level.original, modified: level.modified, width: level.width, height: level.height, isMock: level.isMock });
+  void persistImageLevel(id, { ...level, mode: level.mode ?? 'game' }); // durable copy in Supabase (no-op if not configured)
   return id;
 }
 export function getDifferences(levelId: string) { return g.__vfLevels!.get(levelId) ?? null; }

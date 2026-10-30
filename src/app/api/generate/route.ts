@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server';
 import { selectProviders, assertMetaConfigured } from '@/lib/engine/providers';
 import { checkLimits } from '@/lib/limits';
-import { createJob, getJob, jobsToday, runGeneration } from '@/lib/server/jobs';
+import { createJob, resolveJob, jobsToday, runGeneration } from '@/lib/server/jobs';
+import { persistJob, loadLevelPayload } from '@/lib/server/db';
 import { createDemoLevel, getLevelPayload, getDemoPayload } from '@/lib/serverStore';
 
 export const runtime = 'nodejs';
@@ -19,9 +20,9 @@ export async function POST(req: Request) {
   const { providers, label } = selectProviders();
   if (providers.segmentation.isMock) {
     // Honest offline path: labeled demo scene level, instantly playable. No silent fake "AI generation".
-    const job = createJob(mode, true);
+    const job = createJob(mode, true, count);
     const demo = createDemoLevel(Math.floor(Math.random() * 9999));
-    job.status = 'done'; job.stage = 'done'; job.levelId = demo.levelId;
+    job.status = 'done'; job.stage = 'done'; job.levelId = demo.levelId; job.updatedAt = Date.now(); void persistJob(job);
     return NextResponse.json({ jobId: job.id, isMock: true, label, levelId: demo.levelId });
   }
 
@@ -30,7 +31,7 @@ export async function POST(req: Request) {
   if (!imageDataUrl.startsWith('data:image/') || imageDataUrl.length > MAX_IMAGE_CHARS)
     return NextResponse.json({ error: 'imageDataUrl required (data:image/..., max ~9MB)' }, { status: 400 });
 
-  const job = createJob(mode, false);
+  const job = createJob(mode, false, count);
   void runGeneration(job, imageDataUrl, count, providers); // async by design — poll GET
   return NextResponse.json({ jobId: job.id, isMock: false, label });
 }
@@ -38,11 +39,11 @@ export async function POST(req: Request) {
 /** GET ?id=job-... -> job status; when done, the playable level payload (images+total, no annotations). */
 export async function GET(req: Request) {
   const id = new URL(req.url).searchParams.get('id') ?? '';
-  const job = getJob(id);
+  const job = await resolveJob(id);
   if (!job) return NextResponse.json({ error: 'job not found' }, { status: 404 });
   const base = { jobId: job.id, status: job.status, stage: job.stage, isMock: job.isMock, error: job.error ?? null, elapsedSec: Math.round((Date.now() - job.createdAt) / 1000), stageSec: Math.round((Date.now() - job.updatedAt) / 1000) };
   if (job.status === 'done' && job.levelId) {
-    const payload = getLevelPayload(job.levelId) ?? getDemoPayload(job.levelId);
+    const payload = getLevelPayload(job.levelId) ?? getDemoPayload(job.levelId) ?? await loadLevelPayload(job.levelId);
     if (payload) return NextResponse.json({ ...base, level: payload });
     return NextResponse.json({ ...base, levelId: job.levelId });
   }
