@@ -40,7 +40,7 @@ export async function GET(req: Request) {
   const id = new URL(req.url).searchParams.get('id') ?? '';
   const job = getJob(id);
   if (!job) return NextResponse.json({ error: 'job not found' }, { status: 404 });
-  const base = { jobId: job.id, status: job.status, stage: job.stage, isMock: job.isMock, error: job.error ?? null };
+  const base = { jobId: job.id, status: job.status, stage: job.stage, isMock: job.isMock, error: job.error ?? null, elapsedSec: Math.round((Date.now() - job.createdAt) / 1000), stageSec: Math.round((Date.now() - job.updatedAt) / 1000) };
   if (job.status === 'done' && job.levelId) {
     const payload = getLevelPayload(job.levelId) ?? getDemoPayload(job.levelId);
     if (payload) return NextResponse.json({ ...base, level: payload });

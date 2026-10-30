@@ -27,9 +27,9 @@ export default function Play() {
     const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ imageDataUrl: photo || undefined, count, mode: 'game' }) });
     const data = await res.json();
     if (!res.ok) { setJob(''); setMsg(`❌ ${data.error ?? 'generation failed'}`); return; }
-    for (let i = 0; i < 180; i++) {
+    for (let i = 0; i < 600; i++) {
       const s = await (await fetch(`/api/generate?id=${data.jobId}`)).json();
-      setJob(`job ${s.status}${s.stage ? ` · ${s.stage}` : ''}${s.isMock ? ' · MOCK' : ''}`);
+      setJob(`job ${s.status}${s.stage ? ` · ${s.stage}` : ''}${s.isMock ? ' · MOCK' : ''} · ${s.elapsedSec ?? '?'}s elapsed (each AI call takes 3-60s; a full level can take several minutes)`);
       if (s.status === 'failed') { setMsg(`❌ Generation failed: ${s.error ?? 'unknown error'}`); return; }
       if (s.status === 'done' && s.level) {
         const lv = s.level;

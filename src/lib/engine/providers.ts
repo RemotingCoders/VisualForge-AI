@@ -10,9 +10,12 @@ export function assertMetaConfigured(env: Record<string, string | undefined> = p
 }
 
 type FetchFn = typeof fetch;
+/** Hard ceiling per Meta call (spike latencies were 3-17s; big photos can be slower).
+ *  Without this, a stalled connection/stream hangs a generation job forever with no error. */
+export const META_CALL_TIMEOUT_MS = 180_000;
 export async function metaPost(path: string, body: unknown, env: Record<string, string | undefined> = process.env, fetchFn: FetchFn = fetch): Promise<unknown> {
   assertMetaConfigured(env);
-  const res = await fetchFn(`${META_BASE_URL}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${metaApiKey(env)}` }, body: JSON.stringify(body) });
+  const res = await fetchFn(`${META_BASE_URL}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${metaApiKey(env)}` }, body: JSON.stringify(body), signal: AbortSignal.timeout(META_CALL_TIMEOUT_MS) });
   if (!res.ok) throw new Error(`Meta API ${path} → HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`);
   return res.json();
 }
@@ -47,6 +50,7 @@ export async function samSegmentConcept(imageUrl: string, concept: string, env: 
       stream: true,
       metadata: { include_confidence: 'true', mask_encoding: 'one_bit' },
     }),
+    signal: AbortSignal.timeout(META_CALL_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`Meta API SAM → HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`);
   const raw = await res.text();
