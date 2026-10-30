@@ -65,29 +65,33 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
     expect(payload).not.toHaveProperty('differences'); // anti-cheat: annotations never in the client payload
   });
 
-  it('excludes oversized regions so Muse can never repaint the whole photo', async () => {
+  it('shrinks oversized regions so Muse can never repaint the whole photo', async () => {
     const edited = await solidPng(24, 24, [30, 30, 220]);
     const fake: Providers = {
       segmentation: {
         name: 'fake', isMock: true,
         segment: async () => [
-          { id: 'big', bbox: { x: 0, y: 0, width: 39, height: 29 } },  // ~whole 40x30 image — must be filtered out
-          { id: 'small', bbox: { x: 8, y: 6, width: 6, height: 5 } },  // within the 20% side cap (8x6)
+          { id: 'big', bbox: { x: 0, y: 0, width: 99, height: 79 } },  // ~whole 100x80 image — must be shrunk to the 20% cap (20x16)
+          { id: 'small', bbox: { x: 5, y: 5, width: 10, height: 8 } },  // already within cap
         ],
       },
       vision: {
         name: 'fake', isMock: true,
         moderate: async () => ({ ok: true, reason: 'ok' }),
-        plan: async (_i, regions) => regions.map((r, i) => ({ id: `c-${r.id}`, regionId: r.id, type: 'change color', description: `change in ${r.id}`, editPrompt: 'edit' })),
+        plan: async (_i, regions) => regions.map(r => ({ id: `c-${r.id}`, regionId: r.id, type: 'change color', description: `change in ${r.id}`, editPrompt: 'edit' })),
         verify: async () => ({ ok: true, notes: 'ok' }),
       },
       imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => edited, generateScene: async () => { throw new Error('not used'); } },
     };
     const job = createJob('game', true);
-    await runGeneration(job, await solidPng(40, 30, [120, 120, 120]), 2, fake);
+    await runGeneration(job, await solidPng(100, 80, [120, 120, 120]), 2, fake);
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     const diffs = getDifferences(job.levelId!)!;
-    expect(diffs.map(d => d.id)).toEqual(['c-small']); // the whole-image region never became a difference
+    expect(diffs.map(d => d.id).sort()).toEqual(['c-big', 'c-small']);
+    for (const d of diffs) {
+      expect(d.bbox.width).toBeLessThanOrEqual(100 * 0.32);  // no difference may span the photo
+      expect(d.bbox.height).toBeLessThanOrEqual(80 * 0.32);
+    }
   });
 
   it('marks the job failed when moderation rejects (no silent fallback)', async () => {

@@ -1,13 +1,15 @@
 import { enforceSpacing, maskToBBox, normalizeBBox } from '../engine/geometry';
-import type { Providers, Mode, Difference } from '../engine/types';
-import { normalizeImage, cropDataUrl, expandBox, compositeCrop, diffMask, providerImage } from './imageOps';
+import type { Providers, Mode, Difference, Region } from '../engine/types';
+import { normalizeImage, cropDataUrl, expandBox, compositeCrop, diffMask, providerImage, clampBox } from './imageOps';
 import { saveImageLevel } from '../serverStore';
 
 export type JobStatus = 'queued' | 'running' | 'done' | 'failed';
-/** Differences must stay SMALL and localized: candidate regions may not exceed this fraction
- *  of the image side, and a measured diff larger than MEASURED_CAP is discarded from the level. */
+/** Differences must stay SMALL and localized: candidate regions are shrunk to at most this
+ *  fraction of the image side, and a measured diff larger than MEASURED_CAP is discarded.
+ *  MEASURED_CAP must exceed region cap x crop expansion (0.20 x 1.5 = 0.30) or every
+ *  max-size change is discarded by construction. */
 export const MAX_REGION_FRACTION = 0.2;
-export const MAX_MEASURED_FRACTION = 0.28;
+export const MAX_MEASURED_FRACTION = 0.32;
 export interface Job {
   id: string; status: JobStatus; stage: string; mode: Mode; isMock: boolean;
   error?: string; levelId?: string; createdAt: number; updatedAt: number;
@@ -44,12 +46,18 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
 
     setStage('segmenting');
     const rawRegions = await providers.segmentation.segment(aiImg, width, height);
-    // Size cap FIRST (before spacing): huge regions (e.g. a whole-scene SAM box) would let Muse
-    // repaint most of the photo — the exact failure rejected in spike call 4/6.
-    const small = rawRegions.filter(r => r.bbox.width <= width * MAX_REGION_FRACTION && r.bbox.height <= height * MAX_REGION_FRACTION);
-    const pool = small.length ? small
-      : [...rawRegions].sort((a, b) => a.bbox.width * a.bbox.height - b.bbox.width * b.bbox.height).slice(0, 5); // fallback: smallest available
-    const regions = enforceSpacing(pool);
+    // Size cap: shrink oversized regions (centered) instead of discarding them — a whole-scene
+    // SAM box would otherwise let Muse repaint most of the photo (spike call 4/6 failure mode),
+    // while plain discarding can leave too few candidates on photos with only large objects.
+    const capW = Math.max(8, Math.floor(width * MAX_REGION_FRACTION));
+    const capH = Math.max(8, Math.floor(height * MAX_REGION_FRACTION));
+    const capRegion = (r: Region): Region => {
+      if (r.bbox.width <= capW && r.bbox.height <= capH) return r;
+      const w = Math.min(r.bbox.width, capW), h = Math.min(r.bbox.height, capH);
+      const cx = r.bbox.x + r.bbox.width / 2, cy = r.bbox.y + r.bbox.height / 2;
+      return { ...r, bbox: clampBox({ x: cx - w / 2, y: cy - h / 2, width: w, height: h }, width, height) };
+    };
+    const regions = enforceSpacing(rawRegions.map(capRegion));
     if (!regions.length) throw new Error('segmentation found no usable regions');
 
     setStage('planning');
