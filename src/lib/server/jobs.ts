@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { enforceSpacing, maskToBBox, maskCentroid, normalizeBBox } from '../engine/geometry';
+import { enforceSpacing, maskToBBox, maskCentroid, normalizeBBox, overlaps } from '../engine/geometry';
 import type { Providers, Mode, Difficulty, Difference, Region } from '../engine/types';
-import { normalizeImage, cropDataUrl, expandBox, diffMask, providerImage, clampBox, recolorCrop, squareContextBox, compositeMaskedEdit, estimateAlignment, alignEditedCrop, ALIGNMENT_MAX_RESIDUAL, cropColorStats, colorDeltaE, targetHueFromColor, cropDominantHue, transformObjectInPaste, duplicateObjectInPaste, type LocalTransformKind } from './imageOps';
+import { normalizeImage, cropDataUrl, expandBox, expandMask, diffMask, providerImage, clampBox, recolorCrop, squareContextBox, compositeMaskedEdit, estimateAlignment, alignEditedCrop, ALIGNMENT_MAX_RESIDUAL, cropColorStats, colorDeltaE, targetHueFromColor, cropDominantHue, transformObjectInPaste, duplicateObjectInPaste, extractOnePassComponents, compositeOnePassComponents, type OnePassComponent, type LocalTransformKind } from './imageOps';
 import { saveImageLevel } from '../serverStore';
 import { persistJob, loadJob } from './db';
 
@@ -42,7 +42,18 @@ export function createJob(mode: Mode, isMock: boolean, requestedChanges?: number
  * Providers are injected so the whole loop is testable offline with fakes — no paid calls in tests.
  */
 export async function runGeneration(job: Job, imageDataUrl: string, count: number, providers: Providers): Promise<void> {
-  const setStage = (s: string) => { job.stage = s; job.updatedAt = Date.now(); console.info(`[generate ${job.id}] stage: ${s}`); void persistJob(job); };
+  // Per-model call counters + per-stage wall time, printed in the final summary.
+  const calls = { muse: 0, spark: 0, sam: 0 };
+  const stageMs: Record<string, number> = {};
+  let stageStartedAt = Date.now(); let stageName = 'init';
+  const flushStage = () => { stageMs[stageName] = (stageMs[stageName] ?? 0) + (Date.now() - stageStartedAt); stageStartedAt = Date.now(); };
+  const setStage = (s: string) => { flushStage(); stageName = s.replace(/\d+/g, 'n'); job.stage = s; job.updatedAt = Date.now(); console.info(`[generate ${job.id}] stage: ${s}`); void persistJob(job); };
+  let modeUsed = job.mode === 'qc' ? 'crops (qc)' : 'crops';
+  const logSummary = (differences: Difference[]) => {
+    flushStage();
+    const stages = Object.entries(stageMs).filter(([k]) => k !== 'init').map(([k, ms]) => `${k}=${(ms / 1000).toFixed(1)}s`).join(' ');
+    console.info(`[generate ${job.id}] summary: mode=${modeUsed} · differences ${differences.length}/${count} · calls muse=${calls.muse} spark=${calls.spark} sam=${calls.sam} · stage time: ${stages}`);
+  };
   try {
     job.status = 'running';
     setStage('normalizing');
@@ -52,11 +63,107 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
     const aiImg = await providerImage(img.dataUrl); // light JPEG twin for API calls (same dimensions)
 
     setStage('moderating');
-    const mod = await providers.vision.moderate(aiImg);
+    const mod = await providers.vision.moderate(aiImg); calls.spark++;
     if (!mod.ok) throw new Error(`moderation rejected: ${mod.reason}`);
 
+    const differences: Difference[] = [];
+    const difficulty = job.difficulty ?? 'medium';
+
+    // ================= ONE-PASS (game mode main path) =================
+    // One full-image Muse call -> global alignment compensation -> low-pass/new-edge
+    // extraction (calibrated offline) -> compose ONLY the chosen components over the
+    // original -> re-measure -> ONE batched Spark review. Second pass for the missing
+    // count, then the crop pipeline below tops up whatever is still missing.
+    type Measured = { mask: boolean[]; bbox: NonNullable<ReturnType<typeof maskToBBox>> };
+    const measureComposed = async (composed: string, comps: OnePassComponent[]): Promise<(Measured & { comp: OnePassComponent })[]> => {
+      const fullMask = await diffMask(img.dataUrl, composed, width, height);
+      const out: (Measured & { comp: OnePassComponent })[] = [];
+      for (const comp of comps) {
+        const zone = expandMask(comp.mask, width, height, 6);
+        const mask = fullMask.map((v, i) => v && zone[i]);
+        const bbox = maskToBBox(mask, width, height);
+        if (bbox) out.push({ comp, mask, bbox });
+      }
+      return out;
+    };
+    const reviewMeasured = async (composed: string, measured: (Measured & { comp: OnePassComponent })[]): Promise<(Measured & { comp: OnePassComponent; description: string; type: string; notes: string })[]> => {
+      if (!measured.length) return [];
+      if (!providers.vision.reviewDifferences) {
+        return measured.map((m, i) => ({ ...m, description: `Difference ${differences.length + i + 1}`, type: 'other', notes: 'no batched review available on this provider' }));
+      }
+      const pairs = await Promise.all(measured.map(async (m, i) => {
+        const box = squareContextBox(m.bbox, width, height, 192);
+        const before = await cropDataUrl(img.dataUrl, box);
+        const after = await cropDataUrl(composed, box);
+        return { index: i, before: await providerImage(before.cropDataUrl), after: await providerImage(after.cropDataUrl), bbox: { x: m.bbox.x - box.x, y: m.bbox.y - box.y, width: m.bbox.width, height: m.bbox.height } };
+      }));
+      const reviews = await providers.vision.reviewDifferences(pairs); calls.spark++;
+      const kept: (Measured & { comp: OnePassComponent; description: string; type: string; notes: string })[] = [];
+      for (const m of measured) {
+        const i = measured.indexOf(m);
+        const r = reviews.find(x => x.index === i);
+        console.info(`[generate ${job.id}] onepass review #${i}: ok=${r?.ok ?? 'missing'} type=${r?.type ?? ''} description="${r?.description ?? ''}" notes="${r?.notes ?? ''}"`);
+        if (r?.ok) kept.push({ ...m, description: r.description, type: r.type || 'other', notes: r.notes });
+      }
+      return kept;
+    };
+    const runOnePassPass = async (passBase: string, want: number, label: string): Promise<string | null> => {
+      if (!providers.imageEdit.editFullImage || want <= 0) return null;
+      const prompt = label === 'pass1'
+        ? `Make exactly ${want} minimal, realistic differences for a spot-the-difference game (for example: remove a small part of an object, add a small detail to an object, add a small object in an empty area). To get variety, vary the kind of change: add a small detail, remove a small part, add a small object, change one color, swap one element. Keep everything else pixel-identical: same framing, scale, colors and lighting.`
+        : `Make exactly ${want} additional minimal, realistic differences for a spot-the-difference game, in places that do not already contain a difference. To get variety, vary the kind of change: add a small detail, remove a small part, add a small object, change one color, swap one element. Keep everything else pixel-identical: same framing, scale, colors and lighting.`;
+      const edited = await providers.imageEdit.editFullImage(await providerImage(passBase), prompt); calls.muse++;
+      const est = await estimateAlignment(passBase, edited);
+      console.info(`[generate ${job.id}] onepass ${label} alignment: shift (${est.shiftX}, ${est.shiftY})px · scale ${est.scale.toFixed(2)} · residual error ${est.error.toFixed(1)}`);
+      if (!est.aligned) { console.info(`[generate ${job.id}] onepass ${label} discarded: residual alignment error ${est.error.toFixed(1)} exceeds ${ALIGNMENT_MAX_RESIDUAL}`); return null; }
+      const aligned = await alignEditedCrop(passBase, edited, est);
+      const { components, discarded } = await extractOnePassComponents(passBase, aligned);
+      for (const d of discarded) console.info(`[generate ${job.id}] onepass ${label} discarded component: ${d.area}px amp ${d.meanAmp.toFixed(1)} bbox (${d.bbox.x},${d.bbox.y}) ${d.bbox.width}x${d.bbox.height} — ${d.reason}`);
+      for (const c of components) console.info(`[generate ${job.id}] onepass ${label} component: ${c.area}px amp ${c.meanAmp.toFixed(1)} meanLp ${c.meanLp.toFixed(1)} newEdge ${c.meanNewEdge.toFixed(1)} tex ${c.meanTex.toFixed(1)} score ${Math.round(c.score)} bbox (${c.bbox.x},${c.bbox.y}) ${c.bbox.width}x${c.bbox.height}`);
+      const fresh = components.filter(c => !differences.some(d => overlaps(d.bbox, c.bbox, 4)));
+      const chosen = fresh.slice(0, want);
+      console.info(`[generate ${job.id}] onepass ${label}: chose ${chosen.length}/${components.length} components (${fresh.length} not overlapping existing differences)`);
+      if (!chosen.length) return null;
+      let composed = await compositeOnePassComponents(passBase, aligned, chosen);
+      let kept = await reviewMeasured(composed, await measureComposed(composed, chosen));
+      if (!kept.length) return null;
+      if (kept.length < chosen.length) { // recompose without the Spark-rejected components, re-measure only (no second review)
+        const keptComps = kept.map(k => k.comp);
+        composed = await compositeOnePassComponents(passBase, aligned, keptComps);
+        const remeasured = await measureComposed(composed, keptComps);
+        kept = remeasured.map(m => { const prev = kept.find(k => k.comp === m.comp)!; return { ...m, description: prev.description, type: prev.type, notes: prev.notes }; });
+        if (!kept.length) return null;
+      }
+      for (const k of kept) {
+        differences.push({
+          id: `onepass-${differences.length + 1}`, type: k.type, description: k.description, bbox: k.bbox, bbox_normalized: normalizeBBox(k.bbox, width, height),
+          centroid: maskCentroid(k.mask, width, height) ?? { x: k.bbox.x + k.bbox.width / 2, y: k.bbox.y + k.bbox.height / 2 },
+          mask_url: null, severity: 'medium', verification_status: 'verified', verifier_notes: `one-pass ${label}: ${k.notes}`,
+        });
+      }
+      return composed;
+    };
+
+    if (job.mode === 'game') {
+      try {
+        setStage('one-pass: editing full image (Muse)');
+        const afterPass1 = await runOnePassPass(img.dataUrl, count, 'pass1');
+        if (afterPass1) { current = afterPass1; modeUsed = 'one-pass'; }
+        if (differences.length > 0 && differences.length < count) {
+          setStage(`one-pass: second pass · ${differences.length}/${count} done`);
+          const afterPass2 = await runOnePassPass(current, count - differences.length, 'pass2');
+          if (afterPass2) current = afterPass2;
+        }
+      } catch (e) {
+        console.info(`[generate ${job.id}] one-pass failed (${e instanceof Error ? e.message : String(e)}) — falling back to crop pipeline`);
+      }
+      if (differences.length) console.info(`[generate ${job.id}] one-pass delivered ${differences.length}/${count} — ${differences.length < count ? 'crop pipeline will top up' : 'no crop pipeline needed'}`);
+    }
+
+    // ================= CROP PIPELINE (QC always; game top-up / fallback) =================
+    const cropTopUp = async (): Promise<void> => {
     setStage('segmenting');
-    const rawRegions = await providers.segmentation.segment(aiImg, width, height);
+    const rawRegions = await providers.segmentation.segment(aiImg, width, height); calls.sam++;
     // wholeObject is decided by SAM's box AREA: <= 8% of the image = whole object. Only
     // above that do we center-crop (aspect preserved, scaled to the area cap) and mark it
     // fragment (wholeObject=false: color/add only in game mode — removing, replacing or
@@ -81,8 +188,8 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
     // Ask for MORE candidates than needed (count + 3, priority-ordered, with the variety
     // quota in the planner prompt): the executor walks the list and stops at `count`
     // achieved — discarded candidates no longer sink the whole level.
-    const difficulty = job.difficulty ?? 'medium';
-    const planned = await providers.vision.plan(aiImg, regions, job.mode, count + 3, difficulty);
+    const want = Math.max(1, count - differences.length);
+    const planned = await providers.vision.plan(aiImg, regions, job.mode, want + 3, difficulty); calls.spark++;
     if (!planned.length) throw new Error('planner returned no changes');
     // Hard rule (GAME mode only): remove/replace/geometric transforms on a FRAGMENT make
     // objects look broken, so downgrade those to a color change. "add object" stays: it puts
@@ -110,7 +217,7 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
     type MuseBudget = { calls: number };
     const applyMuse = async (base: string, ch: (typeof plan)[number], region: Region, prompt: string, budget: MuseBudget): Promise<Candidate | null> => {
       if (budget.calls >= 2) { console.info(`[generate ${job.id}] change ${ch.id} discarded: Muse call budget exhausted (max 2 per change)`); return null; }
-      budget.calls++;
+      budget.calls++; calls.muse++;
       // A: square CONTEXT box to Muse; separate smaller PASTE box (object + small margin).
       const contextBox = squareContextBox(region.bbox, width, height);
       const pasteBox = expandBox(region.bbox, 0.15, width, height);
@@ -143,27 +250,31 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
       const targetHue = targetHueFromColor(ch.targetColor);
       if (ch.targetColor && targetHue === null) { console.info(`[generate ${job.id}] change ${ch.id}: local recolor skipped — target color "${ch.targetColor}" has no hue (achromatic/unknown), Muse fallback`); return null; }
       if (stats.saturatedFraction < 0.05) { console.info(`[generate ${job.id}] change ${ch.id}: local recolor skipped — low-chroma object (saturated fraction ${stats.saturatedFraction.toFixed(2)}), Muse fallback`); return null; }
-      // Minimum OKLab ΔE of 0.12 against the original: try the planned hue first; if it
-      // cannot reach the bar, fall back to the FARTHEST hue from the object's dominant hue.
+      // The planned target color is EXACT: when targetColor names a hue we recolor to
+      // THAT hue (yellow=100°, green=145°, red=29° in OKLCH) and nothing else. Only when
+      // targetColor is empty do we pick the hue FARTHEST from the object's current
+      // dominant hue (dominant + 180°). Never a hash-derived shift, never "the candidate
+      // with the biggest ΔE" (that used to override the requested color: yellow star
+      // came out green, green "1" came out red).
       const dominantHue = await cropDominantHue(objCrop);
-      const shifts = [105, 145, -105, -145, 180];
-      const shift = shifts[[...ch.id].reduce((a, c) => a + c.charCodeAt(0), 0) % shifts.length];
-      const hueCandidates: (number | undefined)[] = [targetHue ?? undefined];
-      if (dominantHue !== null) for (const h of [(dominantHue + 180) % 360, (dominantHue + 120) % 360]) if (!hueCandidates.some(x => x !== undefined && Math.abs(x - h) < 5)) hueCandidates.push(h);
-      let best: { recolored: string; meanDeltaE: number; changedPixels: number; hue: number | undefined } | null = null;
-      for (const hue of hueCandidates) {
-        const recolored = await recolorCrop(objCrop, shift, hue);
-        const delta = await colorDeltaE(objCrop, recolored, cropBox.width, cropBox.height);
-        if (delta.changedPixels >= 30 && (!best || delta.meanDeltaE > best.meanDeltaE)) best = { recolored, meanDeltaE: delta.meanDeltaE, changedPixels: delta.changedPixels, hue };
-      }
-      if (!best || best.meanDeltaE < 0.12) { console.info(`[generate ${job.id}] change ${ch.id}: local recolor skipped — best ΔE ${best ? best.meanDeltaE.toFixed(3) : 'n/a'} below 0.12 minimum, Muse fallback`); return null; }
+      let chosenHue: number | null = targetHue;
+      if (chosenHue === null && dominantHue !== null) chosenHue = (dominantHue + 180) % 360;
+      if (chosenHue === null) { console.info(`[generate ${job.id}] change ${ch.id}: local recolor skipped — no target hue and no dominant hue, Muse fallback`); return null; }
+      const recolored = await recolorCrop(objCrop, 0, chosenHue);
+      const delta = await colorDeltaE(objCrop, recolored, cropBox.width, cropBox.height);
+      const resultHue = await cropDominantHue(recolored);
+      const hueDist = (a: number, b: number) => { const d = Math.abs(a - b) % 360; return d > 180 ? 360 - d : d; };
+      console.info(`[generate ${job.id}] change ${ch.id} color: target="${ch.targetColor ?? ''}" targetHue=${targetHue !== null ? Math.round(targetHue) + '°' : 'none'} chosenHue=${Math.round(chosenHue)}° dominantBefore=${dominantHue !== null ? Math.round(dominantHue) + '°' : 'none'} resultHue=${resultHue !== null ? Math.round(resultHue) + '°' : 'none'} ΔE=${delta.meanDeltaE.toFixed(3)} changedPx=${delta.changedPixels}`);
+      if (targetHue !== null && resultHue !== null && hueDist(resultHue, targetHue) > 35) { console.info(`[generate ${job.id}] change ${ch.id}: local recolor rejected — result hue ${Math.round(resultHue)}° does not match target ${Math.round(targetHue)}°, Muse fallback`); return null; }
+      if (delta.changedPixels < 30 || delta.meanDeltaE < 0.12) { console.info(`[generate ${job.id}] change ${ch.id}: local recolor skipped — ΔE ${delta.meanDeltaE.toFixed(3)} / ${delta.changedPixels}px below minimum (ΔE 0.12, 30px), Muse fallback`); return null; }
+      const best = { recolored, meanDeltaE: delta.meanDeltaE, changedPixels: delta.changedPixels, hue: chosenHue };
       const next = await compositeMaskedEdit(base, best.recolored, region.bbox, region.bbox);
       const mask = await diffMask(base, next, width, height);
       const bbox = maskToBBox(mask, width, height);
       if (!bbox) { console.info(`[generate ${job.id}] change ${ch.id} discarded: recolor produced no measurable diff`); return null; }
       if (!measuredOk(bbox)) { console.info(`[generate ${job.id}] change ${ch.id} discarded: recolor diff ${bbox.width}x${bbox.height} (area ${bbox.width * bbox.height}px) exceeds area cap ${Math.floor(width * height * MAX_MEASURED_AREA_FRACTION)}px`); return null; }
       // E: local verification (ΔE + changed mask) — no Spark call for deterministic colors.
-      return { next, mask, bbox, local: true, notes: `local OKLCH verify: ΔE ${best.meanDeltaE.toFixed(3)} over ${best.changedPixels}px, hue ${best.hue !== undefined ? Math.round(best.hue) + '°' : `shift ${shift}°`} (no Spark call)` };
+      return { next, mask, bbox, local: true, notes: `local OKLCH verify: ΔE ${best.meanDeltaE.toFixed(3)} over ${best.changedPixels}px, target hue ${Math.round(best.hue)}° result hue ${resultHue !== null ? Math.round(resultHue) + '°' : 'n/a'} (no Spark call)` };
     };
 
     const LOCAL_KIND = (type: string): LocalTransformKind | null =>
@@ -199,13 +310,13 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
       return { next, mask, bbox, local: true, notes: `local deterministic ${detail}: ${changedPixels}px changed (no Spark call)` };
     };
 
-    const differences: Difference[] = [];
     let idx = 0;
     for (const ch of plan) {
       if (differences.length >= count) break; // candidates are a priority list: stop at count
       idx++;
       const region = regions.find(r => r.id === ch.regionId);
       if (!region) { console.info(`[generate ${job.id}] change ${ch.id} discarded: unknown regionId ${ch.regionId}`); continue; }
+      if (differences.some(d => overlaps(d.bbox, region.bbox, 4))) { console.info(`[generate ${job.id}] change ${ch.id} discarded: region overlaps an already-accepted difference`); continue; }
       setStage(`editing ${idx}/${plan.length} · ${differences.length}/${count} done`);
       const budget: MuseBudget = { calls: 0 };
       const isColor = /colou?r/i.test(ch.type);
@@ -221,13 +332,25 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
       let notes = candidate.notes;
       if (!candidate.local) {
         setStage(`verifying ${idx}/${plan.length} · ${differences.length}/${count} done`);
-        let verdict = await providers.vision.verify(aiImg, await providerImage(candidate.next), ch, candidate.bbox);
+        // Verify the change IN ISOLATION: the image as it was JUST BEFORE this change
+        // (current) vs the candidate, BOTH cropped to the context box. Comparing the
+        // original against the accumulated image made the verifier reject changes for
+        // "differences outside the region" that were earlier, already-accepted changes.
+        const verifyChange = async (cand: Candidate): Promise<{ ok: boolean; notes: string }> => {
+          const contextBox = squareContextBox(region.bbox, width, height);
+          const rel = { x: cand.bbox.x - contextBox.x, y: cand.bbox.y - contextBox.y, width: cand.bbox.width, height: cand.bbox.height };
+          const { cropDataUrl: beforeCrop } = await cropDataUrl(current, contextBox);
+          const { cropDataUrl: afterCrop } = await cropDataUrl(cand.next, contextBox);
+          const verdict = await providers.vision.verify(await providerImage(beforeCrop), await providerImage(afterCrop), ch, rel); calls.spark++;
+          return verdict;
+        };
+        let verdict = await verifyChange(candidate);
         if (!verdict.ok) {
           // E: re-edit ONCE within the same Muse budget (never re-ask the verifier the
           // same question), then discard and move to the next candidate.
           const retry = await applyMuse(current, ch, region, `${ch.editPrompt} The previous attempt failed verification (${verdict.notes}); apply the change more clearly and realistically, confined to the same object.`, budget);
           if (retry) {
-            verdict = await providers.vision.verify(aiImg, await providerImage(retry.next), ch, retry.bbox);
+            verdict = await verifyChange(retry);
             if (verdict.ok) candidate = retry;
           }
           if (!verdict.ok) { console.info(`[generate ${job.id}] change ${ch.id} discarded after re-edit: ${verdict.notes}`); continue; }
@@ -242,8 +365,19 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
       });
       current = candidate.next;
     }
-    if (differences.length < count) console.info(`[generate ${job.id}] candidates exhausted: achieved ${differences.length}/${count} requested changes`);
+    if (differences.length < count) console.info(`[generate ${job.id}] crop candidates exhausted: at ${differences.length}/${count} requested changes`);
+    }; // end cropTopUp
+
+    if (differences.length < count) {
+      if (job.mode === 'game' && differences.length > 0) modeUsed = 'one-pass + crops';
+      try { await cropTopUp(); }
+      catch (e) {
+        if (!differences.length) throw e;
+        console.info(`[generate ${job.id}] crop top-up failed (${e instanceof Error ? e.message : String(e)}) — keeping the ${differences.length} one-pass difference(s)`);
+      }
+    }
     if (!differences.length) throw new Error('no change survived measurement/verification');
+    logSummary(differences);
 
     job.levelId = saveImageLevel({ differences, original: img.dataUrl, modified: current, width, height, isMock: providers.segmentation.isMock, mode: job.mode, jobId: job.id });
     job.status = 'done'; setStage('done');

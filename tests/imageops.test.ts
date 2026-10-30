@@ -432,4 +432,98 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
     expect(getJob(job.id)?.status).toBe('failed');
     expect(getJob(job.id)?.error).toContain('moderation rejected');
   });
+
+  it('color: recolors to the EXACT planned targetColor hue (yellow stays yellow)', async () => {
+    const base = await sharp({ create: { width: 100, height: 80, channels: 3, background: { r: 120, g: 120, b: 120 } } })
+      .composite([{ input: await sharp({ create: { width: 12, height: 10, channels: 3, background: { r: 220, g: 30, b: 30 } } }).png().toBuffer(), left: 40, top: 25 }])
+      .png().toBuffer();
+    let museCalled = false;
+    const fake: Providers = {
+      segmentation: { name: 'fake', isMock: true, segment: async () => [{ id: 'r1', bbox: { x: 40, y: 25, width: 12, height: 10 } }] },
+      vision: {
+        name: 'fake', isMock: true,
+        moderate: async () => ({ ok: true, reason: 'ok' }),
+        plan: async () => [{ id: 'c1', regionId: 'r1', type: 'change color', description: 'square turned yellow', editPrompt: 'turn it yellow', targetColor: 'yellow' }],
+        verify: async () => ({ ok: true, notes: 'ok' }),
+      },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { museCalled = true; throw new Error('local recolor must handle an exact target hue'); }, generateScene: async () => '' },
+    };
+    const job = createJob('game', true);
+    await runGeneration(job, bufferToDataUrl(base), 1, fake);
+    expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
+    expect(museCalled).toBe(false);
+    const diffs = getDifferences(job.levelId!)!;
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0].verifier_notes).toContain('target hue 100°'); // yellow in OKLCH
+    const payload = getLevelPayload(job.levelId!)!;
+    const { data, width } = await rawPixels(payload.modified);
+    const o = (30 * width + 45) * 3; // inside the recolored square
+    const [r, g, b] = [data[o], data[o + 1], data[o + 2]];
+    // Yellow family at the object's preserved lightness: R≈G, both far above B.
+    // (Green would be G>>R, red would be R>>G — the exact regression from the field.)
+    expect(r).toBeGreaterThan(120); expect(g).toBeGreaterThan(110); expect(b).toBeLessThan(110);
+    expect(Math.abs(r - g)).toBeLessThan(60); expect(b).toBeLessThan(Math.min(r, g) - 50);
+  });
+
+  it('verifier compares BEFORE-this-change (current) vs candidate, cropped — accumulated changes do not leak in', async () => {
+    const seen: { before: string; after: string }[] = [];
+    const fake: Providers = {
+      segmentation: { name: 'fake', isMock: true, segment: async () => [{ id: 'r1', bbox: { x: 40, y: 25, width: 10, height: 8 } }] },
+      vision: {
+        name: 'fake', isMock: true,
+        moderate: async () => ({ ok: true, reason: 'ok' }),
+        plan: async () => [{ id: 'c1', regionId: 'r1', type: 'remove object', description: 'remove block', editPrompt: 'remove it' }],
+        verify: async (before: string, after: string) => { seen.push({ before, after }); return { ok: true, notes: 'ok' }; },
+      },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async (imageRef: string, region: { bbox: { x: number; y: number; width: number; height: number } }) => paintPatternBlue(imageRef, region), generateScene: async () => '' },
+    };
+    const job = createJob('game', true);
+    await runGeneration(job, await solidPng(100, 80, [120, 120, 120]), 1, fake);
+    expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
+    expect(seen).toHaveLength(1);
+    // Crops are square context boxes, NOT the full 100x80 frame:
+    const info = await rawPixels(seen[0].before);
+    expect(info.width).toBe(info.height);
+    expect(info.width).toBeLessThan(100);
+    // BEFORE crop is the untouched gray scene (no blue yet): center pixel ~gray
+    const { data, width } = info; const o = ((width / 2 | 0) * width + (width / 2 | 0)) * 3;
+    expect(Math.abs(data[o] - data[o + 2])).toBeLessThan(30);
+  });
+
+  it('one-pass is the main game path: 1 full-image call + 1 batched review, no segmentation', async () => {
+    let fullImageCalls = 0, segmentCalls = 0, reviewCalls = 0;
+    // Fake Muse full-image edit: paint a solid red square at (60,50,14x12) on the gray scene.
+    const editFull = async (imageRef: string) => {
+      fullImageCalls++;
+      const { data, width, height } = await rawPixels(imageRef);
+      const out = Buffer.from(data);
+      for (let y = 50; y < 62; y++) for (let x = 60; x < 74; x++) { const o = (y * width + x) * 3; out[o] = 230; out[o + 1] = 30; out[o + 2] = 30; }
+      return bufferToDataUrl(await sharp(out, { raw: { width, height, channels: 3 } }).png().toBuffer());
+    };
+    const fake: Providers = {
+      segmentation: { name: 'fake', isMock: true, segment: async () => { segmentCalls++; return []; } },
+      vision: {
+        name: 'fake', isMock: true,
+        moderate: async () => ({ ok: true, reason: 'ok' }),
+        plan: async () => [], verify: async () => ({ ok: true, notes: 'ok' }),
+        reviewDifferences: async (pairs: { index: number }[]) => { reviewCalls++; return pairs.map(p => ({ index: p.index, ok: true, description: 'A red square appeared', type: 'add object', notes: 'fake review ok' })); },
+      },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { throw new Error('crop edit must not run when one-pass delivers'); }, editFullImage: editFull, generateScene: async () => '' },
+    };
+    const job = createJob('game', true);
+    await runGeneration(job, await solidPng(100, 80, [120, 120, 120]), 1, fake);
+    expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
+    expect(fullImageCalls).toBe(1);
+    expect(reviewCalls).toBe(1);
+    expect(segmentCalls).toBe(0); // crop pipeline never ran
+    const diffs = getDifferences(job.levelId!)!;
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0].id).toContain('onepass');
+    expect(diffs[0].description).toBe('A red square appeared');
+    expect(diffs[0].bbox.x).toBeGreaterThanOrEqual(55); expect(diffs[0].bbox.x).toBeLessThanOrEqual(65);
+    // Outside the composed component the modified image stays pixel-identical to the original:
+    const payload = getLevelPayload(job.levelId!)!;
+    const { data } = await rawPixels(payload.modified);
+    expect([data[0], data[1], data[2]]).toEqual([120, 120, 120]);
+  });
 });

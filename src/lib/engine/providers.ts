@@ -1,4 +1,4 @@
-import type { Providers, Region, PlannedChange, Mode, Difficulty, BBox, SegmentationProvider, VisionReasoningProvider, ImageEditProvider } from './types';
+import type { Providers, Region, PlannedChange, Mode, Difficulty, BBox, SegmentationProvider, VisionReasoningProvider, ImageEditProvider, DifferenceReview } from './types';
 import { META_BASE_URL, META_MODELS, META_ENDPOINTS, metaApiKey, parseSamOutput, parseSseOutputText, type SamObject } from './meta';
 import { logAiCall } from '../server/db';
 
@@ -113,6 +113,23 @@ export const SPARK_SCHEMAS = {
     properties: { ok: { type: 'boolean' }, notes: { type: 'string' } },
     required: ['ok', 'notes'], additionalProperties: false,
   },
+  differenceReview: {
+    type: 'object',
+    properties: {
+      reviews: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            index: { type: 'integer' }, ok: { type: 'boolean' },
+            description: { type: 'string' }, type: { type: 'string' }, notes: { type: 'string' },
+          },
+          required: ['index', 'ok', 'description', 'type', 'notes'], additionalProperties: false,
+        },
+      },
+    },
+    required: ['reviews'], additionalProperties: false,
+  },
 } as const;
 
 /**
@@ -155,12 +172,13 @@ class MetaProvider implements SegmentationProvider, VisionReasoningProvider, Ima
       });
       labels = listed.concepts;
     }
-    const regions: Region[] = [];
-    for (const label of labels.slice(0, 8)) {
+    // One SAM request per concept, ALL IN PARALLEL (they are independent; serial calls
+    // cost ~19s of wall time for a full concept list). Order stays deterministic.
+    const perConcept = await Promise.all(labels.slice(0, 8).map(async label => {
       const objects = await samSegmentConcept(imageRef, label);
-      for (const o of objects) regions.push({ id: `sam-${label.replace(/\s+/g, '-').toLowerCase()}-${o.id}`, bbox: o.bbox, label });
-    }
-    return regions;
+      return objects.map(o => ({ id: `sam-${label.replace(/\s+/g, '-').toLowerCase()}-${o.id}`, bbox: o.bbox, label }));
+    }));
+    return perConcept.flat();
   }
   async moderate(imageRef: string): Promise<{ ok: boolean; reason: string }> {
     return sparkStructured({
@@ -190,12 +208,26 @@ class MetaProvider implements SegmentationProvider, VisionReasoningProvider, Ima
       images: [imageRef, modifiedRef], schemaName: 'Verification', schema: SPARK_SCHEMAS.verification,
     });
   }
+  async reviewDifferences(pairs: { index: number; before: string; after: string; bbox: BBox }[]): Promise<DifferenceReview[]> {
+    const images: string[] = [];
+    for (const p of pairs) images.push(p.before, p.after);
+    const out = await sparkStructured<{ reviews: DifferenceReview[] }>({
+      prompt: `You are given ${pairs.length} pairs of image crops for a spot-the-difference game, in this order: pair 0 BEFORE, pair 0 AFTER, pair 1 BEFORE, pair 1 AFTER, and so on. The measured change regions are: ${JSON.stringify(pairs.map(p => ({ index: p.index, bbox: p.bbox })))}. For EACH pair decide: ok=true only if a real, describable visual difference exists between BEFORE and AFTER inside that region (an object added, removed, recolored, swapped or altered) and it looks realistic — ok=false if the two crops are effectively the same scene re-rendered (texture/lighting noise only, no describable change). For ok pairs give a short player-facing description of the difference (e.g. "A ladybug appeared on the stem") and a type (one of: "add object", "remove object", "change color", "replace object", "other"). Return exactly one review per pair, keeping its index.`,
+      images, schemaName: 'DifferenceReview', schema: SPARK_SCHEMAS.differenceReview,
+    });
+    return out.reviews;
+  }
   async editMaskedRegion(imageRef: string, _r: Region, prompt: string): Promise<string> {
     // Crop+margin -> edit crop -> resize back -> feathered composite happens in the worker (worker/composite.py);
     // the verified Muse Image call itself has no mask parameter and returns 1600x1600 WebP (spike 3/6).
     // Preservation clause: Muse repaints what it returns, so the prompt must pin everything else down.
     const guarded = `${prompt}. IMPORTANT: change ONLY what is described and keep every other element exactly the same — identical shapes, positions, colors, lighting, shadows and photographic style. If the described change removes or replaces an object, apply it to the object COMPLETELY and cleanly (fully removed with naturally filled background, or fully replaced) — never a half-changed or split object. If the described change is instead a localized surface defect (scratch, crack, dent, corrosion or similar damage), render that defect realistically and confined to the described area only. Do not redraw, move or deform anything else.`;
     return extractEditedImage(await museImageEdit(imageRef, guarded));
+  }
+  async editFullImage(imageRef: string, prompt: string): Promise<string> {
+    // One-pass mode: the caller's prompt is sent RAW (it carries its own preservation
+    // clause); adding the crop-mode guard suffix would contradict its instructions.
+    return extractEditedImage(await museImageEdit(imageRef, prompt));
   }
   async generateScene(_theme: string): Promise<string> {
     assertMetaConfigured();
@@ -220,7 +252,11 @@ export class MockProviders implements SegmentationProvider, VisionReasoningProvi
     return regions.slice(0, count).map((r, i) => ({ id: `change-${i + 1}`, regionId: r.id, type: types[i % types.length], description: `MOCK change ${i + 1}: ${types[i % types.length]}`, editPrompt: `mock edit ${i + 1}`, targetColor: /colou?r/i.test(types[i % types.length]) ? 'blue' : '' }));
   }
   async verify() { return { ok: true, notes: 'MOCK verification — not real visual verification' }; }
+  async reviewDifferences(pairs: { index: number }[]): Promise<DifferenceReview[]> {
+    return pairs.map(p => ({ index: p.index, ok: true, description: `MOCK difference ${p.index + 1} — not a real visual description`, type: 'other', notes: 'MOCK review — not real visual verification' }));
+  }
   async editMaskedRegion(imageRef: string) { return imageRef; }
+  async editFullImage(imageRef: string) { return imageRef; } // unchanged image -> one-pass finds 0 edits -> crop fallback
   async generateScene(theme: string) { return `mock-scene:${theme}`; }
 }
 

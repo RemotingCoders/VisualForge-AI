@@ -279,16 +279,30 @@ function rgbToOklch(r: number, g: number, b: number): [number, number, number] {
   const [L, A, Bb] = rgbToOklab(r, g, b);
   return [L, Math.hypot(A, Bb), Math.atan2(Bb, A) * 180 / Math.PI];
 }
-function oklchToRgb(L: number, C: number, hueDeg: number): [number, number, number] {
+function oklchToLinearRgb(L: number, C: number, hueDeg: number): [number, number, number] {
   const rad = hueDeg * Math.PI / 180, A = C * Math.cos(rad), Bb = C * Math.sin(rad);
   const l = L + 0.3963377774 * A + 0.2158037573 * Bb;
   const m = L - 0.1055613458 * A - 0.0638541728 * Bb;
   const s = L - 0.0894841775 * A - 1.2914855480 * Bb;
-  const R = 4.0767416621 * l ** 3 - 3.3077115913 * m ** 3 + 0.2309699292 * s ** 3;
-  const G = -1.2684380046 * l ** 3 + 2.6097574011 * m ** 3 - 0.3413193965 * s ** 3;
-  const B = -0.0041960863 * l ** 3 - 0.7034186147 * m ** 3 + 1.7076147010 * s ** 3;
+  return [
+    4.0767416621 * l ** 3 - 3.3077115913 * m ** 3 + 0.2309699292 * s ** 3,
+    -1.2684380046 * l ** 3 + 2.6097574011 * m ** 3 - 0.3413193965 * s ** 3,
+    -0.0041960863 * l ** 3 - 0.7034186147 * m ** 3 + 1.7076147010 * s ** 3,
+  ];
+}
+function oklchToRgb(L: number, C: number, hueDeg: number): [number, number, number] {
+  // Gamut-map by REDUCING CHROMA (preserving L and hue) instead of clamping each
+  // channel independently — per-channel clamping shifted the hue (a saturated red
+  // recolored to yellow/100° came out at ~80° with washed-out channels).
+  let rgb = oklchToLinearRgb(L, C, hueDeg);
+  const inGamut = (v: [number, number, number]) => v.every(x => x >= -1e-4 && x <= 1.0001);
+  if (!inGamut(rgb) && C > 0) {
+    let lo = 0, hi = C;
+    for (let i = 0; i < 20; i++) { const mid = (lo + hi) / 2; if (inGamut(oklchToLinearRgb(L, mid, hueDeg))) lo = mid; else hi = mid; }
+    rgb = oklchToLinearRgb(L, lo, hueDeg);
+  }
   const cl = (v: number) => Math.round(Math.max(0, Math.min(1, linearToSrgb(v))) * 255);
-  return [cl(R), cl(G), cl(B)];
+  return [cl(rgb[0]), cl(rgb[1]), cl(rgb[2])];
 }
 const OKLCH_HUES: Record<string, number> = { red: 29, orange: 58, amber: 75, yellow: 100, lime: 130, green: 145, teal: 175, cyan: 195, sky: 220, blue: 260, indigo: 275, violet: 300, purple: 300, magenta: 330, pink: 350, brown: 55 };
 /** Hue (OKLCH degrees) for a named target color; null for achromatic/unknown targets (route to Muse). */
@@ -407,6 +421,144 @@ export async function duplicateObjectInPaste(pasteDataUrl: string, rel: BBox): P
   const objBuf = await sharp(pasteBuf).extract({ left: rel.x, top: rel.y, width: rel.width, height: rel.height }).png().toBuffer();
   const out = await sharp(pasteBuf).composite([{ input: objBuf, left: best.x, top: best.y }]).png().toBuffer();
   return bufferToDataUrl(out);
+}
+
+/** Dilate a boolean mask by `radius` px (Chebyshev). Exported for one-pass measurement. */
+export const expandMask = (mask: boolean[], w: number, h: number, radius: number): boolean[] => dilateMask(mask, w, h, radius);
+
+/** O(n) box blur (integral image) of a single-channel float map. */
+function boxBlurFloat(src: Float32Array, w: number, h: number, radius: number): Float32Array {
+  const integ = new Float64Array((w + 1) * (h + 1));
+  for (let y = 0; y < h; y++) { let row = 0; for (let x = 0; x < w; x++) { row += src[y * w + x]; integ[(y + 1) * (w + 1) + x + 1] = integ[y * (w + 1) + x + 1] + row; } }
+  const out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const x0 = Math.max(0, x - radius), x1 = Math.min(w - 1, x + radius), y0 = Math.max(0, y - radius), y1 = Math.min(h - 1, y + radius);
+    const s = integ[(y1 + 1) * (w + 1) + x1 + 1] - integ[y0 * (w + 1) + x1 + 1] - integ[(y1 + 1) * (w + 1) + x0] + integ[y0 * (w + 1) + x0];
+    out[y * w + x] = s / ((x1 - x0 + 1) * (y1 - y0 + 1));
+  }
+  return out;
+}
+
+/**
+ * One-pass edit extraction — separate REAL edits from Muse's re-render noise.
+ *
+ * Calibrated OFFLINE on the saved spike pair (test.jpeg vs the one-pass Muse return,
+ * 2026-10-30) after amplitude-only dual thresholds PROVED insufficient (petal-vein
+ * re-render has mean amplitude 27-45 over huge areas, absorbing the real edits).
+ * What actually separates them (measured per blob):
+ *  - LOW-PASS difference: blur both images (radius 3) and diff the blurred versions.
+ *    Texture rearrangement (stamens, veins) cancels out; solid edits persist.
+ *  - NEW EDGES: gradient(edited) - gradient(original), positive part, blurred.
+ *    Added structure (a droplet outline, a ladybug) lights up; re-render keeps the
+ *    original edges in place, so it does not.
+ *  - ORIGINAL TEXTURE: blurred gradient magnitude of the original. Re-render noise
+ *    lives on high texture (measured 40-66); real edits here sit on smooth areas (2-15).
+ * A candidate blob (low-pass diff >= 9) is a REAL edit when it is a strong solid change
+ * (mean low-pass diff >= 25: vanished bud 32, ladybug 60 — next noise blob was 19) OR it
+ * adds new structure on a smooth area (mean new-edge >= 15 with texture <= 25: droplet
+ * 29.6/10.3 — every noise blob with new-edge >= 15 had texture >= 40).
+ * Final mask = raw diff pixels (>= 14) or solid low-pass core (>= 16) inside the blob
+ * dilated 3px. Sorted by area x mean raw amplitude (strongest edit first).
+ */
+export interface OnePassComponent { mask: boolean[]; bbox: BBox; area: number; meanAmp: number; score: number; meanLp: number; meanNewEdge: number; meanTex: number }
+export interface OnePassDiscard { bbox: BBox; area: number; meanAmp: number; reason: string }
+export interface OnePassThresholds { lpRadius: number; lpThreshold: number; strongMeanLp: number; newEdgeMin: number; newEdgeMaxTex: number; minArea: number; maxAreaFraction: number; growAmp: number; coreLp: number }
+export const ONE_PASS_THRESHOLDS: OnePassThresholds = { lpRadius: 3, lpThreshold: 9, strongMeanLp: 25, newEdgeMin: 15, newEdgeMaxTex: 25, minArea: 24, maxAreaFraction: 0.06, growAmp: 14, coreLp: 16 };
+
+export async function extractOnePassComponents(originalDataUrl: string, alignedEditedDataUrl: string, opts: Partial<OnePassThresholds> = {}): Promise<{ components: OnePassComponent[]; discarded: OnePassDiscard[] }> {
+  const th = { ...ONE_PASS_THRESHOLDS, ...opts };
+  const a = await rawOf(originalDataUrl);
+  const b = await rawOf(alignedEditedDataUrl, a.width, a.height);
+  const w = a.width, h = a.height, n = w * h;
+  const amp = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const o = i * 3;
+    amp[i] = Math.max(Math.abs(a.data[o] - b.data[o]), Math.abs(a.data[o + 1] - b.data[o + 1]), Math.abs(a.data[o + 2] - b.data[o + 2]));
+  }
+  // Low-pass difference per channel, then max across channels.
+  const lp = new Float32Array(n);
+  for (let c = 0; c < 3; c++) {
+    const ca = new Float32Array(n), cb = new Float32Array(n);
+    for (let i = 0; i < n; i++) { ca[i] = a.data[i * 3 + c]; cb[i] = b.data[i * 3 + c]; }
+    const ba = boxBlurFloat(ca, w, h, th.lpRadius), bb = boxBlurFloat(cb, w, h, th.lpRadius);
+    for (let i = 0; i < n; i++) lp[i] = Math.max(lp[i], Math.abs(ba[i] - bb[i]));
+  }
+  // Original texture + new edges (grayscale gradients).
+  const grayA = new Float32Array(n), grayB = new Float32Array(n);
+  for (let i = 0; i < n; i++) { grayA[i] = (a.data[i * 3] + a.data[i * 3 + 1] + a.data[i * 3 + 2]) / 3; grayB[i] = (b.data[i * 3] + b.data[i * 3 + 1] + b.data[i * 3 + 2]) / 3; }
+  const gradOf = (g: Float32Array) => {
+    const gr = new Float32Array(n);
+    for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) { const i = y * w + x; gr[i] = Math.abs(g[i + 1] - g[i - 1]) + Math.abs(g[i + w] - g[i - w]); }
+    return gr;
+  };
+  const gradA = gradOf(grayA), gradB = gradOf(grayB);
+  const tex = boxBlurFloat(gradA, w, h, th.lpRadius);
+  const newEdgeRaw = new Float32Array(n);
+  for (let i = 0; i < n; i++) newEdgeRaw[i] = Math.max(0, gradB[i] - gradA[i]);
+  const newEdge = boxBlurFloat(newEdgeRaw, w, h, 2);
+
+  const candidate = new Array<boolean>(n).fill(false);
+  for (let i = 0; i < n; i++) candidate[i] = lp[i] >= th.lpThreshold;
+  const { labels } = connectedComponents(candidate, w, h);
+  const byLabel = new Map<number, number[]>();
+  for (let i = 0; i < n; i++) { const g = labels[i]; if (g < 0) continue; const arr = byLabel.get(g) ?? []; arr.push(i); byLabel.set(g, arr); }
+
+  const components: OnePassComponent[] = [];
+  const discarded: OnePassDiscard[] = [];
+  for (const pixels of byLabel.values()) {
+    let minX = w, minY = h, maxX = -1, maxY = -1;
+    let sumLp = 0, sumEdge = 0, sumTex = 0, sumAmp = 0;
+    const blobMask = new Array<boolean>(n).fill(false);
+    for (const p of pixels) {
+      blobMask[p] = true; sumLp += lp[p]; sumEdge += newEdge[p]; sumTex += tex[p]; sumAmp += amp[p];
+      const x = p % w, y = (p / w) | 0;
+      if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y;
+    }
+    const blobBbox = { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 };
+    const blobArea = pixels.length;
+    const meanLp = sumLp / blobArea, meanNewEdge = sumEdge / blobArea, meanTex = sumTex / blobArea, blobMeanAmp = sumAmp / blobArea;
+    const isSolid = meanLp >= th.strongMeanLp;
+    const isNewStructure = meanNewEdge >= th.newEdgeMin && meanTex <= th.newEdgeMaxTex;
+    if (blobArea < th.minArea) { discarded.push({ bbox: blobBbox, area: blobArea, meanAmp: blobMeanAmp, reason: `area ${blobArea}px < ${th.minArea}px (noise speck)` }); continue; }
+    if (blobArea > w * h * th.maxAreaFraction) { discarded.push({ bbox: blobBbox, area: blobArea, meanAmp: blobMeanAmp, reason: `area ${blobArea}px > ${th.maxAreaFraction * 100}% of image (re-render, not an edit)` }); continue; }
+    if (!isSolid && !isNewStructure) { discarded.push({ bbox: blobBbox, area: blobArea, meanAmp: blobMeanAmp, reason: `re-render noise (meanLp ${meanLp.toFixed(1)} < ${th.strongMeanLp}, newEdge ${meanNewEdge.toFixed(1)}, texture ${meanTex.toFixed(1)})` }); continue; }
+    // Final measured mask: raw-diff pixels or solid low-pass core, within the blob dilated 3px.
+    const grown = dilateMask(blobMask, w, h, 3);
+    const mask = new Array<boolean>(n).fill(false);
+    let area = 0, ampSum = 0; minX = w; minY = h; maxX = -1; maxY = -1;
+    for (let i = 0; i < n; i++) {
+      if (!grown[i] || (amp[i] < th.growAmp && lp[i] < th.coreLp)) continue;
+      mask[i] = true; area++; ampSum += amp[i];
+      const x = i % w, y = (i / w) | 0;
+      if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y;
+    }
+    if (area < th.minArea) { discarded.push({ bbox: blobBbox, area, meanAmp: area ? ampSum / area : 0, reason: `measured mask ${area}px < ${th.minArea}px after raw-diff tightening` }); continue; }
+    const meanAmp = ampSum / area;
+    components.push({ mask, bbox: { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 }, area, meanAmp, score: area * meanAmp, meanLp, meanNewEdge, meanTex });
+  }
+  components.sort((c1, c2) => c2.score - c1.score);
+  return { components, discarded };
+}
+
+/**
+ * Compose ONLY the selected one-pass components (dilated 4px, smoothed edge) over the
+ * ORIGINAL image. Everything outside the selected components stays pixel-identical.
+ */
+export async function compositeOnePassComponents(originalDataUrl: string, alignedEditedDataUrl: string, components: OnePassComponent[]): Promise<string> {
+  const a = await rawOf(originalDataUrl);
+  const b = await rawOf(alignedEditedDataUrl, a.width, a.height);
+  const w = a.width, h = a.height;
+  const union = new Array<boolean>(w * h).fill(false);
+  for (const c of components) for (let i = 0; i < w * h; i++) if (c.mask[i]) union[i] = true;
+  const alpha = blurAlpha(Buffer.from(dilateMask(union, w, h, 4).map(v => (v ? 255 : 0))), w, h);
+  const out = Buffer.alloc(w * h * 3);
+  for (let i = 0; i < w * h; i++) {
+    const o = i * 3, al = alpha[i] / 255;
+    out[o] = Math.round(a.data[o] * (1 - al) + b.data[o] * al);
+    out[o + 1] = Math.round(a.data[o + 1] * (1 - al) + b.data[o + 1] * al);
+    out[o + 2] = Math.round(a.data[o + 2] * (1 - al) + b.data[o + 2] * al);
+  }
+  return bufferToDataUrl(await sharp(out, { raw: { width: w, height: h, channels: 3 } }).png().toBuffer());
 }
 
 /** Boolean per-pixel diff mask (row-major w*h) between two same-size images. */

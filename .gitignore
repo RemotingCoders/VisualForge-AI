@@ -13,4 +13,5 @@ __pycache__/
 test-results/
 playwright-report/
 spike-output/
+debug-runs/
 .DS_Store
