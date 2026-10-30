@@ -39,7 +39,7 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
   it('produces a playable level with a measured, verified difference', async () => {
     const edited = await solidPng(24, 24, [30, 30, 220]);
     const fake: Providers = {
-      segmentation: { name: 'fake', isMock: true, segment: async () => [{ id: 'r1', bbox: { x: 8, y: 6, width: 16, height: 12 } }] },
+      segmentation: { name: 'fake', isMock: true, segment: async () => [{ id: 'r1', bbox: { x: 16, y: 10, width: 6, height: 5 } }] },
       vision: {
         name: 'fake', isMock: true,
         moderate: async () => ({ ok: true, reason: 'ok' }),
@@ -55,14 +55,39 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
     expect(diffs).toHaveLength(1);
     expect(diffs[0].verification_status).toBe('verified');
     expect(diffs[0].bbox.width).toBeGreaterThan(0);
-    // Measured bbox must sit inside the expanded crop region (8,6,16x12 @ +25% -> 4,3,24x18)
-    expect(diffs[0].bbox.x).toBeGreaterThanOrEqual(4);
-    expect(diffs[0].bbox.y).toBeGreaterThanOrEqual(3);
-    expect(diffs[0].bbox.x + diffs[0].bbox.width).toBeLessThanOrEqual(28);
-    expect(diffs[0].bbox.y + diffs[0].bbox.height).toBeLessThanOrEqual(21);
+    // Measured bbox must sit inside the expanded crop region (16,10,6x5 @ +25% -> ~14,8,9x8)
+    expect(diffs[0].bbox.x).toBeGreaterThanOrEqual(14);
+    expect(diffs[0].bbox.y).toBeGreaterThanOrEqual(8);
+    expect(diffs[0].bbox.x + diffs[0].bbox.width).toBeLessThanOrEqual(23);
+    expect(diffs[0].bbox.y + diffs[0].bbox.height).toBeLessThanOrEqual(16);
     const payload = getLevelPayload(job.levelId!)!;
     expect(payload.total).toBe(1);
     expect(payload).not.toHaveProperty('differences'); // anti-cheat: annotations never in the client payload
+  });
+
+  it('excludes oversized regions so Muse can never repaint the whole photo', async () => {
+    const edited = await solidPng(24, 24, [30, 30, 220]);
+    const fake: Providers = {
+      segmentation: {
+        name: 'fake', isMock: true,
+        segment: async () => [
+          { id: 'big', bbox: { x: 0, y: 0, width: 39, height: 29 } },  // ~whole 40x30 image — must be filtered out
+          { id: 'small', bbox: { x: 8, y: 6, width: 6, height: 5 } },  // within the 20% side cap (8x6)
+        ],
+      },
+      vision: {
+        name: 'fake', isMock: true,
+        moderate: async () => ({ ok: true, reason: 'ok' }),
+        plan: async (_i, regions) => regions.map((r, i) => ({ id: `c-${r.id}`, regionId: r.id, type: 'change color', description: `change in ${r.id}`, editPrompt: 'edit' })),
+        verify: async () => ({ ok: true, notes: 'ok' }),
+      },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => edited, generateScene: async () => { throw new Error('not used'); } },
+    };
+    const job = createJob('game', true);
+    await runGeneration(job, await solidPng(40, 30, [120, 120, 120]), 2, fake);
+    expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
+    const diffs = getDifferences(job.levelId!)!;
+    expect(diffs.map(d => d.id)).toEqual(['c-small']); // the whole-image region never became a difference
   });
 
   it('marks the job failed when moderation rejects (no silent fallback)', async () => {

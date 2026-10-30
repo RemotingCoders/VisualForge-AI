@@ -4,6 +4,10 @@ import { normalizeImage, cropDataUrl, expandBox, compositeCrop, diffMask, provid
 import { saveImageLevel } from '../serverStore';
 
 export type JobStatus = 'queued' | 'running' | 'done' | 'failed';
+/** Differences must stay SMALL and localized: candidate regions may not exceed this fraction
+ *  of the image side, and a measured diff larger than MEASURED_CAP is discarded from the level. */
+export const MAX_REGION_FRACTION = 0.2;
+export const MAX_MEASURED_FRACTION = 0.28;
 export interface Job {
   id: string; status: JobStatus; stage: string; mode: Mode; isMock: boolean;
   error?: string; levelId?: string; createdAt: number; updatedAt: number;
@@ -39,7 +43,13 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
     if (!mod.ok) throw new Error(`moderation rejected: ${mod.reason}`);
 
     setStage('segmenting');
-    const regions = enforceSpacing(await providers.segmentation.segment(aiImg, width, height));
+    const rawRegions = await providers.segmentation.segment(aiImg, width, height);
+    // Size cap FIRST (before spacing): huge regions (e.g. a whole-scene SAM box) would let Muse
+    // repaint most of the photo — the exact failure rejected in spike call 4/6.
+    const small = rawRegions.filter(r => r.bbox.width <= width * MAX_REGION_FRACTION && r.bbox.height <= height * MAX_REGION_FRACTION);
+    const pool = small.length ? small
+      : [...rawRegions].sort((a, b) => a.bbox.width * a.bbox.height - b.bbox.width * b.bbox.height).slice(0, 5); // fallback: smallest available
+    const regions = enforceSpacing(pool);
     if (!regions.length) throw new Error('segmentation found no usable regions');
 
     setStage('planning');
@@ -71,6 +81,10 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
       const mask = masks.get(ch.id); if (!mask) continue;
       setStage(`verifying ${verifyIdx}/${plan.length}`);
       const bbox = maskToBBox(mask, width, height); if (!bbox) continue;
+      if (bbox.width > width * MAX_MEASURED_FRACTION || bbox.height > height * MAX_MEASURED_FRACTION) {
+        console.info(`[generate ${job.id}] change ${ch.id} discarded: measured diff ${bbox.width}x${bbox.height} exceeds size cap`);
+        continue;
+      }
       let verdict = await providers.vision.verify(aiImg, vMod, ch, bbox);
       if (!verdict.ok) verdict = await providers.vision.verify(aiImg, vMod, ch, bbox); // retry ONCE
       differences.push({

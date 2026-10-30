@@ -61,12 +61,12 @@ export default function Play() {
 
   const done = total > 0 && found.length >= total; const elapsed = Math.round((Date.now() - start) / 1000);
   const Panel = ({ shapes, onClick, marks }: { shapes: Shape[]; onClick?: (e: React.MouseEvent) => void; marks?: Found[] }) => (
-    <svg ref={onClick ? svgRef : undefined} onClick={onClick} viewBox="0 0 400 300" className={`w-full rounded-xl bg-gradient-to-br from-slate-800 to-slate-950 ${onClick ? 'cursor-crosshair' : ''}`} dangerouslySetInnerHTML={{ __html: renderShapes(shapes) + (marks ?? []).map(f => `<rect x="${f.bbox.x}" y="${f.bbox.y}" width="${f.bbox.width}" height="${f.bbox.height}" fill="none" stroke="#22c55e" stroke-width="3" rx="8"/>`).join('') }} />);
+    <svg ref={onClick ? svgRef : undefined} onClick={onClick} viewBox="0 0 400 300" className={`w-full rounded-xl bg-gradient-to-br from-slate-800 to-slate-950 ${onClick ? 'cursor-crosshair' : ''}`} dangerouslySetInnerHTML={{ __html: renderShapes(shapes) + (marks ?? []).map(f => `<ellipse cx="${f.bbox.x + f.bbox.width / 2}" cy="${f.bbox.y + f.bbox.height / 2}" rx="${f.bbox.width / 2}" ry="${f.bbox.height / 2}" fill="none" stroke="#22c55e" stroke-width="3"/>`).join('') }} />);
   const ImgPanel = ({ src, clickable }: { src: string; clickable?: boolean }) => (
     <div className="relative w-full">
       {/* eslint-disable-next-line @next/next/no-img-element */}
       <img ref={clickable ? imgRef : undefined} src={src} alt={clickable ? 'Modified — click differences' : 'Original'} onClick={clickable ? clickImg : undefined} className={`w-full rounded-xl ${clickable ? 'cursor-crosshair' : ''}`} />
-      {clickable && img && found.map(f => (<div key={f.id} className="absolute border-[3px] border-green-500 rounded-lg pointer-events-none" style={{ left: `${(f.bbox.x / img.width) * 100}%`, top: `${(f.bbox.y / img.height) * 100}%`, width: `${(f.bbox.width / img.width) * 100}%`, height: `${(f.bbox.height / img.height) * 100}%` }} />))}
+      {clickable && img && found.map(f => (<div key={f.id} className="absolute border-[3px] border-green-500 rounded-[50%] pointer-events-none" style={{ left: `${(f.bbox.x / img.width) * 100}%`, top: `${(f.bbox.y / img.height) * 100}%`, width: `${(f.bbox.width / img.width) * 100}%`, height: `${(f.bbox.height / img.height) * 100}%` }} />))}
     </div>);
 
   return (<main className="max-w-6xl mx-auto px-5 py-8">
