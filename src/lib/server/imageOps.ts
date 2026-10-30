@@ -35,6 +35,21 @@ export const clampBox = (b: BBox, w: number, h: number): BBox => {
 export const expandBox = (b: BBox, frac: number, w: number, h: number): BBox =>
   clampBox({ x: b.x - b.width * frac, y: b.y - b.height * frac, width: b.width * (1 + 2 * frac), height: b.height * (1 + 2 * frac) }, w, h);
 
+/**
+ * A — Square CONTEXT box sent to Muse: side = max(2 x largest bbox side, 384px), SHIFTED to
+ * stay inside the image instead of being shrunk, so Muse's square 1600x1600 output maps back
+ * 1:1 with no distortion. The PASTE box is separate (object + small margin, see jobs.ts).
+ * On images smaller than the desired side the square is limited by the smaller image side.
+ */
+export function squareContextBox(b: BBox, w: number, h: number, minSide = 384): BBox {
+  const desired = Math.max(2 * Math.max(b.width, b.height), minSide);
+  const side = Math.max(1, Math.min(desired, w, h));
+  const cx = b.x + b.width / 2, cy = b.y + b.height / 2;
+  const x = Math.max(0, Math.min(w - side, Math.round(cx - side / 2)));
+  const y = Math.max(0, Math.min(h - side, Math.round(cy - side / 2)));
+  return { x, y, width: side, height: side };
+}
+
 export async function cropDataUrl(dataUrl: string, box: BBox): Promise<{ cropDataUrl: string; cropBox: BBox; width: number; height: number }> {
   const buf = dataUrlToBuffer(dataUrl);
   const { width, height } = await imageInfo(dataUrl);
@@ -68,6 +83,130 @@ export async function compositeCrop(originalDataUrl: string, editedDataUrl: stri
   return bufferToDataUrl(out);
 }
 
+const rawOf = async (dataUrl: string, w?: number, h?: number) => {
+  let s = sharp(dataUrlToBuffer(dataUrl)).removeAlpha();
+  if (w && h) s = s.resize(w, h, { fit: 'fill' });
+  const { data, info } = await s.raw().toBuffer({ resolveWithObject: true });
+  return { data, width: info.width, height: info.height };
+};
+
+/** Connected components (8-connectivity) of a boolean mask; returns per-pixel label + sizes. */
+function connectedComponents(mask: boolean[], w: number, h: number): { labels: Int32Array; sizes: number[] } {
+  const labels = new Int32Array(w * h).fill(-1); const sizes: number[] = [];
+  for (let i = 0; i < w * h; i++) {
+    if (!mask[i] || labels[i] >= 0) continue;
+    const id = sizes.length; let size = 0; const stack = [i]; labels[i] = id;
+    while (stack.length) {
+      const p = stack.pop()!; size++;
+      const px = p % w, py = (p / w) | 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const nx = px + dx, ny = py + dy; if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+        const q = ny * w + nx; if (mask[q] && labels[q] < 0) { labels[q] = id; stack.push(q); }
+      }
+    }
+    sizes.push(size);
+  }
+  return { labels, sizes };
+}
+
+function dilateMask(mask: boolean[], w: number, h: number, radius: number): boolean[] {
+  const out = new Array<boolean>(w * h).fill(false);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    if (!mask[y * w + x]) continue;
+    for (let dy = -radius; dy <= radius; dy++) for (let dx = -radius; dx <= radius; dx++) {
+      const nx = x + dx, ny = y + dy; if (nx >= 0 && ny >= 0 && nx < w && ny < h) out[ny * w + nx] = true;
+    }
+  }
+  return out;
+}
+
+function blurAlpha(alpha: Buffer, w: number, h: number, radius = 2): Buffer {
+  // Two separable box-blur passes: smooths the dilated mask edge (no hard rectangular seams).
+  let cur = Float32Array.from(alpha);
+  for (let pass = 0; pass < 2; pass++) {
+    const tmp = new Float32Array(cur.length);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      let s = 0, n = 0; for (let dx = -radius; dx <= radius; dx++) { const nx = x + dx; if (nx >= 0 && nx < w) { s += cur[y * w + nx]; n++; } }
+      tmp[y * w + x] = s / n;
+    }
+    const out = new Float32Array(cur.length);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      let s = 0, n = 0; for (let dy = -radius; dy <= radius; dy++) { const ny = y + dy; if (ny >= 0 && ny < h) { s += tmp[ny * w + x]; n++; } }
+      out[y * w + x] = s / n;
+    }
+    cur = out;
+  }
+  return Buffer.from(cur.map(v => Math.max(0, Math.min(255, Math.round(v)))));
+}
+
+/**
+ * B — Mask-based composition (NOT a rectangle): paste alpha = large connected components of
+ * |edited - original| inside the PASTE box, dilated 5px and smoothed. (Union with the decoded
+ * SAM mask joins here once `@meta-sam/parser` raster decoding lands; the diff-only version
+ * already kills repainted neighbours, straight edges and background jitter.) Pixels outside
+ * the paste box are copied from the original untouched.
+ * `editedDataUrl` is the full CONTEXT image Muse returned; the paste area is extracted from it.
+ */
+export async function compositeMaskedEdit(originalDataUrl: string, editedDataUrl: string, contextBox: BBox, pasteBox: BBox): Promise<string> {
+  const { width, height } = await imageInfo(originalDataUrl);
+  const ctx = clampBox(contextBox, width, height); const paste = clampBox(pasteBox, width, height);
+  const rel = { left: paste.x - ctx.x, top: paste.y - ctx.y, width: paste.width, height: paste.height };
+  if (rel.left < 0 || rel.top < 0 || rel.left + rel.width > ctx.width || rel.top + rel.height > ctx.height)
+    throw new Error('paste box must lie inside the context box');
+  const editedCtx = await sharp(dataUrlToBuffer(editedDataUrl)).resize(ctx.width, ctx.height, { fit: 'fill' }).png().toBuffer();
+  const editedPasteBuf = await sharp(editedCtx).extract(rel).png().toBuffer();
+  const origPasteBuf = await sharp(dataUrlToBuffer(originalDataUrl)).extract({ left: paste.x, top: paste.y, width: paste.width, height: paste.height }).png().toBuffer();
+  const [a, b] = [await rawOf(bufferToDataUrl(origPasteBuf)), await rawOf(bufferToDataUrl(editedPasteBuf))];
+  const w = paste.width, h = paste.height;
+  const rawMask = new Array<boolean>(w * h).fill(false);
+  for (let i = 0; i < w * h; i++) { const o = i * 3; rawMask[i] = Math.max(Math.abs(a.data[o] - b.data[o]), Math.abs(a.data[o + 1] - b.data[o + 1]), Math.abs(a.data[o + 2] - b.data[o + 2])) > 12; }
+  const { labels, sizes } = connectedComponents(rawMask, w, h);
+  const minArea = Math.max(8, Math.floor(w * h * 0.01)); // drop jitter specks, keep the real change
+  const kept = new Array<boolean>(w * h).fill(false);
+  for (let i = 0; i < w * h; i++) kept[i] = labels[i] >= 0 && sizes[labels[i]] >= minArea;
+  const alpha = blurAlpha(Buffer.from(dilateMask(kept, w, h, 5).map(v => (v ? 255 : 0))), w, h);
+  const withAlpha = await sharp(editedPasteBuf).joinChannel(alpha, { raw: { width: w, height: h, channels: 1 } }).png().toBuffer();
+  const out = await sharp(dataUrlToBuffer(originalDataUrl)).composite([{ input: withAlpha, left: paste.x, top: paste.y }]).png().toBuffer();
+  return bufferToDataUrl(out);
+}
+
+/**
+ * C — Alignment guard (measurable, before pasting): search the shift (±8px, SAD over the outer
+ * ring of the context crop) that best aligns the edited crop onto the original. Reject when the
+ * best shift is > 2px or the best ring error stays high (Muse reframed/repainted the scene).
+ */
+export async function alignmentCheck(originalDataUrl: string, editedDataUrl: string, exclude?: BBox): Promise<{ shiftX: number; shiftY: number; error: number; aligned: boolean }> {
+  const a = await rawOf(originalDataUrl);
+  const b = await rawOf(editedDataUrl, a.width, a.height);
+  const w = a.width, h = a.height, t = Math.max(3, Math.round(Math.min(w, h) * 0.12));
+  const ring: number[] = [];
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    if (!(x < t || y < t || x >= w - t || y >= h - t)) continue;
+    // The paste area itself may touch the ring (object near the crop edge) — it is SUPPOSED to change there.
+    if (exclude && x >= exclude.x - 6 && y >= exclude.y - 6 && x < exclude.x + exclude.width + 6 && y < exclude.y + exclude.height + 6) continue;
+    ring.push(y * w + x);
+  }
+  const step = Math.max(1, Math.floor(Math.sqrt(ring.length / 8000)));
+  let best = { shiftX: 0, shiftY: 0, error: Infinity };
+  // Prefer the SMALLEST shift among near-ties: on flat backgrounds every shift scores ~0,
+  // and "no shift" is the right explanation — otherwise featureless crops always "fail".
+  const shifts: [number, number][] = [];
+  for (let dy = -8; dy <= 8; dy++) for (let dx = -8; dx <= 8; dx++) shifts.push([dx, dy]);
+  shifts.sort((p, q) => Math.max(Math.abs(p[0]), Math.abs(p[1])) - Math.max(Math.abs(q[0]), Math.abs(q[1])));
+  for (const [dx, dy] of shifts) {
+    let sum = 0, n = 0;
+    for (let k = 0; k < ring.length; k += step) {
+      const p = ring[k], x = p % w, y = (p / w) | 0, ex = x + dx, ey = y + dy;
+      if (ex < 0 || ey < 0 || ex >= w || ey >= h) continue;
+      const oa = p * 3, ob = (ey * w + ex) * 3;
+      sum += (Math.abs(a.data[oa] - b.data[ob]) + Math.abs(a.data[oa + 1] - b.data[ob + 1]) + Math.abs(a.data[oa + 2] - b.data[ob + 2])) / 3; n++;
+    }
+    const err = n ? sum / n : Infinity;
+    if (err < best.error) best = { shiftX: dx, shiftY: dy, error: err };
+  }
+  return { ...best, aligned: Math.max(Math.abs(best.shiftX), Math.abs(best.shiftY)) <= 2 && best.error <= 25 };
+}
+
 /** JPEG copy for PROVIDER calls only (same dimensions, ~10x smaller than a photo PNG — large
  *  base64 PNG bodies risk connection resets). Internal masters stay lossless PNG so the
  *  composite/diff measurement is never polluted by recompression artifacts. */
@@ -77,25 +216,83 @@ export async function providerImage(dataUrl: string, quality = 82): Promise<stri
 }
 
 /**
- * Deterministic pure-color change: rotate the hue of a crop while preserving lightness and
- * shading — the SHAPE stays pixel-identical, only the color changes (no generative repaint,
- * no deformation, no API cost). Low-saturation pixels (grays, whites) barely move, weighted
- * by saturation, so backgrounds inside the crop are mostly untouched.
+ * D — Deterministic pure-color change in OKLCH: preserve L (lightness/shading), move only the
+ * hue, gently raise chroma for vivid pixels. Applied ONLY to the object's own pixels (jobs pass
+ * the un-expanded bbox crop, never the expanded context). Achromatic pixels (C ~ 0: grays,
+ * whites, creams) have no hue to rotate — they are left untouched here, and jobs route
+ * low-chroma objects to Muse instead of rotating.
  */
-export async function recolorCrop(cropDataUrl: string, hueShiftDeg: number): Promise<string> {
+const srgbToLinear = (c: number) => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
+const linearToSrgb = (c: number) => (c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055);
+function rgbToOklab(r: number, g: number, b: number): [number, number, number] {
+  const R = srgbToLinear(r), G = srgbToLinear(g), B = srgbToLinear(b);
+  const l = Math.cbrt(0.4122214708 * R + 0.5363325363 * G + 0.0514459929 * B);
+  const m = Math.cbrt(0.2119034982 * R + 0.6806995451 * G + 0.1073969566 * B);
+  const s = Math.cbrt(0.0883024619 * R + 0.2817188376 * G + 0.6299787005 * B);
+  return [
+    0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+    1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+    0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+  ];
+}
+function rgbToOklch(r: number, g: number, b: number): [number, number, number] {
+  const [L, A, Bb] = rgbToOklab(r, g, b);
+  return [L, Math.hypot(A, Bb), Math.atan2(Bb, A) * 180 / Math.PI];
+}
+function oklchToRgb(L: number, C: number, hueDeg: number): [number, number, number] {
+  const rad = hueDeg * Math.PI / 180, A = C * Math.cos(rad), Bb = C * Math.sin(rad);
+  const l = L + 0.3963377774 * A + 0.2158037573 * Bb;
+  const m = L - 0.1055613458 * A - 0.0638541728 * Bb;
+  const s = L - 0.0894841775 * A - 1.2914855480 * Bb;
+  const R = 4.0767416621 * l ** 3 - 3.3077115913 * m ** 3 + 0.2309699292 * s ** 3;
+  const G = -1.2684380046 * l ** 3 + 2.6097574011 * m ** 3 - 0.3413193965 * s ** 3;
+  const B = -0.0041960863 * l ** 3 - 0.7034186147 * m ** 3 + 1.7076147010 * s ** 3;
+  const cl = (v: number) => Math.round(Math.max(0, Math.min(1, linearToSrgb(v))) * 255);
+  return [cl(R), cl(G), cl(B)];
+}
+const OKLCH_HUES: Record<string, number> = { red: 29, orange: 58, amber: 75, yellow: 100, lime: 130, green: 145, teal: 175, cyan: 195, sky: 220, blue: 260, indigo: 275, violet: 300, purple: 300, magenta: 330, pink: 350, brown: 55 };
+/** Hue (OKLCH degrees) for a named target color; null for achromatic/unknown targets (route to Muse). */
+export function targetHueFromColor(name?: string): number | null {
+  if (!name) return null;
+  const key = name.trim().toLowerCase();
+  if (key in OKLCH_HUES) return OKLCH_HUES[key];
+  const hit = Object.keys(OKLCH_HUES).find(k => key.includes(k));
+  return hit ? OKLCH_HUES[hit] : null;
+}
+/** Mean OKLCH chroma of a crop: low values (cream/white/gray objects) must NOT be hue-rotated. */
+export async function cropColorStats(cropDataUrl: string): Promise<{ meanChroma: number; saturatedFraction: number }> {
+  const { data } = await rawOf(cropDataUrl);
+  let sum = 0, sat = 0, n = 0;
+  for (let i = 0; i < data.length; i += 3) { const [, C] = rgbToOklch(data[i] / 255, data[i + 1] / 255, data[i + 2] / 255); sum += C; if (C > 0.05) sat++; n++; }
+  return { meanChroma: n ? sum / n : 0, saturatedFraction: n ? sat / n : 0 };
+}
+/** ΔE (OKLab euclidean) between two same-size images: mean over pixels that actually changed. */
+export async function colorDeltaE(aDataUrl: string, bDataUrl: string, width: number, height: number): Promise<{ meanDeltaE: number; changedPixels: number }> {
+  const [a, b] = [await rawOf(aDataUrl, width, height), await rawOf(bDataUrl, width, height)];
+  let sum = 0, changed = 0;
+  for (let i = 0; i < width * height; i++) {
+    const o = i * 3;
+    const [L1, a1, b1] = rgbToOklab(a.data[o] / 255, a.data[o + 1] / 255, a.data[o + 2] / 255);
+    const [L2, a2, b2] = rgbToOklab(b.data[o] / 255, b.data[o + 1] / 255, b.data[o + 2] / 255);
+    const de = Math.hypot(L1 - L2, a1 - a2, b1 - b2);
+    if (de > 0.03) { sum += de; changed++; }
+  }
+  return { meanDeltaE: changed ? sum / changed : 0, changedPixels: changed };
+}
+
+export async function recolorCrop(cropDataUrl: string, hueShiftDeg: number, targetHueDeg?: number): Promise<string> {
   const { data, info } = await sharp(dataUrlToBuffer(cropDataUrl)).removeAlpha().raw().toBuffer({ resolveWithObject: true });
   const out = Buffer.from(data);
   for (let i = 0; i < data.length; i += 3) {
-    const r = data[i] / 255, g = data[i + 1] / 255, b = data[i + 2] / 255;
-    const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2, d = max - min;
-    if (d === 0) continue; // pure gray: hue undefined, leave untouched
-    const s = d / (1 - Math.abs(2 * l - 1) || 1);
-    let h = max === r ? ((g - b) / d) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
-    h = ((h * 60) + hueShiftDeg + 360) % 360;
-    const c = (1 - Math.abs(2 * l - 1)) * s, x = c * (1 - Math.abs(((h / 60) % 2) - 1)), m = l - c / 2;
-    const rgb = h < 60 ? [c, x, 0] : h < 120 ? [x, c, 0] : h < 180 ? [0, c, x] : h < 240 ? [0, x, c] : h < 300 ? [x, 0, c] : [c, 0, x];
-    const wgt = Math.min(1, s * 1.8); // blend by saturation: vivid colors shift fully, muted ones gently
-    for (let k = 0; k < 3; k++) out[i + k] = Math.round((data[i + k] / 255 * (1 - wgt) + (rgb[k] + m) * wgt) * 255);
+    const [L, C, H] = rgbToOklch(data[i] / 255, data[i + 1] / 255, data[i + 2] / 255);
+    if (C < 0.004) continue; // achromatic: no hue — untouched (gray/white stay exact)
+    const newHue = targetHueDeg ?? (H + hueShiftDeg);
+    const newC = C >= 0.02 ? Math.min(0.37, Math.max(C, C * 1.18 + 0.01)) : C; // gentle chroma lift for vivid pixels only
+    const wgt = Math.min(1, C / 0.08); // muted pixels blend gently — backgrounds in the crop barely move
+    const [r, g, b] = oklchToRgb(L, newC, newHue);
+    out[i] = Math.round(data[i] * (1 - wgt) + r * wgt);
+    out[i + 1] = Math.round(data[i + 1] * (1 - wgt) + g * wgt);
+    out[i + 2] = Math.round(data[i + 2] * (1 - wgt) + b * wgt);
   }
   return bufferToDataUrl(await sharp(out, { raw: { width: info.width, height: info.height, channels: 3 } }).png().toBuffer());
 }

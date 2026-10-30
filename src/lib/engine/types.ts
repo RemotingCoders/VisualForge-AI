@@ -5,6 +5,8 @@ export interface Region { id: string; bbox: BBox; maskRef?: string; label?: stri
 
 export interface PlannedChange {
   id: string; regionId: string; type: string; description: string; editPrompt: string; severity?: 'low' | 'medium' | 'high';
+  /** Named target color for color changes (e.g. "blue"); the local recolor derives its hue from this so description matches pixels. */
+  targetColor?: string;
 }
 
 export interface Difference {

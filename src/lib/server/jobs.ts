@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { enforceSpacing, maskToBBox, maskCentroid, normalizeBBox } from '../engine/geometry';
 import type { Providers, Mode, Difference, Region } from '../engine/types';
-import { normalizeImage, cropDataUrl, expandBox, compositeCrop, diffMask, providerImage, clampBox, recolorCrop } from './imageOps';
+import { normalizeImage, cropDataUrl, expandBox, diffMask, providerImage, clampBox, recolorCrop, squareContextBox, compositeMaskedEdit, alignmentCheck, cropColorStats, colorDeltaE, targetHueFromColor } from './imageOps';
 import { saveImageLevel } from '../serverStore';
 import { persistJob, loadJob } from './db';
 
@@ -84,59 +84,90 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
       return job.mode === 'game' && r && r.wholeObject === false && !/colou?r/i.test(ch.type) ? { ...ch, type: 'change color' } : ch;
     });
 
-    setStage('editing');
-    const masks = new Map<string, boolean[]>();
-    let editIdx = 0;
+    // --- Per-change edit -> measure -> verify (E: no identical verifier retry — a failed
+    // verification re-edits ONCE with Muse, then discards. Deterministic color changes are
+    // verified locally with ΔE + mask, never via Spark.)
+    type Candidate = { next: string; mask: boolean[]; bbox: NonNullable<ReturnType<typeof maskToBBox>>; local: boolean; notes: string };
+    const measuredOk = (bbox: Candidate['bbox']) => bbox.width <= width * MAX_MEASURED_FRACTION && bbox.height <= height * MAX_MEASURED_FRACTION;
+
+    const applyMuse = async (base: string, ch: (typeof plan)[number], region: Region, prompt: string): Promise<Candidate | null> => {
+      // A: square CONTEXT box to Muse; separate smaller PASTE box (object + small margin).
+      const contextBox = squareContextBox(region.bbox, width, height);
+      const pasteBox = expandBox(region.bbox, 0.15, width, height);
+      const { cropDataUrl: contextCrop } = await cropDataUrl(base, contextBox);
+      const prompts = [prompt, `${prompt} Keep the exact same camera position, framing, scale and alignment as the input image; do not shift, zoom, crop or reframe.`];
+      for (let attempt = 0; attempt < prompts.length; attempt++) {
+        const edited = await providers.imageEdit.editMaskedRegion(await providerImage(contextCrop), { id: region.id, bbox: { x: pasteBox.x - contextBox.x, y: pasteBox.y - contextBox.y, width: pasteBox.width, height: pasteBox.height } }, prompts[attempt]);
+        // C: measurable alignment guard BEFORE pasting — reject shifted/reframed edits.
+        const align = await alignmentCheck(contextCrop, edited, { x: pasteBox.x - contextBox.x, y: pasteBox.y - contextBox.y, width: pasteBox.width, height: pasteBox.height });
+        if (!align.aligned) {
+          console.info(`[generate ${job.id}] change ${ch.id} attempt ${attempt + 1} rejected by alignment guard (shift ${align.shiftX},${align.shiftY}px, ring error ${align.error.toFixed(1)})`);
+          continue;
+        }
+        // B: mask composition from large diff components inside the paste box only.
+        const next = await compositeMaskedEdit(base, edited, contextBox, pasteBox);
+        const mask = await diffMask(base, next, width, height);
+        const bbox = maskToBBox(mask, width, height);
+        if (!bbox || !measuredOk(bbox)) continue;
+        return { next, mask, bbox, local: false, notes: '' };
+      }
+      return null;
+    };
+
+    const applyLocalRecolor = async (base: string, ch: (typeof plan)[number], region: Region): Promise<Candidate | null> => {
+      // D: recolor ONLY the object's own bbox pixels (never the expanded context), in OKLCH.
+      const { cropDataUrl: objCrop } = await cropDataUrl(base, region.bbox);
+      const stats = await cropColorStats(objCrop);
+      const targetHue = targetHueFromColor(ch.targetColor);
+      if (ch.targetColor && targetHue === null) return null; // achromatic/unknown target (white/gray/black) -> Muse
+      if (stats.meanChroma < 0.04 || stats.saturatedFraction < 0.15) return null; // low-chroma object: no hue rotation -> Muse
+      const shifts = [105, 145, -105, -145, 180];
+      const shift = shifts[[...ch.id].reduce((a, c) => a + c.charCodeAt(0), 0) % shifts.length];
+      const recolored = await recolorCrop(objCrop, shift, targetHue ?? undefined);
+      const next = await compositeMaskedEdit(base, recolored, region.bbox, region.bbox);
+      const mask = await diffMask(base, next, width, height);
+      const bbox = maskToBBox(mask, width, height);
+      if (!bbox || !measuredOk(bbox)) return null;
+      // E: local verification (ΔE + changed mask) — no Spark call for deterministic colors.
+      const delta = await colorDeltaE(base, next, width, height);
+      if (delta.changedPixels < 30 || delta.meanDeltaE < 0.05) return null;
+      return { next, mask, bbox, local: true, notes: `local OKLCH verify: ΔE ${delta.meanDeltaE.toFixed(3)} over ${delta.changedPixels}px (no Spark call)` };
+    };
+
+    const differences: Difference[] = [];
+    let idx = 0;
     for (const ch of plan) {
-      editIdx++;
+      idx++;
       const region = regions.find(r => r.id === ch.regionId);
       if (!region) continue;
-      setStage(`editing ${editIdx}/${plan.length}`);
-      const cropBox = expandBox(region.bbox, 0.25, width, height);
-      const { cropDataUrl: cropUrl } = await cropDataUrl(current, cropBox);
-      let next: string; let mask: boolean[];
-      if (/colou?r/i.test(ch.type)) {
-        // Pure color change: deterministic local recolor (shape pixel-identical, zero deformation,
-        // zero API cost). Falls back to Muse only if the recolor is invisible (e.g. gray object).
-        const shifts = [105, 145, -105, -145, 180];
-        const shift = shifts[[...ch.id].reduce((a, c) => a + c.charCodeAt(0), 0) % shifts.length];
-        next = await compositeCrop(current, await recolorCrop(cropUrl, shift), cropBox);
-        mask = await diffMask(current, next, width, height);
-        if (mask.filter(Boolean).length < 30) {
-          const edited = await providers.imageEdit.editMaskedRegion(await providerImage(cropUrl), { id: region.id, bbox: cropBox }, ch.editPrompt);
-          next = await compositeCrop(current, edited, cropBox);
-          mask = await diffMask(current, next, width, height);
-        }
-      } else {
-        const edited = await providers.imageEdit.editMaskedRegion(await providerImage(cropUrl), { id: region.id, bbox: cropBox }, ch.editPrompt);
-        next = await compositeCrop(current, edited, cropBox);
-        mask = await diffMask(current, next, width, height);
-      }
-      masks.set(ch.id, mask);
-      current = next;
-    }
+      setStage(`editing ${idx}/${plan.length}`);
+      const isColor = /colou?r/i.test(ch.type);
+      let candidate = isColor ? await applyLocalRecolor(current, ch, region) : null;
+      if (!candidate) candidate = await applyMuse(current, ch, region, ch.editPrompt);
+      if (!candidate) { console.info(`[generate ${job.id}] change ${ch.id} discarded: no aligned, measurable edit`); continue; }
 
-    setStage('verifying');
-    const vMod = await providerImage(current);
-    const differences: Difference[] = [];
-    let verifyIdx = 0;
-    for (const ch of plan) {
-      verifyIdx++;
-      const mask = masks.get(ch.id); if (!mask) continue;
-      setStage(`verifying ${verifyIdx}/${plan.length}`);
-      const bbox = maskToBBox(mask, width, height); if (!bbox) continue;
-      if (bbox.width > width * MAX_MEASURED_FRACTION || bbox.height > height * MAX_MEASURED_FRACTION) {
-        console.info(`[generate ${job.id}] change ${ch.id} discarded: measured diff ${bbox.width}x${bbox.height} exceeds size cap`);
-        continue;
+      let notes = candidate.notes;
+      if (!candidate.local) {
+        setStage(`verifying ${idx}/${plan.length}`);
+        let verdict = await providers.vision.verify(aiImg, await providerImage(candidate.next), ch, candidate.bbox);
+        if (!verdict.ok) {
+          // E: re-edit ONCE (never re-ask the verifier the same question), then discard.
+          const retry = await applyMuse(current, ch, region, `${ch.editPrompt} The previous attempt failed verification (${verdict.notes}); apply the change more clearly and realistically, confined to the same object.`);
+          if (retry) {
+            verdict = await providers.vision.verify(aiImg, await providerImage(retry.next), ch, retry.bbox);
+            if (verdict.ok) candidate = retry;
+          }
+          if (!verdict.ok) { console.info(`[generate ${job.id}] change ${ch.id} discarded after re-edit: ${verdict.notes}`); continue; }
+        }
+        notes = verdict.notes;
       }
-      let verdict = await providers.vision.verify(aiImg, vMod, ch, bbox);
-      if (!verdict.ok) verdict = await providers.vision.verify(aiImg, vMod, ch, bbox); // retry ONCE
       differences.push({
-        id: ch.id, type: ch.type, description: ch.description, bbox, bbox_normalized: normalizeBBox(bbox, width, height),
-        centroid: maskCentroid(mask, width, height) ?? { x: bbox.x + bbox.width / 2, y: bbox.y + bbox.height / 2 },
+        id: ch.id, type: ch.type, description: ch.description, bbox: candidate.bbox, bbox_normalized: normalizeBBox(candidate.bbox, width, height),
+        centroid: maskCentroid(candidate.mask, width, height) ?? { x: candidate.bbox.x + candidate.bbox.width / 2, y: candidate.bbox.y + candidate.bbox.height / 2 },
         mask_url: null, severity: ch.severity ?? 'medium',
-        verification_status: verdict.ok ? 'verified' : 'needs_review', verifier_notes: verdict.notes,
+        verification_status: 'verified', verifier_notes: notes,
       });
+      current = candidate.next;
     }
     if (!differences.length) throw new Error('no change survived measurement/verification');
 

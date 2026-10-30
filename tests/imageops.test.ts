@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import sharp from 'sharp';
-import { compositeCrop, diffMask, bufferToDataUrl, recolorCrop } from '../src/lib/server/imageOps';
+import { compositeCrop, diffMask, bufferToDataUrl, recolorCrop, squareContextBox, compositeMaskedEdit, alignmentCheck, cropColorStats, targetHueFromColor } from '../src/lib/server/imageOps';
 import { maskToBBox, maskCentroid } from '../src/lib/engine/geometry';
 import { createJob, getJob, runGeneration } from '../src/lib/server/jobs';
 import { getDifferences, getLevelPayload } from '../src/lib/serverStore';
@@ -11,6 +11,19 @@ const solidPng = async (w: number, h: number, rgb: [number, number, number]) =>
 const rawPixels = async (dataUrl: string) => {
   const { data, info } = await sharp(Buffer.from(dataUrl.split(',')[1], 'base64')).removeAlpha().raw().toBuffer({ resolveWithObject: true });
   return { data, width: info.width, height: info.height };
+};
+
+/** Realistic fake Muse edit: paints blue exactly in the paste sub-region it is given,
+ *  leaving everything else untouched — a whole-image repaint would (correctly) fail the
+ *  alignment guard. */
+const paintPatternBlue = async (imageRef: string, region?: { bbox: { x: number; y: number; width: number; height: number } }) => {
+  const { data, info } = await sharp(Buffer.from(imageRef.split(',')[1], 'base64')).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+  const out = Buffer.from(data);
+  const b = region?.bbox ?? { x: 12, y: 12, width: Math.max(1, info.width - 24), height: Math.max(1, info.height - 24) };
+  for (let y = Math.max(0, b.y); y < Math.min(info.height, b.y + b.height); y++) for (let x = Math.max(0, b.x); x < Math.min(info.width, b.x + b.width); x++) {
+    const o = (y * info.width + x) * 3; out[o] = 30; out[o + 1] = 30; out[o + 2] = 220;
+  }
+  return bufferToDataUrl(await sharp(out, { raw: { width: info.width, height: info.height, channels: 3 } }).png().toBuffer());
 };
 
 describe('server imageOps (sharp)', () => {
@@ -59,9 +72,59 @@ describe('maskCentroid', () => {
   });
 });
 
+describe('A/B/C/D: square context, masked composite, alignment guard, OKLCH recolor', () => {
+  it('A: square context box is shifted inside the image, never shrunk', () => {
+    expect(squareContextBox({ x: 0, y: 0, width: 20, height: 10 }, 800, 600)).toEqual({ x: 0, y: 0, width: 384, height: 384 });
+    expect(squareContextBox({ x: 390, y: 290, width: 20, height: 20 }, 800, 600)).toEqual({ x: 208, y: 108, width: 384, height: 384 });
+  });
+
+  it('B: masked composite changes only the paste area — context neighbours stay original', async () => {
+    const original = await solidPng(80, 60, [120, 120, 120]);
+    const editedContext = await solidPng(40, 40, [30, 30, 220]); // Muse repainted its whole square
+    const out = await rawPixels(await compositeMaskedEdit(original, editedContext, { x: 10, y: 10, width: 40, height: 40 }, { x: 30, y: 20, width: 20, height: 20 }));
+    const px = (x: number, y: number) => { const o = (y * out.width + x) * 3; return [out.data[o], out.data[o + 1], out.data[o + 2]]; };
+    expect(px(15, 15)).toEqual([120, 120, 120]); // inside context but OUTSIDE paste box: untouched
+    expect(px(40, 30)[2]).toBeGreaterThan(150); // centre of paste: edited blue lands
+  });
+
+  it('C: alignment guard accepts identical crops and rejects a 5px shift', async () => {
+    const pattern = async (shiftX: number) => {
+      const w = 48, h = 48, buf = Buffer.alloc(w * h * 3);
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        const sx = Math.max(0, Math.min(w - 1, x - shiftX)), o = (y * w + x) * 3;
+        buf[o] = sx * 5; buf[o + 1] = y * 5; buf[o + 2] = (sx * 3 + y * 7) % 256;
+      }
+      return bufferToDataUrl(await sharp(buf, { raw: { width: w, height: h, channels: 3 } }).png().toBuffer());
+    };
+    const orig = await pattern(0);
+    const same = await alignmentCheck(orig, orig);
+    expect(same.aligned).toBe(true); expect(same.shiftX).toBe(0);
+    const shifted = await alignmentCheck(orig, await pattern(5));
+    expect(shifted.aligned).toBe(false); expect(Math.abs(shifted.shiftX)).toBeGreaterThan(2);
+  });
+
+  it('D: target color names map to hues; achromatic targets route away from local recolor', () => {
+    expect(targetHueFromColor('green')).toBe(145);
+    expect(targetHueFromColor('Blue')).toBe(260);
+    expect(targetHueFromColor('white')).toBeNull();
+    expect(targetHueFromColor(undefined)).toBeNull();
+  });
+
+  it('D: low-chroma crops report low chroma (no hue rotation for cream/gray objects)', async () => {
+    expect((await cropColorStats(await solidPng(10, 10, [200, 195, 185]))).meanChroma).toBeLessThan(0.04);
+    expect((await cropColorStats(await solidPng(10, 10, [220, 30, 30]))).meanChroma).toBeGreaterThan(0.1);
+  });
+
+  it('D: recolor to a named target hue lands on that color family', async () => {
+    const red = await solidPng(6, 6, [220, 30, 30]);
+    const out = await rawPixels(await recolorCrop(red, 0, targetHueFromColor('green')!));
+    expect(out.data[1]).toBeGreaterThan(out.data[0]); // green dominant over red
+    expect(out.data[1]).toBeGreaterThan(out.data[2]); // and over blue
+  });
+});
+
 describe('runGeneration with fake providers (offline, no paid calls)', () => {
   it('produces a playable level with a measured, verified difference', async () => {
-    const edited = await solidPng(24, 24, [30, 30, 220]);
     const fake: Providers = {
       segmentation: { name: 'fake', isMock: true, segment: async () => [{ id: 'r1', bbox: { x: 40, y: 25, width: 10, height: 8 } }] },
       vision: {
@@ -70,7 +133,7 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
         plan: async () => [{ id: 'c1', regionId: 'r1', type: 'change color', description: 'block turned blue', editPrompt: 'make it blue' }],
         verify: async () => ({ ok: true, notes: 'verified by fake verifier' }),
       },
-      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => edited, generateScene: async () => { throw new Error('not used'); } },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async (imageRef: string, region: { bbox: { x: number; y: number; width: number; height: number } }) => paintPatternBlue(imageRef, region), generateScene: async () => { throw new Error('not used'); } },
     };
     const job = createJob('game', true);
     await runGeneration(job, await solidPng(100, 80, [120, 120, 120]), 1, fake);
@@ -90,7 +153,6 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
   });
 
   it('shrinks oversized regions so Muse can never repaint the whole photo', async () => {
-    const edited = await solidPng(24, 24, [30, 30, 220]);
     const fake: Providers = {
       segmentation: {
         name: 'fake', isMock: true,
@@ -105,7 +167,7 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
         plan: async (_i, regions) => regions.map(r => ({ id: `c-${r.id}`, regionId: r.id, type: 'change color', description: `change in ${r.id}`, editPrompt: 'edit' })),
         verify: async () => ({ ok: true, notes: 'ok' }),
       },
-      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => edited, generateScene: async () => { throw new Error('not used'); } },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async (imageRef: string, region: { bbox: { x: number; y: number; width: number; height: number } }) => paintPatternBlue(imageRef, region), generateScene: async () => { throw new Error('not used'); } },
     };
     const job = createJob('game', true);
     await runGeneration(job, await solidPng(100, 80, [120, 120, 120]), 2, fake);
@@ -141,6 +203,7 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
     expect(diffs).toHaveLength(1);
     expect(diffs[0].centroid!.x).toBeGreaterThanOrEqual(40); // centered on the recolored square
     expect(diffs[0].centroid!.x).toBeLessThanOrEqual(50);
+    expect(diffs[0].verifier_notes).toContain('no Spark call'); // E: deterministic colors verified locally (ΔE + mask)
   });
 
   it('never removes/replaces a fragment — downgraded to a color change (no broken objects)', async () => {
@@ -168,7 +231,6 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
 
   it('QC mode keeps localized defects on fragments (scratch on part of a part is the point)', async () => {
     let museCalled = false;
-    const edited = await solidPng(24, 24, [30, 30, 220]);
     const fake: Providers = {
       segmentation: { name: 'fake', isMock: true, segment: async () => [{ id: 'big', bbox: { x: 0, y: 0, width: 99, height: 79 } }] }, // fragment after shrink
       vision: {
@@ -177,13 +239,33 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
         plan: async () => [{ id: 'c1', regionId: 'big', type: 'scratch', description: 'scratch across the surface', editPrompt: 'add a realistic scratch' }],
         verify: async () => ({ ok: true, notes: 'ok' }),
       },
-      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { museCalled = true; return edited; }, generateScene: async () => '' },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async (imageRef: string, region: { bbox: { x: number; y: number; width: number; height: number } }) => { museCalled = true; return paintPatternBlue(imageRef, region); }, generateScene: async () => '' },
     };
     const job = createJob('qc', true);
     await runGeneration(job, await solidPng(100, 80, [120, 120, 120]), 1, fake);
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     expect(museCalled).toBe(true); // NOT downgraded to a local recolor
     expect(getDifferences(job.levelId!)![0].type).toBe('scratch');
+  });
+
+  it('E: a failed verification re-edits once with Muse (never re-asks the same question)', async () => {
+    let editCalls = 0, verifyCalls = 0;
+    const fake: Providers = {
+      segmentation: { name: 'fake', isMock: true, segment: async () => [{ id: 'r1', bbox: { x: 40, y: 25, width: 10, height: 8 } }] },
+      vision: {
+        name: 'fake', isMock: true,
+        moderate: async () => ({ ok: true, reason: 'ok' }),
+        plan: async () => [{ id: 'c1', regionId: 'r1', type: 'remove object', description: 'remove the block', editPrompt: 'Remove the block.' }],
+        verify: async () => { verifyCalls++; return verifyCalls === 1 ? { ok: false, notes: 'still visible' } : { ok: true, notes: 'gone now' }; },
+      },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async (imageRef: string, region: { bbox: { x: number; y: number; width: number; height: number } }) => { editCalls++; return paintPatternBlue(imageRef, region); }, generateScene: async () => '' },
+    };
+    const job = createJob('game', true);
+    await runGeneration(job, await solidPng(100, 80, [120, 120, 120]), 1, fake);
+    expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
+    expect(editCalls).toBe(2);   // initial edit + exactly one re-edit
+    expect(verifyCalls).toBe(2); // verified the NEW edit, not the same one twice
+    expect(getDifferences(job.levelId!)![0].verifier_notes).toBe('gone now');
   });
 
   it('marks the job failed when moderation rejects (no silent fallback)', async () => {
