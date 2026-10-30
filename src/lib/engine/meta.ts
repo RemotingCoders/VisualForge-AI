@@ -104,12 +104,65 @@ export function parseSseOutputText(sseText: string): string {
 }
 
 /**
- * SAM mask payloads are base85 at LOWER resolution than the image and must be rescaled.
- * The byte->raster algorithm lives ONLY in the official client libraries
- * (@meta-sam/parser >= 0.0.13 / meta-sam-parser >= 0.0.6) per /docs/sam/client-libraries —
- * that page has NOT been verified yet, so this stays a loud stub instead of a guess.
- * The pipeline does not depend on it: real masks/bboxes come from pixel-diff measurement.
+ * Mask decoding via the OFFICIAL @meta-sam/parser (installed 0.1.0; Damian verified the
+ * client-libraries page). One shape difference from our SamMask: the codec expects the
+ * payload WITH its leading encoding marker ('!' one_bit / '~' lossless) — it validates
+ * `payload.startsWith('!')` and decodes `payload.slice(1)`. Our SamMask stores the
+ * payload stripped with `encoding` separate, so toParserMask reattaches the marker.
+ * Pure ESM package — if Next/Vitest ever refuse the static import, switch these to
+ * dynamic imports. Throws InvalidSegmentationMaskError on malformed payloads: callers
+ * must catch and fall back to bbox behavior.
  */
-export function decodeMaskToRaster(_mask: SamMask, _targetW: number, _targetH: number): Uint8Array {
-  throw new Error('decodeMaskToRaster pending verification of https://dev.meta.ai/docs/sam/client-libraries (official @meta-sam/parser) — not guessed. Pipeline measures real masks from pixel diff instead.');
+import {
+  decodeMaskToRaster as parserDecodeRaster,
+  decodeMaskToRLE as parserDecodeRLE,
+  decodeMaskToSVGPath as parserDecodeSVGPath,
+  InvalidSegmentationMaskError,
+} from '@meta-sam/parser';
+export { InvalidSegmentationMaskError };
+
+const toParserMask = (mask: SamMask) => {
+  // SamMask contract: payload is stored WITHOUT the encoding marker (parseSamOutput
+  // strips it); the codec wants it back on. Always prepend by encoding — a stripped
+  // one_bit payload can itself legitimately start with '!' (base85 digit 0), so a
+  // startsWith check would wrongly skip the prepend.
+  const marker = mask.encoding === 'lossless' ? '~' : '!';
+  return { encoding: mask.encoding, width: mask.width, height: mask.height, payload: marker + mask.payload };
+};
+
+/** Decode a SAM mask payload to its native-resolution raster: Uint8Array of
+ *  mask.width * mask.height values 0/1, row-major. Covers the object's box. */
+export function decodeMaskToRaster(mask: SamMask): Uint8Array {
+  return parserDecodeRaster(toParserMask(mask));
+}
+/** COCO RLE ({ counts, size }) for a SAM mask, via the official parser. */
+export function decodeMaskToRLE(mask: SamMask) {
+  return parserDecodeRLE(toParserMask(mask));
+}
+/** SVG path string for a SAM mask, via the official parser ('' when the mask is empty). */
+export function decodeMaskToSVGPath(mask: SamMask): string {
+  return parserDecodeSVGPath(toParserMask(mask));
+}
+
+/**
+ * Bring a SAM mask to the image frame: decode, scale the raster to the box's
+ * width/height (nearest neighbor), and place it at (box.x, box.y) in a
+ * frameW*frameH 0/1 raster. Outside the box everything is 0.
+ */
+export function maskRasterToFrame(mask: SamMask, box: { x: number; y: number; width: number; height: number }, frameW: number, frameH: number): Uint8Array {
+  const raster = decodeMaskToRaster(mask);
+  const out = new Uint8Array(frameW * frameH);
+  const bw = Math.max(1, Math.round(box.width)), bh = Math.max(1, Math.round(box.height));
+  for (let dy = 0; dy < bh; dy++) {
+    const fy = Math.round(box.y) + dy;
+    if (fy < 0 || fy >= frameH) continue;
+    const sy = Math.min(mask.height - 1, Math.floor(dy * mask.height / bh));
+    for (let dx = 0; dx < bw; dx++) {
+      const fx = Math.round(box.x) + dx;
+      if (fx < 0 || fx >= frameW) continue;
+      const sx = Math.min(mask.width - 1, Math.floor(dx * mask.width / bw));
+      out[fy * frameW + fx] = raster[sy * mask.width + sx];
+    }
+  }
+  return out;
 }

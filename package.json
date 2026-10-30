@@ -14,6 +14,7 @@
     "spike:meta": "node scripts/meta-spike.mjs"
   },
   "dependencies": {
+    "@meta-sam/parser": "^0.1.0",
     "@supabase/supabase-js": "^2.45.0",
     "canvas-confetti": "^1.9.4",
     "next": "^14.2.5",

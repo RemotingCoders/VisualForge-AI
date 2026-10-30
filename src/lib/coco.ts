@@ -1,12 +1,12 @@
 import type { BBox } from './engine/types';
 
 export interface CocoImage { id: number; file_name: string; width: number; height: number }
-export interface CocoAnnotation { id: number; image_id: number; category_id: number; bbox: [number, number, number, number]; area: number; iscrowd: 0 }
-export function toCOCO(images: CocoImage[], anns: { imageId: number; categoryId: number; bbox: BBox }[], categories: { id: number; name: string }[]) {
+export interface CocoAnnotation { id: number; image_id: number; category_id: number; bbox: [number, number, number, number]; area: number; iscrowd: 0; segmentation?: number[][] }
+export function toCOCO(images: CocoImage[], anns: { imageId: number; categoryId: number; bbox: BBox; segmentation?: number[]; area?: number }[], categories: { id: number; name: string }[]) {
   return {
     info: { description: 'VisualForge AI synthetic dataset — validate before industrial use', synthetic: true },
     images, categories,
-    annotations: anns.map((a, i): CocoAnnotation => ({ id: i + 1, image_id: a.imageId, category_id: a.categoryId, bbox: [a.bbox.x, a.bbox.y, a.bbox.width, a.bbox.height], area: a.bbox.width * a.bbox.height, iscrowd: 0 })),
+    annotations: anns.map((a, i): CocoAnnotation => ({ id: i + 1, image_id: a.imageId, category_id: a.categoryId, bbox: [a.bbox.x, a.bbox.y, a.bbox.width, a.bbox.height], area: a.area ?? a.bbox.width * a.bbox.height, iscrowd: 0, ...(a.segmentation ? { segmentation: [a.segmentation] } : {}) })),
   };
 }
 export function toYOLO(bbox: BBox, imgW: number, imgH: number, classId: number): string {
@@ -23,7 +23,7 @@ export function qcCategories(diffs: { type: string }[]): { id: number; name: str
   return names.map((name, i) => ({ id: i + 1, name }));
 }
 
-type ExportableDiff = { type: string; bbox: BBox; verification_status: string };
+type ExportableDiff = { type: string; bbox: BBox; verification_status: string; segmentation?: number[]; area_px?: number };
 
 /**
  * QC dataset from a REAL generated level. Only `verified` differences are exported, and the
@@ -35,7 +35,7 @@ export function buildQCCoco(diffs: ExportableDiff[], width: number, height: numb
   const catId = new Map(categories.map(c => [c.name, c.id]));
   return toCOCO(
     [{ id: 1, file_name: fileName, width, height }],
-    verified.map(d => ({ imageId: 1, categoryId: catId.get(d.type)!, bbox: d.bbox })),
+    verified.map(d => ({ imageId: 1, categoryId: catId.get(d.type)!, bbox: d.bbox, segmentation: d.segmentation, area: d.area_px })),
     categories,
   );
 }

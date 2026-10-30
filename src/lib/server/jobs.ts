@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { enforceSpacing, maskToBBox, maskCentroid, normalizeBBox, overlaps } from '../engine/geometry';
+import { enforceSpacing, maskToBBox, maskCentroid, maskToPolygon, normalizeBBox, overlaps } from '../engine/geometry';
+import { maskRasterToFrame } from '../engine/meta';
 import type { Providers, Mode, Difficulty, Difference, Region, PlannedChange } from '../engine/types';
 import { normalizeImage, cropDataUrl, expandBox, expandMask, diffMask, providerImage, clampBox, recolorCrop, squareContextBox, compositeMaskedEdit, estimateAlignment, alignEditedCrop, ALIGNMENT_MAX_RESIDUAL, cropColorStats, colorDeltaE, targetHueFromColor, cropDominantHue, transformObjectInPaste, duplicateObjectInPaste, extractOnePassComponents, compositeOnePassComponents, type OnePassComponent, type LocalTransformKind } from './imageOps';
 import { saveImageLevel } from '../serverStore';
@@ -68,6 +69,29 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
 
     const differences: Difference[] = [];
     const difficulty = job.difficulty ?? 'medium';
+
+    // VF_SAM_MASKS: real SAM masks via the official parser. The object's mask as a
+    // full-frame boolean[], or null with the reason logged — callers fall back to the
+    // bbox/diff-only behavior of today. Zero extra API calls (masks ride on SAM responses).
+    const samMasksOn = process.env.VF_SAM_MASKS === 'true';
+    const samFrameMask = (region: Region, changeId: string): boolean[] | null => {
+      if (!samMasksOn) return null;
+      if (!region.samMask) { console.info(`[generate ${job.id}] change ${changeId}: SAM mask unavailable (region has no SAM mask) — falling back to bbox`); return null; }
+      try {
+        const frame = maskRasterToFrame(region.samMask, region.bbox, width, height);
+        const bool = Array.from(frame, v => v === 1);
+        if (!bool.some(Boolean)) { console.info(`[generate ${job.id}] change ${changeId}: SAM mask empty after decode — falling back to bbox`); return null; }
+        return bool;
+      } catch (e) {
+        console.info(`[generate ${job.id}] change ${changeId}: SAM mask decode failed (${e instanceof Error ? e.message : String(e)}) — falling back to bbox`);
+        return null;
+      }
+    };
+    const maskSubgrid = (frameMask: boolean[], box: { x: number; y: number; width: number; height: number }): boolean[] => {
+      const out: boolean[] = [];
+      for (let y = 0; y < box.height; y++) for (let x = 0; x < box.width; x++) out.push(frameMask[(box.y + y) * width + (box.x + x)]);
+      return out;
+    };
 
     // ============ CROP PREP: segmentation + planning, launched IN PARALLEL with the
     // one-pass Muse call below — both depend only on the ORIGINAL image. The resulting
@@ -203,6 +227,8 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
       for (const k of kept) {
         differences.push({
           id: `onepass-${differences.length + 1}`, type: k.type, description: k.description, bbox: k.bbox, bbox_normalized: normalizeBBox(k.bbox, width, height),
+          segmentation: maskToPolygon(k.mask, width, height) ?? undefined,
+          area_px: k.mask.reduce((a, v) => a + (v ? 1 : 0), 0),
           centroid: maskCentroid(k.mask, width, height) ?? { x: k.bbox.x + k.bbox.width / 2, y: k.bbox.y + k.bbox.height / 2 },
           mask_url: null, severity: 'medium', verification_status: 'verified', verifier_notes: `one-pass ${label}: ${k.notes}`,
         });
@@ -257,8 +283,12 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
         return null;
       }
       const alignedEdited = await alignEditedCrop(contextCrop, edited, est);
-      // B: mask composition from large diff components inside the paste box only.
-      const next = await compositeMaskedEdit(base, alignedEdited, contextBox, pasteBox);
+      // B: mask composition from large diff components inside the paste box only;
+      // VF_SAM_MASKS unions the object's real SAM mask into the paste alpha.
+      const frameMask = samFrameMask(region, ch.id);
+      const objectMask = frameMask ? maskSubgrid(frameMask, pasteBox) : undefined;
+      if (objectMask) console.info(`[generate ${job.id}] change ${ch.id}: SAM mask union in composite (${objectMask.filter(Boolean).length}px of paste box)`);
+      const next = await compositeMaskedEdit(base, alignedEdited, contextBox, pasteBox, objectMask);
       const mask = await diffMask(base, next, width, height);
       const bbox = maskToBBox(mask, width, height);
       if (!bbox) { console.info(`[generate ${job.id}] change ${ch.id} discarded: no measurable diff after masked composite`); return null; }
@@ -279,13 +309,22 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
       // dominant hue (dominant + 180°). Never a hash-derived shift, never "the candidate
       // with the biggest ΔE" (that used to override the requested color: yellow star
       // came out green, green "1" came out red).
-      const dominantHue = await cropDominantHue(objCrop);
+      // VF_SAM_MASKS: recolor ONLY the object's real mask pixels (dilated 1px, no
+      // feather). The hue measurements below are scoped to the same mask: the
+      // unrecolored remainder of the bbox must not pollute the result-hue gate.
+      const frameMask = samFrameMask(region, ch.id);
+      let recolorMask: boolean[] | null = null;
+      if (frameMask) {
+        recolorMask = expandMask(maskSubgrid(frameMask, cropBox), cropBox.width, cropBox.height, 1);
+        console.info(`[generate ${job.id}] change ${ch.id}: SAM mask applied to recolor (${recolorMask.filter(Boolean).length}/${cropBox.width * cropBox.height}px of bbox)`);
+      }
+      const dominantHue = await cropDominantHue(objCrop, recolorMask);
       let chosenHue: number | null = targetHue;
       if (chosenHue === null && dominantHue !== null) chosenHue = (dominantHue + 180) % 360;
       if (chosenHue === null) { console.info(`[generate ${job.id}] change ${ch.id}: local recolor skipped — no target hue and no dominant hue, Muse fallback`); return null; }
-      const recolored = await recolorCrop(objCrop, 0, chosenHue);
+      const recolored = await recolorCrop(objCrop, 0, chosenHue, recolorMask);
       const delta = await colorDeltaE(objCrop, recolored, cropBox.width, cropBox.height);
-      const resultHue = await cropDominantHue(recolored);
+      const resultHue = await cropDominantHue(recolored, recolorMask);
       const hueDist = (a: number, b: number) => { const d = Math.abs(a - b) % 360; return d > 180 ? 360 - d : d; };
       console.info(`[generate ${job.id}] change ${ch.id} color: target="${ch.targetColor ?? ''}" targetHue=${targetHue !== null ? Math.round(targetHue) + '°' : 'none'} chosenHue=${Math.round(chosenHue)}° dominantBefore=${dominantHue !== null ? Math.round(dominantHue) + '°' : 'none'} resultHue=${resultHue !== null ? Math.round(resultHue) + '°' : 'none'} ΔE=${delta.meanDeltaE.toFixed(3)} changedPx=${delta.changedPixels}`);
       if (targetHue !== null && resultHue !== null && hueDist(resultHue, targetHue) > 35) { console.info(`[generate ${job.id}] change ${ch.id}: local recolor rejected — result hue ${Math.round(resultHue)}° does not match target ${Math.round(targetHue)}°, Muse fallback`); return null; }
@@ -382,6 +421,8 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
       }
       differences.push({
         id: ch.id, type: ch.type, description: ch.description, bbox: candidate.bbox, bbox_normalized: normalizeBBox(candidate.bbox, width, height),
+        segmentation: maskToPolygon(candidate.mask, width, height) ?? undefined,
+        area_px: candidate.mask.reduce((a, v) => a + (v ? 1 : 0), 0),
         centroid: maskCentroid(candidate.mask, width, height) ?? { x: candidate.bbox.x + candidate.bbox.width / 2, y: candidate.bbox.y + candidate.bbox.height / 2 },
         mask_url: null, severity: ch.severity ?? 'medium',
         verification_status: 'verified', verifier_notes: notes,

@@ -146,8 +146,11 @@ function blurAlpha(alpha: Buffer, w: number, h: number, radius = 2): Buffer {
  * already kills repainted neighbours, straight edges and background jitter.) Pixels outside
  * the paste box are copied from the original untouched.
  * `editedDataUrl` is the full CONTEXT image Muse returned; the paste area is extracted from it.
+ * `objectMask` (VF_SAM_MASKS): the object's real SAM mask in PASTE-box frame — paste
+ * alpha = object mask ∪ large diff components, so the whole object is pasted even
+ * where Muse's edit barely moved its pixels, while repainted neighbours stay out.
  */
-export async function compositeMaskedEdit(originalDataUrl: string, editedDataUrl: string, contextBox: BBox, pasteBox: BBox): Promise<string> {
+export async function compositeMaskedEdit(originalDataUrl: string, editedDataUrl: string, contextBox: BBox, pasteBox: BBox, objectMask?: boolean[]): Promise<string> {
   const { width, height } = await imageInfo(originalDataUrl);
   const ctx = clampBox(contextBox, width, height); const paste = clampBox(pasteBox, width, height);
   const rel = { left: paste.x - ctx.x, top: paste.y - ctx.y, width: paste.width, height: paste.height };
@@ -163,7 +166,7 @@ export async function compositeMaskedEdit(originalDataUrl: string, editedDataUrl
   const { labels, sizes } = connectedComponents(rawMask, w, h);
   const minArea = Math.max(8, Math.floor(w * h * 0.01)); // drop jitter specks, keep the real change
   const kept = new Array<boolean>(w * h).fill(false);
-  for (let i = 0; i < w * h; i++) kept[i] = labels[i] >= 0 && sizes[labels[i]] >= minArea;
+  for (let i = 0; i < w * h; i++) kept[i] = (labels[i] >= 0 && sizes[labels[i]] >= minArea) || (objectMask?.[i] ?? false);
   const alpha = blurAlpha(Buffer.from(dilateMask(kept, w, h, 5).map(v => (v ? 255 : 0))), w, h);
   const withAlpha = await sharp(editedPasteBuf).joinChannel(alpha, { raw: { width: w, height: h, channels: 1 } }).png().toBuffer();
   const out = await sharp(dataUrlToBuffer(originalDataUrl)).composite([{ input: withAlpha, left: paste.x, top: paste.y }]).png().toBuffer();
@@ -334,10 +337,11 @@ export async function colorDeltaE(aDataUrl: string, bDataUrl: string, width: num
   return { meanDeltaE: changed ? sum / changed : 0, changedPixels: changed };
 }
 
-export async function recolorCrop(cropDataUrl: string, hueShiftDeg: number, targetHueDeg?: number): Promise<string> {
+export async function recolorCrop(cropDataUrl: string, hueShiftDeg: number, targetHueDeg?: number, mask?: boolean[] | null): Promise<string> {
   const { data, info } = await sharp(dataUrlToBuffer(cropDataUrl)).removeAlpha().raw().toBuffer({ resolveWithObject: true });
   const out = Buffer.from(data);
   for (let i = 0; i < data.length; i += 3) {
+    if (mask && !mask[i / 3]) continue; // VF_SAM_MASKS: recolor ONLY the object's real mask pixels
     const [L, C, H] = rgbToOklch(data[i] / 255, data[i + 1] / 255, data[i + 2] / 255);
     if (C < 0.004) continue; // achromatic: no hue — untouched (gray/white stay exact)
     const newHue = targetHueDeg ?? (H + hueShiftDeg);
@@ -351,11 +355,17 @@ export async function recolorCrop(cropDataUrl: string, hueShiftDeg: number, targ
   return bufferToDataUrl(await sharp(out, { raw: { width: info.width, height: info.height, channels: 3 } }).png().toBuffer());
 }
 
-/** Circular mean hue (OKLCH degrees, 0-360) of a crop's saturated pixels; null when it has none. */
-export async function cropDominantHue(cropDataUrl: string): Promise<number | null> {
+/**
+ * Circular mean hue (OKLCH degrees, 0-360) of a crop's saturated pixels; null when it
+ * has none. With a mask (VF_SAM_MASKS), ONLY masked pixels count — measuring the whole
+ * crop would mix in the object's intentionally-unrecolored pixels and fail the
+ * result-hue gate (a 58%-covered red square measured 58° instead of the target 100°).
+ */
+export async function cropDominantHue(cropDataUrl: string, mask?: boolean[] | null): Promise<number | null> {
   const { data } = await rawOf(cropDataUrl);
   let sx = 0, sy = 0;
   for (let i = 0; i < data.length; i += 3) {
+    if (mask && !mask[i / 3]) continue;
     const [, C, H] = rgbToOklch(data[i] / 255, data[i + 1] / 255, data[i + 2] / 255);
     if (C <= 0.03) continue;
     const rad = H * Math.PI / 180;

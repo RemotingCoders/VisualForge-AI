@@ -39,6 +39,60 @@ export function maskCentroid(mask: Uint8Array | boolean[], w: number, h: number)
   return n ? { x: sx / n, y: sy / n } : null;
 }
 
+/**
+ * COCO polygon for a boolean mask: crack-following boundary trace (walk the grid
+ * edges of the foreground, keeping foreground cells on the right) around the
+ * component containing the first foreground pixel. Returns a FLAT
+ * [x1,y1,x2,y2,...] array of grid-corner coordinates, or null for an empty mask.
+ * Degenerate traces fall back to the mask's bbox rectangle (>= 3 points always).
+ */
+export function maskToPolygon(mask: Uint8Array | boolean[], w: number, h: number): number[] | null {
+  if (mask.length !== w * h) throw new Error(`mask size ${mask.length} != ${w}x${h}`);
+  const fg = (cx: number, cy: number) => cx >= 0 && cy >= 0 && cx < w && cy < h && !!mask[cy * w + cx];
+  let start = -1;
+  for (let i = 0; i < w * h; i++) if (mask[i]) { start = i; break; }
+  if (start < 0) return null;
+  const bbox = maskToBBox(mask, w, h)!;
+  const rect = [bbox.x, bbox.y, bbox.x + bbox.width, bbox.y, bbox.x + bbox.width, bbox.y + bbox.height, bbox.x, bbox.y + bbox.height];
+  // Headings E,S,W,N (y down). Right/left cells of the edge leaving vertex (vx,vy):
+  const RIGHT = [[0, 0], [-1, 0], [-1, -1], [0, -1]]; // per heading: [dcx, dcy] added to (vx, vy)
+  const LEFT = [[0, -1], [0, 0], [-1, 0], [-1, -1]];
+  const STEP = [[1, 0], [0, 1], [-1, 0], [0, -1]];
+  const sx = start % w, sy = (start / w) | 0;
+  let vx = sx, vy = sy, heading = 0; // start at the pixel's top-left corner, heading east along its top edge
+  const corners: [number, number][] = [[vx, vy]];
+  const maxSteps = w * h * 4 + 16;
+  for (let step = 0; step < maxSteps; step++) {
+    // Closed the loop as soon as we are BACK at the start vertex (any heading — the
+    // walker arrives heading N and departs E, so a heading check here never fires).
+    if (step > 0 && vx === sx && vy === sy) break;
+    // Preference: right turn, straight, left turn, back — first edge with fg on the right and bg on the left.
+    let moved = false;
+    for (const turn of [1, 0, 3, 2]) {
+      const nh = (heading + turn) % 4;
+      const rcx = vx + RIGHT[nh][0], rcy = vy + RIGHT[nh][1];
+      const lcx = vx + LEFT[nh][0], lcy = vy + LEFT[nh][1];
+      if (fg(rcx, rcy) && !fg(lcx, lcy)) {
+        vx += STEP[nh][0]; vy += STEP[nh][1]; heading = nh;
+        corners.push([vx, vy]);
+        moved = true;
+        break;
+      }
+    }
+    if (!moved) break;
+  }
+  if (corners.length > 1 && corners[corners.length - 1][0] === sx && corners[corners.length - 1][1] === sy) corners.pop();
+  // Drop collinear middle points (keep only heading changes).
+  const ring: [number, number][] = [];
+  for (let i = 0; i < corners.length; i++) {
+    const prev = corners[(i - 1 + corners.length) % corners.length], cur = corners[i], next = corners[(i + 1) % corners.length];
+    const cross = (cur[0] - prev[0]) * (next[1] - cur[1]) - (cur[1] - prev[1]) * (next[0] - cur[0]);
+    if (cross !== 0) ring.push(cur);
+  }
+  if (ring.length < 3) return rect;
+  return ring.flatMap(p => [p[0], p[1]]);
+}
+
 /** Click hit-test against the REAL bbox, expanded by tolerance (pixels). */
 export function clickHits(click: { x: number; y: number }, bbox: BBox, tolerance = 14): boolean {
   return click.x >= bbox.x - tolerance && click.x <= bbox.x + bbox.width + tolerance &&

@@ -1,8 +1,10 @@
+import type { SamMask } from './meta';
+
 export type Mode = 'game' | 'qc';
 export type Difficulty = 'easy' | 'medium' | 'hard';
 export type BBox = { x: number; y: number; width: number; height: number };
 
-export interface Region { id: string; bbox: BBox; maskRef?: string; label?: string; wholeObject?: boolean }
+export interface Region { id: string; bbox: BBox; maskRef?: string; label?: string; wholeObject?: boolean; /** Real SAM mask as emitted by the API (payload form); decoded via @meta-sam/parser when VF_SAM_MASKS=true. */ samMask?: SamMask }
 
 export interface PlannedChange {
   id: string; regionId: string; type: string; description: string; editPrompt: string; severity?: 'low' | 'medium' | 'high';
@@ -14,6 +16,10 @@ export interface Difference {
   id: string; type: string; description: string;
   bbox: BBox; bbox_normalized: BBox; mask_url: string | null;
   centroid?: { x: number; y: number }; // center of mass of the measured diff — marker circles center here
+  /** Flat COCO polygon [x1,y1,x2,y2,...] traced from the MEASURED diff mask (QC export); absent when unavailable. */
+  segmentation?: number[];
+  /** Real measured area of the diff mask in pixels (COCO `area`); absent when unavailable. */
+  area_px?: number;
   severity: 'low' | 'medium' | 'high';
   verification_status: 'verified' | 'needs_review' | 'rejected';
   verifier_notes: string;

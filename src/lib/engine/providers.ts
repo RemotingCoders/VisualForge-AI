@@ -176,7 +176,7 @@ class MetaProvider implements SegmentationProvider, VisionReasoningProvider, Ima
     // cost ~19s of wall time for a full concept list). Order stays deterministic.
     const perConcept = await Promise.all(labels.slice(0, 8).map(async label => {
       const objects = await samSegmentConcept(imageRef, label);
-      return objects.map(o => ({ id: `sam-${label.replace(/\s+/g, '-').toLowerCase()}-${o.id}`, bbox: o.bbox, label }));
+      return objects.map(o => ({ id: `sam-${label.replace(/\s+/g, '-').toLowerCase()}-${o.id}`, bbox: o.bbox, label, ...(o.mask ? { samMask: o.mask } : {}) }));
     }));
     return perConcept.flat();
   }
