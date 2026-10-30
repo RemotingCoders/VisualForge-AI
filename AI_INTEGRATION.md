@@ -1,6 +1,6 @@
 # AI Integration — Phase 0 status
 
-**Status: ✅ SPIKE COMPLETE 2026-10-29 — 5/6 paid calls used (1 reserve unspent). Full loop validated end-to-end: SAM segment → Spark plan → Muse crop edit → feathered composite → pixel-diff measurement → Spark verify. Full-image editing REJECTED with evidence (regenerates the scene). Tests green (Vitest 17/17, pytest 2/2, Playwright 1/1). Next: wire the real providers into the async job pipeline (AI_PROVIDER=meta) behind the same limits.**
+**Status: ✅ SPIKE COMPLETE 2026-10-29 — 5/6 paid calls used (1 reserve unspent). Full loop validated end-to-end: SAM segment → Spark plan → Muse crop edit → feathered composite → pixel-diff measurement → Spark verify. Full-image editing REJECTED with evidence (regenerates the scene). ✅ Real providers wired into the app as async jobs (Phase 6, 2026-10-29): POST /api/generate creates a job (limits + kill switch enforced), GET polls stage; the Play page uploads a photo, shows job progress, and plays the generated level with server-validated clicks. Offline tests cover the loop with fake providers (Vitest 21/21, pytest 2/2). Live generation still requires per-run approval: `AI_PROVIDER=meta` + `META_REAL_CALLS_ENABLED=true`.**
 
 ## Verified API reference (dev.meta.ai/docs, pasted by Damian 2026-10-28)
 - **Base URL:** `https://api.meta.ai/v1` · **Auth:** `Authorization: Bearer $MODEL_API_KEY` (key set by Damian in `.env.local`, never via chat)

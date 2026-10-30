@@ -1,4 +1,4 @@
-import type { Providers, Region, PlannedChange, Mode, BBox } from './types';
+import type { Providers, Region, PlannedChange, Mode, BBox, SegmentationProvider, VisionReasoningProvider, ImageEditProvider } from './types';
 import { META_BASE_URL, META_MODELS, META_ENDPOINTS, metaApiKey, parseSamOutput, parseSseOutputText, type SamObject } from './meta';
 
 export class MetaNotConfiguredError extends Error {
@@ -121,7 +121,7 @@ export async function sparkStructured<T>(opts: {
   return JSON.parse(text) as T;
 }
 
-class MetaProvider implements Providers['segmentation'], Providers['vision'], Providers['imageEdit'] {
+class MetaProvider implements SegmentationProvider, VisionReasoningProvider, ImageEditProvider {
   readonly name = 'meta'; readonly isMock = false;
   async segment(imageRef: string, _w: number, _h: number, concepts?: string[]): Promise<Region[]> {
     assertMetaConfigured();
@@ -175,7 +175,7 @@ class MetaProvider implements Providers['segmentation'], Providers['vision'], Pr
 }
 
 /** MOCK — tests/offline ONLY. Always labeled; never a silent fallback in demo. */
-export class MockProviders implements Providers['segmentation'], Providers['vision'], Providers['imageEdit'] {
+export class MockProviders implements SegmentationProvider, VisionReasoningProvider, ImageEditProvider {
   readonly name = 'mock'; readonly isMock = true;
   async segment(_i: string, w: number, h: number): Promise<Region[]> {
     const cols = 4, rows = 3, out: Region[] = [];

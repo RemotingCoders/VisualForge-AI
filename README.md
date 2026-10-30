@@ -15,7 +15,7 @@ upload/theme → Muse Spark moderation → SAM 3.1 segmentation → Muse Spark p
 → Muse Image edit (masked region only) → composite (outside mask = pixel-identical)
 → measure REAL pixel diff → real mask/bbox → Muse Spark verify (retry once, else needs_review) → publish
 ```
-Full detail, prompts, verified endpoints and costs: [AI_INTEGRATION.md](AI_INTEGRATION.md). **The real Meta providers (SAM 3.1 streaming segmentation, Muse Spark structured plan/verify, Muse Image edit) are implemented verbatim from the official docs; the Phase-0 spike (max 6 paid calls) runs only after tests pass and phases are committed — no paid calls have been made yet.** Until then the app runs a clearly-labeled **MOCK** provider (UI banner + output labels); the real provider refuses loudly rather than falling back silently.
+Full detail, prompts, verified endpoints and costs: [AI_INTEGRATION.md](AI_INTEGRATION.md). **The real Meta providers (SAM 3.1 streaming segmentation, Muse Spark structured plan/verify, Muse Image crop-edit + composite) are implemented verbatim from the official docs and were validated end-to-end by the Phase-0 spike on 2026-10-29 (5 paid calls, full loop verified; full-image editing rejected with pixel evidence). They are wired into the app as async generation jobs (`POST /api/generate` → poll → playable level) behind the kill switch and credit limits.** With the offline **MOCK** provider (clearly labeled in the UI and outputs) the app returns the demo level instead — never a silent fake.
 
 ## Setup
 ```bash
@@ -30,13 +30,13 @@ npm test            # Vitest: pipeline, composite invariant, mask→bbox, click 
 .venv/bin/python -m pytest tests/test_composite.py   # Python env lives in .venv (git-ignored)
 npm run test:e2e    # Playwright: single-player flow on MOCK
 ```
-**Status (2026-10-28): all green** — Vitest 16/16, pytest 2/2, Playwright 1/1, run locally after the Phase-0 doc verification.
+**Status (2026-10-29): all green** — Vitest 21/21 (incl. the async generation loop with fake providers + sharp composite/measurement invariants), pytest 2/2, Playwright 1/1.
 
 ## Feature status
 | Feature | Status |
 |---|---|
-| Engine pipeline + providers + credit limits | ✅ code (mock-verified logic) · ⏳ real Meta (Phase 0) |
-| Play Your Photo (offline MOCK level, server-validated clicks) | ✅ playable slice · ⏳ upload/theme with real models |
+| Engine pipeline + providers + credit limits | ✅ real Meta spike-validated + wired as async jobs |
+| Play Your Photo (upload → generate → server-validated play) | ✅ playable · ⏳ theme→scene generation (Muse Image generation shape unverified) |
 | Diferia Online (room/race/best-of-3 UI + DB race guard) | 🟡 local simulation · ⏳ Supabase Realtime wiring |
 | QC Trainer + COCO/YOLO export | ✅ playable slice · ⏳ batch dataset review flow |
 | Landing "one engine, three uses" | ✅ |
@@ -48,6 +48,6 @@ Everything in this repository: Next.js app, engine, providers, Supabase schema, 
 This project was built with **Muse** (Anthropic's CLI) as the development partner.
 
 ## Known limitations
-Real Meta integration awaits the Phase-0 spike; Supabase Realtime multiplayer and storage uploads need project credentials; demo scenes are procedural shapes, not photos, until Muse Image is verified.
+Real Meta generation runs only when deliberately enabled server-side (`AI_PROVIDER=meta` + kill switch on, per-run approval); Supabase Realtime multiplayer and storage uploads need project credentials; jobs/levels currently live in server memory (Supabase persistence is the next wiring step); Muse Image *generation* (theme→scene) is still unverified, so scenes come from uploads or the labeled MOCK demo.
 
 MIT License — see [LICENSE](LICENSE).

@@ -1,0 +1,50 @@
+import { NextResponse } from 'next/server';
+import { selectProviders, assertMetaConfigured } from '@/lib/engine/providers';
+import { checkLimits } from '@/lib/limits';
+import { createJob, getJob, jobsToday, runGeneration } from '@/lib/server/jobs';
+import { createDemoLevel, getLevelPayload, getDemoPayload } from '@/lib/serverStore';
+
+export const runtime = 'nodejs';
+const MAX_IMAGE_CHARS = 12_000_000; // ~9 MB base64 — abuse/credit guard
+
+/** POST {imageDataUrl, count, mode} -> {jobId, isMock, label}. Generation runs async (Meta calls take 3-17s each). */
+export async function POST(req: Request) {
+  let body: { imageDataUrl?: string; count?: number; mode?: 'game' | 'qc' };
+  try { body = await req.json(); } catch { return NextResponse.json({ error: 'invalid JSON' }, { status: 400 }); }
+  const count = Math.max(1, Math.min(10, body.count ?? 5));
+  const mode = body.mode === 'qc' ? 'qc' : 'game';
+  const limits = checkLimits({ changes: count, jobsToday: jobsToday() });
+  if (!limits.ok) return NextResponse.json({ error: limits.reason }, { status: 429 });
+
+  const { providers, label } = selectProviders();
+  if (providers.segmentation.isMock) {
+    // Honest offline path: labeled demo scene level, instantly playable. No silent fake "AI generation".
+    const job = createJob(mode, true);
+    const demo = createDemoLevel(Math.floor(Math.random() * 9999));
+    job.status = 'done'; job.stage = 'done'; job.levelId = demo.levelId;
+    return NextResponse.json({ jobId: job.id, isMock: true, label, levelId: demo.levelId });
+  }
+
+  try { assertMetaConfigured(); } catch (e) { return NextResponse.json({ error: e instanceof Error ? e.message : 'meta not configured' }, { status: 400 }); }
+  const imageDataUrl = body.imageDataUrl ?? '';
+  if (!imageDataUrl.startsWith('data:image/') || imageDataUrl.length > MAX_IMAGE_CHARS)
+    return NextResponse.json({ error: 'imageDataUrl required (data:image/..., max ~9MB)' }, { status: 400 });
+
+  const job = createJob(mode, false);
+  void runGeneration(job, imageDataUrl, count, providers); // async by design — poll GET
+  return NextResponse.json({ jobId: job.id, isMock: false, label });
+}
+
+/** GET ?id=job-... -> job status; when done, the playable level payload (images+total, no annotations). */
+export async function GET(req: Request) {
+  const id = new URL(req.url).searchParams.get('id') ?? '';
+  const job = getJob(id);
+  if (!job) return NextResponse.json({ error: 'job not found' }, { status: 404 });
+  const base = { jobId: job.id, status: job.status, stage: job.stage, isMock: job.isMock, error: job.error ?? null };
+  if (job.status === 'done' && job.levelId) {
+    const payload = getLevelPayload(job.levelId) ?? getDemoPayload(job.levelId);
+    if (payload) return NextResponse.json({ ...base, level: payload });
+    return NextResponse.json({ ...base, levelId: job.levelId });
+  }
+  return NextResponse.json(base);
+}
