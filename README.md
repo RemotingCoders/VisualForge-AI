@@ -30,7 +30,7 @@ npm test            # Vitest: pipeline, composite invariant, mask→bbox, click 
 .venv/bin/python -m pytest tests/test_composite.py   # Python env lives in .venv (git-ignored)
 npm run test:e2e    # Playwright: single-player flow on MOCK
 ```
-**Status (2026-10-29): all green** — Vitest 21/21 (incl. the async generation loop with fake providers + sharp composite/measurement invariants), pytest 2/2, Playwright 1/1.
+**Status (2026-10-30):** Vitest 42/42 (incl. the async generation loop with fake providers + sharp composite/measurement invariants); pytest 2/2 and Playwright 1/1 last verified 2026-10-29.
 
 ## Feature status
 | Feature | Status |

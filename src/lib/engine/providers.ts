@@ -1,4 +1,4 @@
-import type { Providers, Region, PlannedChange, Mode, BBox, SegmentationProvider, VisionReasoningProvider, ImageEditProvider } from './types';
+import type { Providers, Region, PlannedChange, Mode, Difficulty, BBox, SegmentationProvider, VisionReasoningProvider, ImageEditProvider } from './types';
 import { META_BASE_URL, META_MODELS, META_ENDPOINTS, metaApiKey, parseSamOutput, parseSseOutputText, type SamObject } from './meta';
 import { logAiCall } from '../server/db';
 
@@ -168,13 +168,18 @@ class MetaProvider implements SegmentationProvider, VisionReasoningProvider, Ima
       images: [imageRef], schemaName: 'Moderation', schema: SPARK_SCHEMAS.moderation,
     });
   }
-  async plan(imageRef: string, regions: Region[], mode: Mode, count: number): Promise<PlannedChange[]> {
+  async plan(imageRef: string, regions: Region[], mode: Mode, count: number, difficulty: Difficulty = 'medium'): Promise<PlannedChange[]> {
+    const difficultyRule = difficulty === 'easy'
+      ? 'Difficulty EASY: prefer the LARGEST suitable objects and the strongest, most clearly visible version of each change.'
+      : difficulty === 'hard'
+        ? 'Difficulty HARD: prefer the SMALLEST suitable objects and the subtlest version of each change that is still real and measurable.'
+        : 'Difficulty MEDIUM: balance object size and change visibility — noticeable when compared side by side, not obvious at a glance.';
     const rules = mode === 'qc'
-      ? 'Change types allowed (QC defects): scratch, crack, dent, missing component, corrosion, misalignment, wrong color, foreign object. Defects must be localized and realistic, not covering the whole part.'
-      : 'Change types allowed (game) — ONLY these three: "change color", "remove object", "replace object". Difficulty: every change must be SUBTLE and hard to spot at a glance. Never use shape deformation, never add large new elements, never partially transform an object. "change color": same object, same shape, clearly different color (can use ANY region). "remove object": the whole object disappears and the background is filled naturally, as if it had never been there — ONLY on regions with wholeObject=true. "replace object": the whole object is swapped for a DIFFERENT but similar object of similar size in the same place — ONLY on regions with wholeObject=true. MIX: about half "change color"; the rest split between remove/replace on wholeObject regions only. Each editPrompt must describe the change applied COMPLETELY and cleanly to the entire object — never a half-changed, split or broken-looking result.';
+      ? `Change types allowed (QC defects): scratch, crack, dent, missing component, corrosion, misalignment, wrong color, foreign object. Defects must be localized and realistic, not covering the whole part. ${difficultyRule}`
+      : `Change types allowed (game) — ONLY these: "change color", "remove object", "replace object", "add object", "flip", "resize", "rotate", "duplicate". ${difficultyRule} Never use shape deformation or partially transform an object. "change color": same object, same shape, clearly different color (can use ANY region). "remove object": the whole object disappears and the background is filled naturally — ONLY on regions with wholeObject=true. "replace object": the whole object is swapped for a DIFFERENT but similar object of similar size in the same place — ONLY on wholeObject=true. "add object": add ONE small, plausible object similar to the scene inside the region (allowed on any region, in visibly empty space). "flip", "resize", "rotate" and "duplicate" (deterministic local transforms of the whole object) — ONLY on wholeObject=true. VARIETY QUOTA across this ordered candidate list: at most 40% may be "change color"; include at least one "remove object" and at least one "replace object" or "add object" (when a suitable wholeObject region exists). Order candidates by priority: best, most reliable changes first. Each editPrompt must describe the change applied COMPLETELY and cleanly to the entire object — never a half-changed, split or broken-looking result.`;
     const common = ' EVERY editPrompt must be exactly ONE sentence and must explicitly name the object/part using its region label (e.g. "Change the red mug to blue."). For "change color" or "wrong color", set targetColor to one simple color name clearly different from the object\'s current color and make the description/editPrompt use that same color; for all other types set targetColor to "".';
     const out = await sparkStructured<{ changes: PlannedChange[] }>({
-      prompt: `Plan exactly ${count} realistic, localized visual changes to this image. ${rules}${common} Use ONLY these regionIds, at most one change per region, regions must not overlap: ${JSON.stringify(regions.map(r => ({ regionId: r.id, bbox: r.bbox, label: r.label ?? '', wholeObject: r.wholeObject ?? true })))}. Each editPrompt must describe a precise, subtle image edit confined to that region, preserving the region's overall appearance except for the one small change.`,
+      prompt: `Plan exactly ${count} realistic, localized visual-change candidates in priority order. ${rules}${common} Use ONLY these regionIds, at most one change per region, regions must not overlap: ${JSON.stringify(regions.map(r => ({ regionId: r.id, bbox: r.bbox, label: r.label ?? '', wholeObject: r.wholeObject ?? true })))}. Each editPrompt must describe a precise image edit confined to that region, with a magnitude consistent with the selected difficulty and preserving everything else in the region.`,
       images: [imageRef], schemaName: 'ChangePlan', schema: SPARK_SCHEMAS.plan,
     });
     return out.changes.slice(0, count);
@@ -211,7 +216,7 @@ export class MockProviders implements SegmentationProvider, VisionReasoningProvi
   async plan(_i: string, regions: Region[], mode: Mode, count: number): Promise<PlannedChange[]> {
     const types = mode === 'qc'
       ? ['scratch', 'crack', 'dent', 'missing component', 'corrosion']
-      : ['remove object', 'change color', 'replace object'];
+      : ['remove object', 'change color', 'flip', 'replace object', 'duplicate'];
     return regions.slice(0, count).map((r, i) => ({ id: `change-${i + 1}`, regionId: r.id, type: types[i % types.length], description: `MOCK change ${i + 1}: ${types[i % types.length]}`, editPrompt: `mock edit ${i + 1}`, targetColor: /colou?r/i.test(types[i % types.length]) ? 'blue' : '' }));
   }
   async verify() { return { ok: true, notes: 'MOCK verification — not real visual verification' }; }

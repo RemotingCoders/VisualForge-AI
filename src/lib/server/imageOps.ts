@@ -337,6 +337,78 @@ export async function recolorCrop(cropDataUrl: string, hueShiftDeg: number, targ
   return bufferToDataUrl(await sharp(out, { raw: { width: info.width, height: info.height, channels: 3 } }).png().toBuffer());
 }
 
+/** Circular mean hue (OKLCH degrees, 0-360) of a crop's saturated pixels; null when it has none. */
+export async function cropDominantHue(cropDataUrl: string): Promise<number | null> {
+  const { data } = await rawOf(cropDataUrl);
+  let sx = 0, sy = 0;
+  for (let i = 0; i < data.length; i += 3) {
+    const [, C, H] = rgbToOklch(data[i] / 255, data[i + 1] / 255, data[i + 2] / 255);
+    if (C <= 0.03) continue;
+    const rad = H * Math.PI / 180;
+    sx += C * Math.cos(rad); sy += C * Math.sin(rad);
+  }
+  if (Math.hypot(sx, sy) < 1e-9) return null;
+  const deg = Math.atan2(sy, sx) * 180 / Math.PI;
+  return deg < 0 ? deg + 360 : deg;
+}
+
+export type LocalTransformKind = 'flip' | 'resize' | 'rotate' | 'duplicate';
+
+/**
+ * Deterministic whole-object transform INSIDE the paste canvas (same masked composition as
+ * Muse edits afterwards): flip mirrors the object's bbox, resize scales it ±15-20% (mirrored
+ * fill when shrinking, center-crop when growing), rotate turns it 10-15° with transparent
+ * corners so the original background shows through.
+ */
+export async function transformObjectInPaste(pasteDataUrl: string, rel: BBox, kind: Exclude<LocalTransformKind, 'duplicate'>, opts: { resizeFactor?: number; rotateDeg?: number } = {}): Promise<string> {
+  const pasteBuf = dataUrlToBuffer(pasteDataUrl);
+  const objBuf = await sharp(pasteBuf).extract({ left: rel.x, top: rel.y, width: rel.width, height: rel.height }).png().toBuffer();
+  let transformed: Buffer;
+  if (kind === 'flip') {
+    transformed = await sharp(objBuf).flop().png().toBuffer();
+  } else if (kind === 'resize') {
+    const f = opts.resizeFactor ?? 1.18;
+    const nw = Math.max(2, Math.round(rel.width * f)), nh = Math.max(2, Math.round(rel.height * f));
+    if (f >= 1) {
+      transformed = await sharp(objBuf).resize(nw, nh).extract({ left: Math.floor((nw - rel.width) / 2), top: Math.floor((nh - rel.height) / 2), width: rel.width, height: rel.height }).png().toBuffer();
+    } else {
+      const dw = rel.width - nw, dh = rel.height - nh;
+      transformed = await sharp(objBuf).resize(nw, nh).extend({ left: Math.floor(dw / 2), right: dw - Math.floor(dw / 2), top: Math.floor(dh / 2), bottom: dh - Math.floor(dh / 2), extendWith: 'mirror' }).png().toBuffer();
+    }
+  } else {
+    transformed = await sharp(objBuf).ensureAlpha().rotate(opts.rotateDeg ?? 12, { background: { r: 0, g: 0, b: 0, alpha: 0 } }).resize(rel.width, rel.height, { fit: 'fill' }).png().toBuffer();
+  }
+  const out = await sharp(pasteBuf).composite([{ input: transformed, left: rel.x, top: rel.y }]).png().toBuffer();
+  return bufferToDataUrl(out);
+}
+
+/** Copy the object to the smoothest neighbouring spot inside the paste canvas (lowest local
+ *  variance wins). Returns the paste unchanged when no non-overlapping spot fits. */
+export async function duplicateObjectInPaste(pasteDataUrl: string, rel: BBox): Promise<string> {
+  const pasteBuf = dataUrlToBuffer(pasteDataUrl);
+  const { data, width: pw, height: ph } = await rawOf(pasteDataUrl);
+  const step = Math.max(3, Math.floor(Math.min(rel.width, rel.height) / 3));
+  const smoothness = (x0: number, y0: number): number => {
+    let sum = 0, n = 0;
+    for (let y = y0; y < y0 + rel.height; y += 3) for (let x = x0; x < x0 + rel.width; x += 3) { const o = (y * pw + x) * 3; sum += (data[o] + data[o + 1] + data[o + 2]) / 3; n++; }
+    const mean = n ? sum / n : 0;
+    let dev = 0;
+    for (let y = y0; y < y0 + rel.height; y += 3) for (let x = x0; x < x0 + rel.width; x += 3) { const o = (y * pw + x) * 3; dev += Math.abs((data[o] + data[o + 1] + data[o + 2]) / 3 - mean); }
+    return n ? dev / n : Infinity;
+  };
+  let best: { x: number; y: number; score: number } | null = null;
+  for (let y = 0; y + rel.height <= ph; y += step) for (let x = 0; x + rel.width <= pw; x += step) {
+    const overlapsObject = x < rel.x + rel.width + 3 && x + rel.width > rel.x - 3 && y < rel.y + rel.height + 3 && y + rel.height > rel.y - 3;
+    if (overlapsObject) continue;
+    const score = smoothness(x, y);
+    if (!best || score < best.score) best = { x, y, score };
+  }
+  if (!best) return pasteDataUrl;
+  const objBuf = await sharp(pasteBuf).extract({ left: rel.x, top: rel.y, width: rel.width, height: rel.height }).png().toBuffer();
+  const out = await sharp(pasteBuf).composite([{ input: objBuf, left: best.x, top: best.y }]).png().toBuffer();
+  return bufferToDataUrl(out);
+}
+
 /** Boolean per-pixel diff mask (row-major w*h) between two same-size images. */
 export async function diffMask(aDataUrl: string, bDataUrl: string, width: number, height: number, threshold = 12): Promise<boolean[]> {
   const raw = async (d: string) => sharp(dataUrlToBuffer(d)).resize(width, height, { fit: 'fill' }).removeAlpha().raw().toBuffer();

@@ -1,20 +1,20 @@
 import { randomUUID } from 'node:crypto';
 import { enforceSpacing, maskToBBox, maskCentroid, normalizeBBox } from '../engine/geometry';
-import type { Providers, Mode, Difference, Region } from '../engine/types';
-import { normalizeImage, cropDataUrl, expandBox, diffMask, providerImage, clampBox, recolorCrop, squareContextBox, compositeMaskedEdit, estimateAlignment, alignEditedCrop, ALIGNMENT_MAX_RESIDUAL, cropColorStats, colorDeltaE, targetHueFromColor } from './imageOps';
+import type { Providers, Mode, Difficulty, Difference, Region } from '../engine/types';
+import { normalizeImage, cropDataUrl, expandBox, diffMask, providerImage, clampBox, recolorCrop, squareContextBox, compositeMaskedEdit, estimateAlignment, alignEditedCrop, ALIGNMENT_MAX_RESIDUAL, cropColorStats, colorDeltaE, targetHueFromColor, cropDominantHue, transformObjectInPaste, duplicateObjectInPaste, type LocalTransformKind } from './imageOps';
 import { saveImageLevel } from '../serverStore';
 import { persistJob, loadJob } from './db';
 
 export type JobStatus = 'queued' | 'running' | 'done' | 'failed';
-/** Differences must stay SMALL, localized and subtle: candidate regions are shrunk to at most
- *  this fraction of the image side, and a measured diff larger than MEASURED_CAP is discarded.
- *  MEASURED_CAP must exceed region cap x crop expansion (0.10 x 1.5 = 0.15) or every
- *  max-size change is discarded by construction. */
-export const MAX_REGION_FRACTION = 0.1;
-export const MAX_MEASURED_FRACTION = 0.17;
+/** Size criteria are AREA-based, not side-based: a SAM box is a WHOLE object if it occupies
+ *  up to 8% of the image area; above that it is center-cropped (aspect preserved) to the area
+ *  cap and marked fragment. Measured diffs get a larger area cap (region cap x paste
+ *  expansion² ≈ 8% x 1.69 ≈ 13.5%, rounded up) or max-size changes die by construction. */
+export const MAX_REGION_AREA_FRACTION = 0.08;
+export const MAX_MEASURED_AREA_FRACTION = 0.15;
 export interface Job {
   id: string; status: JobStatus; stage: string; mode: Mode; isMock: boolean;
-  error?: string; levelId?: string; requestedChanges?: number; createdAt: number; updatedAt: number;
+  error?: string; levelId?: string; requestedChanges?: number; difficulty?: Difficulty; createdAt: number; updatedAt: number;
 }
 const g = globalThis as unknown as { __vfJobs?: Map<string, Job> };
 if (!g.__vfJobs) g.__vfJobs = new Map();
@@ -28,8 +28,8 @@ export async function resolveJob(id: string): Promise<Job | null> {
   return job;
 }
 export const jobsToday = () => { const day = new Date().toDateString(); return [...g.__vfJobs!.values()].filter(j => new Date(j.createdAt).toDateString() === day).length; };
-export function createJob(mode: Mode, isMock: boolean, requestedChanges?: number): Job {
-  const job: Job = { id: randomUUID(), status: 'queued', stage: 'queued', mode, isMock, requestedChanges, createdAt: Date.now(), updatedAt: Date.now() };
+export function createJob(mode: Mode, isMock: boolean, requestedChanges?: number, difficulty: Difficulty = 'medium'): Job {
+  const job: Job = { id: randomUUID(), status: 'queued', stage: 'queued', mode, isMock, requestedChanges, difficulty, createdAt: Date.now(), updatedAt: Date.now() };
   g.__vfJobs!.set(job.id, job);
   void persistJob(job);
   return job;
@@ -57,16 +57,15 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
 
     setStage('segmenting');
     const rawRegions = await providers.segmentation.segment(aiImg, width, height);
-    // Size cap: shrink oversized regions (centered) instead of discarding them — a whole-scene
-    // SAM box would otherwise let Muse repaint most of the photo (spike call 4/6 failure mode),
-    // while plain discarding can leave too few candidates on photos with only large objects.
-    const capW = Math.max(8, Math.floor(width * MAX_REGION_FRACTION));
-    const capH = Math.max(8, Math.floor(height * MAX_REGION_FRACTION));
+    // wholeObject is decided by SAM's box AREA: <= 8% of the image = whole object. Only
+    // above that do we center-crop (aspect preserved, scaled to the area cap) and mark it
+    // fragment (wholeObject=false: color/add only in game mode — removing, replacing or
+    // geometrically transforming a fragment is what made objects look "broken/split").
+    const areaCap = width * height * MAX_REGION_AREA_FRACTION;
     const capRegion = (r: Region): Region => {
-      // wholeObject=false marks a center-cut FRAGMENT of a larger object: usable for color
-      // changes only. Removing/replacing a fragment is what makes objects look "broken/split".
-      if (r.bbox.width <= capW && r.bbox.height <= capH) return { ...r, wholeObject: true };
-      const w = Math.min(r.bbox.width, capW), h = Math.min(r.bbox.height, capH);
+      if (r.bbox.width * r.bbox.height <= areaCap) return { ...r, wholeObject: true };
+      const s = Math.sqrt(areaCap / (r.bbox.width * r.bbox.height));
+      const w = Math.max(8, Math.floor(r.bbox.width * s)), h = Math.max(8, Math.floor(r.bbox.height * s));
       const cx = r.bbox.x + r.bbox.width / 2, cy = r.bbox.y + r.bbox.height / 2;
       return { ...r, bbox: clampBox({ x: cx - w / 2, y: cy - h / 2, width: w, height: h }, width, height), wholeObject: false };
     };
@@ -79,23 +78,39 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
     if (!regions.length) throw new Error('segmentation found no usable regions');
 
     setStage('planning');
-    const planned = (await providers.vision.plan(aiImg, regions, job.mode, count)).slice(0, count);
+    // Ask for MORE candidates than needed (count + 3, priority-ordered, with the variety
+    // quota in the planner prompt): the executor walks the list and stops at `count`
+    // achieved — discarded candidates no longer sink the whole level.
+    const difficulty = job.difficulty ?? 'medium';
+    const planned = await providers.vision.plan(aiImg, regions, job.mode, count + 3, difficulty);
     if (!planned.length) throw new Error('planner returned no changes');
-    // Hard rule (GAME mode only): remove/replace on a FRAGMENT makes objects look broken,
-    // so downgrade those to a color change. In QC mode this must NOT apply — scratch/crack/
-    // dent defects are intentionally localized ON a fragment of a part.
+    // Hard rule (GAME mode only): remove/replace/geometric transforms on a FRAGMENT make
+    // objects look broken, so downgrade those to a color change. "add object" stays: it puts
+    // a NEW element in empty space, it does not tear an existing one. In QC mode none of this
+    // applies — scratch/crack/dent defects intentionally live ON a fragment of a part.
+    const WHOLE_OBJECT_ONLY = /remove|replace|flip|resize|rotate|duplicate/i;
     const plan = planned.map(ch => {
       const r = regions.find(x => x.id === ch.regionId);
-      return job.mode === 'game' && r && r.wholeObject === false && !/colou?r/i.test(ch.type) ? { ...ch, type: 'change color' } : ch;
+      return job.mode === 'game' && r && r.wholeObject === false && WHOLE_OBJECT_ONLY.test(ch.type) ? { ...ch, type: 'change color' } : ch;
     });
+    // One line per planned change (post-downgrade) so console logs explain the level's mix.
+    for (const ch of plan) {
+      const r = regions.find(x => x.id === ch.regionId);
+      console.info(`[generate ${job.id}] planned ${ch.id}: type=${ch.type} region=${ch.regionId} label="${r?.label ?? ''}" wholeObject=${r?.wholeObject ?? '?'} targetColor=${ch.targetColor ?? ''}`);
+    }
 
     // --- Per-change edit -> measure -> verify (E: no identical verifier retry — a failed
     // verification re-edits ONCE with Muse, then discards. Deterministic color changes are
     // verified locally with ΔE + mask, never via Spark.)
     type Candidate = { next: string; mask: boolean[]; bbox: NonNullable<ReturnType<typeof maskToBBox>>; local: boolean; notes: string };
-    const measuredOk = (bbox: Candidate['bbox']) => bbox.width <= width * MAX_MEASURED_FRACTION && bbox.height <= height * MAX_MEASURED_FRACTION;
+    const measuredOk = (bbox: Candidate['bbox']) => bbox.width * bbox.height <= width * height * MAX_MEASURED_AREA_FRACTION;
 
-    const applyMuse = async (base: string, ch: (typeof plan)[number], region: Region, prompt: string): Promise<Candidate | null> => {
+    // Max 2 Muse calls per change (initial edit + one verifier-driven re-edit); when the
+    // budget is exhausted the executor moves on to the next candidate.
+    type MuseBudget = { calls: number };
+    const applyMuse = async (base: string, ch: (typeof plan)[number], region: Region, prompt: string, budget: MuseBudget): Promise<Candidate | null> => {
+      if (budget.calls >= 2) { console.info(`[generate ${job.id}] change ${ch.id} discarded: Muse call budget exhausted (max 2 per change)`); return null; }
+      budget.calls++;
       // A: square CONTEXT box to Muse; separate smaller PASTE box (object + small margin).
       const contextBox = squareContextBox(region.bbox, width, height);
       const pasteBox = expandBox(region.bbox, 0.15, width, height);
@@ -117,49 +132,100 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
       const mask = await diffMask(base, next, width, height);
       const bbox = maskToBBox(mask, width, height);
       if (!bbox) { console.info(`[generate ${job.id}] change ${ch.id} discarded: no measurable diff after masked composite`); return null; }
-      if (!measuredOk(bbox)) { console.info(`[generate ${job.id}] change ${ch.id} discarded: measured diff ${bbox.width}x${bbox.height} exceeds size cap`); return null; }
+      if (!measuredOk(bbox)) { console.info(`[generate ${job.id}] change ${ch.id} discarded: measured diff ${bbox.width}x${bbox.height} (area ${bbox.width * bbox.height}px) exceeds area cap ${Math.floor(width * height * MAX_MEASURED_AREA_FRACTION)}px`); return null; }
       return { next, mask, bbox, local: false, notes: '' };
     };
 
     const applyLocalRecolor = async (base: string, ch: (typeof plan)[number], region: Region): Promise<Candidate | null> => {
       // D: recolor ONLY the object's own bbox pixels (never the expanded context), in OKLCH.
-      const { cropDataUrl: objCrop } = await cropDataUrl(base, region.bbox);
+      const { cropDataUrl: objCrop, cropBox } = await cropDataUrl(base, region.bbox);
       const stats = await cropColorStats(objCrop);
       const targetHue = targetHueFromColor(ch.targetColor);
-      if (ch.targetColor && targetHue === null) return null; // achromatic/unknown target (white/gray/black) -> Muse
-      if (stats.meanChroma < 0.04 || stats.saturatedFraction < 0.15) return null; // low-chroma object: no hue rotation -> Muse
+      if (ch.targetColor && targetHue === null) { console.info(`[generate ${job.id}] change ${ch.id}: local recolor skipped — target color "${ch.targetColor}" has no hue (achromatic/unknown), Muse fallback`); return null; }
+      if (stats.saturatedFraction < 0.05) { console.info(`[generate ${job.id}] change ${ch.id}: local recolor skipped — low-chroma object (saturated fraction ${stats.saturatedFraction.toFixed(2)}), Muse fallback`); return null; }
+      // Minimum OKLab ΔE of 0.12 against the original: try the planned hue first; if it
+      // cannot reach the bar, fall back to the FARTHEST hue from the object's dominant hue.
+      const dominantHue = await cropDominantHue(objCrop);
       const shifts = [105, 145, -105, -145, 180];
       const shift = shifts[[...ch.id].reduce((a, c) => a + c.charCodeAt(0), 0) % shifts.length];
-      const recolored = await recolorCrop(objCrop, shift, targetHue ?? undefined);
-      const next = await compositeMaskedEdit(base, recolored, region.bbox, region.bbox);
+      const hueCandidates: (number | undefined)[] = [targetHue ?? undefined];
+      if (dominantHue !== null) for (const h of [(dominantHue + 180) % 360, (dominantHue + 120) % 360]) if (!hueCandidates.some(x => x !== undefined && Math.abs(x - h) < 5)) hueCandidates.push(h);
+      let best: { recolored: string; meanDeltaE: number; changedPixels: number; hue: number | undefined } | null = null;
+      for (const hue of hueCandidates) {
+        const recolored = await recolorCrop(objCrop, shift, hue);
+        const delta = await colorDeltaE(objCrop, recolored, cropBox.width, cropBox.height);
+        if (delta.changedPixels >= 30 && (!best || delta.meanDeltaE > best.meanDeltaE)) best = { recolored, meanDeltaE: delta.meanDeltaE, changedPixels: delta.changedPixels, hue };
+      }
+      if (!best || best.meanDeltaE < 0.12) { console.info(`[generate ${job.id}] change ${ch.id}: local recolor skipped — best ΔE ${best ? best.meanDeltaE.toFixed(3) : 'n/a'} below 0.12 minimum, Muse fallback`); return null; }
+      const next = await compositeMaskedEdit(base, best.recolored, region.bbox, region.bbox);
       const mask = await diffMask(base, next, width, height);
       const bbox = maskToBBox(mask, width, height);
-      if (!bbox || !measuredOk(bbox)) return null;
+      if (!bbox) { console.info(`[generate ${job.id}] change ${ch.id} discarded: recolor produced no measurable diff`); return null; }
+      if (!measuredOk(bbox)) { console.info(`[generate ${job.id}] change ${ch.id} discarded: recolor diff ${bbox.width}x${bbox.height} (area ${bbox.width * bbox.height}px) exceeds area cap ${Math.floor(width * height * MAX_MEASURED_AREA_FRACTION)}px`); return null; }
       // E: local verification (ΔE + changed mask) — no Spark call for deterministic colors.
-      const delta = await colorDeltaE(base, next, width, height);
-      if (delta.changedPixels < 30 || delta.meanDeltaE < 0.05) return null;
-      return { next, mask, bbox, local: true, notes: `local OKLCH verify: ΔE ${delta.meanDeltaE.toFixed(3)} over ${delta.changedPixels}px (no Spark call)` };
+      return { next, mask, bbox, local: true, notes: `local OKLCH verify: ΔE ${best.meanDeltaE.toFixed(3)} over ${best.changedPixels}px, hue ${best.hue !== undefined ? Math.round(best.hue) + '°' : `shift ${shift}°`} (no Spark call)` };
+    };
+
+    const LOCAL_KIND = (type: string): LocalTransformKind | null =>
+      /duplicate/i.test(type) ? 'duplicate' : /flip|mirror/i.test(type) ? 'flip' : /resize|scale/i.test(type) ? 'resize' : /rotate/i.test(type) ? 'rotate' : null;
+
+    const applyLocalTransform = async (base: string, ch: (typeof plan)[number], region: Region, kind: LocalTransformKind): Promise<Candidate | null> => {
+      // Deterministic geometric change of the WHOLE object, composed with the same masked
+      // composition as Muse edits. Magnitude scales with difficulty (resize ±15-20%,
+      // rotate 10-15°). No Muse fallback: if it cannot be measured, next candidate.
+      const pasteBox = expandBox(region.bbox, kind === 'duplicate' ? 1.0 : 0.15, width, height);
+      const { cropDataUrl: pasteCrop, cropBox } = await cropDataUrl(base, pasteBox);
+      const rel = { x: region.bbox.x - cropBox.x, y: region.bbox.y - cropBox.y, width: region.bbox.width, height: region.bbox.height };
+      const hash = [...ch.id].reduce((a, c) => a + c.charCodeAt(0), 0);
+      const sign = hash % 2 === 0 ? 1 : -1;
+      let editedPaste: string; let detail: string = kind;
+      if (kind === 'duplicate') editedPaste = await duplicateObjectInPaste(pasteCrop, rel);
+      else if (kind === 'flip') editedPaste = await transformObjectInPaste(pasteCrop, rel, 'flip');
+      else if (kind === 'resize') {
+        const mag = difficulty === 'easy' ? 0.20 : difficulty === 'hard' ? 0.15 : 0.17;
+        const factor = 1 + sign * mag; detail = `resize x${factor.toFixed(2)}`;
+        editedPaste = await transformObjectInPaste(pasteCrop, rel, 'resize', { resizeFactor: factor });
+      } else {
+        const deg = sign * (difficulty === 'easy' ? 15 : difficulty === 'hard' ? 10 : 12); detail = `rotate ${deg}°`;
+        editedPaste = await transformObjectInPaste(pasteCrop, rel, 'rotate', { rotateDeg: deg });
+      }
+      const next = await compositeMaskedEdit(base, editedPaste, pasteBox, pasteBox);
+      const mask = await diffMask(base, next, width, height);
+      const bbox = maskToBBox(mask, width, height);
+      if (!bbox) { console.info(`[generate ${job.id}] change ${ch.id} discarded: local ${detail} produced no measurable diff`); return null; }
+      if (!measuredOk(bbox)) { console.info(`[generate ${job.id}] change ${ch.id} discarded: local ${detail} diff ${bbox.width}x${bbox.height} (area ${bbox.width * bbox.height}px) exceeds area cap ${Math.floor(width * height * MAX_MEASURED_AREA_FRACTION)}px`); return null; }
+      const changedPixels = mask.reduce((a, v) => a + (v ? 1 : 0), 0);
+      if (changedPixels < 30) { console.info(`[generate ${job.id}] change ${ch.id} discarded: local ${detail} changed only ${changedPixels}px (< 30)`); return null; }
+      return { next, mask, bbox, local: true, notes: `local deterministic ${detail}: ${changedPixels}px changed (no Spark call)` };
     };
 
     const differences: Difference[] = [];
     let idx = 0;
     for (const ch of plan) {
+      if (differences.length >= count) break; // candidates are a priority list: stop at count
       idx++;
       const region = regions.find(r => r.id === ch.regionId);
-      if (!region) continue;
-      setStage(`editing ${idx}/${plan.length}`);
+      if (!region) { console.info(`[generate ${job.id}] change ${ch.id} discarded: unknown regionId ${ch.regionId}`); continue; }
+      setStage(`editing ${idx}/${plan.length} · ${differences.length}/${count} done`);
+      const budget: MuseBudget = { calls: 0 };
       const isColor = /colou?r/i.test(ch.type);
-      let candidate = isColor ? await applyLocalRecolor(current, ch, region) : null;
-      if (!candidate) candidate = await applyMuse(current, ch, region, ch.editPrompt);
-      if (!candidate) { console.info(`[generate ${job.id}] change ${ch.id} discarded: no aligned, measurable edit`); continue; }
+      const localKind = job.mode === 'game' ? LOCAL_KIND(ch.type) : null;
+      let candidate: Candidate | null = null;
+      if (isColor) candidate = await applyLocalRecolor(current, ch, region);
+      else if (localKind) candidate = await applyLocalTransform(current, ch, region, localKind);
+      // Muse is reserved for remove / replace / add / QC defects, plus color changes the
+      // deterministic recolor could not do. Local geometric transforms get no Muse fallback.
+      if (!candidate && !localKind) candidate = await applyMuse(current, ch, region, ch.editPrompt, budget);
+      if (!candidate) { console.info(`[generate ${job.id}] change ${ch.id} discarded: no aligned, measurable edit (next candidate)`); continue; }
 
       let notes = candidate.notes;
       if (!candidate.local) {
-        setStage(`verifying ${idx}/${plan.length}`);
+        setStage(`verifying ${idx}/${plan.length} · ${differences.length}/${count} done`);
         let verdict = await providers.vision.verify(aiImg, await providerImage(candidate.next), ch, candidate.bbox);
         if (!verdict.ok) {
-          // E: re-edit ONCE (never re-ask the verifier the same question), then discard.
-          const retry = await applyMuse(current, ch, region, `${ch.editPrompt} The previous attempt failed verification (${verdict.notes}); apply the change more clearly and realistically, confined to the same object.`);
+          // E: re-edit ONCE within the same Muse budget (never re-ask the verifier the
+          // same question), then discard and move to the next candidate.
+          const retry = await applyMuse(current, ch, region, `${ch.editPrompt} The previous attempt failed verification (${verdict.notes}); apply the change more clearly and realistically, confined to the same object.`, budget);
           if (retry) {
             verdict = await providers.vision.verify(aiImg, await providerImage(retry.next), ch, retry.bbox);
             if (verdict.ok) candidate = retry;
@@ -176,6 +242,7 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
       });
       current = candidate.next;
     }
+    if (differences.length < count) console.info(`[generate ${job.id}] candidates exhausted: achieved ${differences.length}/${count} requested changes`);
     if (!differences.length) throw new Error('no change survived measurement/verification');
 
     job.levelId = saveImageLevel({ differences, original: img.dataUrl, modified: current, width, height, isMock: providers.segmentation.isMock, mode: job.mode, jobId: job.id });

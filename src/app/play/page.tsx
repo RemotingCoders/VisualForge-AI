@@ -14,7 +14,7 @@ export default function Play() {
   const [img, setImg] = useState<ImgLevel | null>(null);
   const [total, setTotal] = useState(0); const [found, setFound] = useState<Found[]>([]); const [mistakes, setMistakes] = useState(0);
   const [hints, setHints] = useState(0); const [msg, setMsg] = useState('Loading MOCK level…'); const [start] = useState(Date.now());
-  const [photo, setPhoto] = useState(''); const [count, setCount] = useState(5); const [job, setJob] = useState('');
+  const [photo, setPhoto] = useState(''); const [count, setCount] = useState(5); const [difficulty, setDifficulty] = useState('medium'); const [job, setJob] = useState('');
   const svgRef = useRef<SVGSVGElement>(null); const imgRef = useRef<HTMLImageElement>(null);
 
   const resetGame = (t: number) => { setTotal(t); setFound([]); setMistakes(0); setHints(0); };
@@ -26,7 +26,7 @@ export default function Play() {
   /** Upload -> POST /api/generate (async job) -> poll stage -> playable level. Mock mode returns the labeled demo level. */
   const generate = async () => {
     setJob('creating job…'); setMsg('Generating level — the AI pipeline takes a few seconds per change.');
-    const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ imageDataUrl: photo || undefined, count, mode: 'game' }) });
+    const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ imageDataUrl: photo || undefined, count, mode: 'game', difficulty }) });
     const data = await res.json();
     if (!res.ok) { setJob(''); setMsg(`❌ ${data.error ?? 'generation failed'}`); return; }
     for (let i = 0; i < 600; i++) {
@@ -101,6 +101,7 @@ export default function Play() {
       <div className="flex flex-wrap items-center gap-3 mt-3 text-sm">
         <input type="file" accept="image/*" aria-label="Upload a photo" onChange={e => onFile(e.target.files?.[0])} className="bg-white/10 px-3 py-2 rounded-lg" />
         <label>Differences <select aria-label="Number of differences" value={count} onChange={e => setCount(Number(e.target.value))} className="bg-white/10 px-2 py-2 rounded-lg text-white"><option value={3}>3</option><option value={5}>5</option><option value={7}>7</option></select></label>
+        <label>Difficulty <select aria-label="Difficulty" value={difficulty} onChange={e => setDifficulty(e.target.value)} className="bg-white/10 px-2 py-2 rounded-lg text-white"><option value="easy">Easy</option><option value="medium">Medium</option><option value="hard">Hard</option></select></label>
         <button className="bg-indigo-500 px-4 py-2 rounded-lg font-bold disabled:opacity-50" disabled={!!job} onClick={generate}>{job ? '⏳ Generating…' : '✨ Generate level'}</button>
         {job && <span className="opacity-80">{job}</span>}
       </div>

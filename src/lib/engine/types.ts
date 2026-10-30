@@ -1,4 +1,5 @@
 export type Mode = 'game' | 'qc';
+export type Difficulty = 'easy' | 'medium' | 'hard';
 export type BBox = { x: number; y: number; width: number; height: number };
 
 export interface Region { id: string; bbox: BBox; maskRef?: string; label?: string; wholeObject?: boolean }
@@ -27,7 +28,7 @@ export interface SegmentationProvider {
 export interface VisionReasoningProvider {
   readonly name: string; readonly isMock: boolean;
   moderate(imageRef: string): Promise<{ ok: boolean; reason: string }>;
-  plan(imageRef: string, regions: Region[], mode: Mode, count: number): Promise<PlannedChange[]>;
+  plan(imageRef: string, regions: Region[], mode: Mode, count: number, difficulty?: Difficulty): Promise<PlannedChange[]>;
   verify(imageRef: string, modifiedRef: string, change: PlannedChange, measured: BBox): Promise<{ ok: boolean; notes: string }>;
 }
 export interface ImageEditProvider {
