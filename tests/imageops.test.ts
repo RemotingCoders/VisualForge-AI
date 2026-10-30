@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import sharp from 'sharp';
-import { compositeCrop, diffMask, bufferToDataUrl, recolorCrop, squareContextBox, compositeMaskedEdit, alignmentCheck, cropColorStats, targetHueFromColor } from '../src/lib/server/imageOps';
+import { compositeCrop, diffMask, bufferToDataUrl, recolorCrop, squareContextBox, compositeMaskedEdit, estimateAlignment, alignEditedCrop, cropColorStats, targetHueFromColor } from '../src/lib/server/imageOps';
 import { maskToBBox, maskCentroid } from '../src/lib/engine/geometry';
 import { createJob, getJob, runGeneration } from '../src/lib/server/jobs';
 import { getDifferences, getLevelPayload } from '../src/lib/serverStore';
@@ -109,20 +109,31 @@ describe('A/B/C/D: square context, masked composite, alignment guard, OKLCH reco
     expect(px(40, 30)[2]).toBeGreaterThan(150); // centre of paste: edited blue lands
   });
 
-  it('C: alignment guard accepts identical crops and rejects a 5px shift', async () => {
+  it('C: alignment is estimated and compensated, not rejected — only residual error gates', async () => {
     const pattern = async (shiftX: number) => {
-      const w = 48, h = 48, buf = Buffer.alloc(w * h * 3);
+      const w = 96, h = 96, buf = Buffer.alloc(w * h * 3);
       for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
         const sx = Math.max(0, Math.min(w - 1, x - shiftX)), o = (y * w + x) * 3;
-        buf[o] = sx * 5; buf[o + 1] = y * 5; buf[o + 2] = (sx * 3 + y * 7) % 256;
+        buf[o] = sx * 2; buf[o + 1] = y * 2; buf[o + 2] = (sx * 3 + y * 7) % 256;
       }
       return bufferToDataUrl(await sharp(buf, { raw: { width: w, height: h, channels: 3 } }).png().toBuffer());
     };
     const orig = await pattern(0);
-    const same = await alignmentCheck(orig, orig);
-    expect(same.aligned).toBe(true); expect(same.shiftX).toBe(0);
-    const shifted = await alignmentCheck(orig, await pattern(5));
-    expect(shifted.aligned).toBe(false); expect(Math.abs(shifted.shiftX)).toBeGreaterThan(2);
+    const same = await estimateAlignment(orig, orig);
+    expect(same.shiftX).toBe(0); expect(same.scale).toBe(1); expect(same.aligned).toBe(true);
+    // A pure 6px shift (Muse's systematic behaviour) is MEASURED with low residual error…
+    const shifted = await pattern(6);
+    const est = await estimateAlignment(orig, shifted);
+    expect(est.shiftX).toBe(6); expect(est.scale).toBe(1); expect(est.error).toBeLessThan(5); expect(est.aligned).toBe(true);
+    // …and warping the edit back by the inverse transform re-aligns it onto the original grid.
+    const warped = await alignEditedCrop(orig, shifted, est);
+    const re = await estimateAlignment(orig, warped);
+    expect(Math.abs(re.shiftX)).toBeLessThanOrEqual(1);
+    const mask = await diffMask(orig, warped, 96, 96);
+    expect(mask.filter(Boolean).length).toBeLessThan(96 * 96 * 0.05);
+    // A total repaint has high residual error under every transform -> the only rejection.
+    const repaint = await estimateAlignment(orig, await solidPng(96, 96, [30, 200, 90]));
+    expect(repaint.aligned).toBe(false); expect(repaint.error).toBeGreaterThan(25);
   });
 
   it('D: target color names map to hues; achromatic targets route away from local recolor', () => {

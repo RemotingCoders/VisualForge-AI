@@ -171,14 +171,21 @@ export async function compositeMaskedEdit(originalDataUrl: string, editedDataUrl
 }
 
 /**
- * C — Alignment guard (measurable, before pasting): search the shift (±8px, SAD over the outer
- * ring of the context crop) that best aligns the edited crop onto the original. Reject when the
- * best shift is > 2px or the best ring error stays high (Muse reframed/repainted the scene).
+ * C — Alignment ESTIMATION (not a gate): Muse tends to return the scene slightly SHIFTED
+ * (and occasionally rescaled) rather than repainted. Estimate the transform over the outer
+ * ring of the context crop (paste area excluded): coarse pass ±24px every 4px, fine pass
+ * ±3px around the best, scale search 0.96–1.04 in 5 steps. The caller warps the edit back
+ * with `alignEditedCrop` and rejects only if the RESIDUAL error after aligning stays high.
  */
-export async function alignmentCheck(originalDataUrl: string, editedDataUrl: string, exclude?: BBox): Promise<{ shiftX: number; shiftY: number; error: number; aligned: boolean }> {
+export interface AlignmentEstimate { shiftX: number; shiftY: number; scale: number; error: number; aligned: boolean }
+export const ALIGNMENT_MAX_RESIDUAL = 25;
+const ALIGNMENT_SCALES = [0.96, 0.98, 1, 1.02, 1.04];
+
+export async function estimateAlignment(originalDataUrl: string, editedDataUrl: string, exclude?: BBox): Promise<AlignmentEstimate> {
   const a = await rawOf(originalDataUrl);
   const b = await rawOf(editedDataUrl, a.width, a.height);
   const w = a.width, h = a.height, t = Math.max(3, Math.round(Math.min(w, h) * 0.12));
+  const cx = w / 2, cy = h / 2;
   const ring: number[] = [];
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
     if (!(x < t || y < t || x >= w - t || y >= h - t)) continue;
@@ -186,25 +193,58 @@ export async function alignmentCheck(originalDataUrl: string, editedDataUrl: str
     if (exclude && x >= exclude.x - 6 && y >= exclude.y - 6 && x < exclude.x + exclude.width + 6 && y < exclude.y + exclude.height + 6) continue;
     ring.push(y * w + x);
   }
-  const step = Math.max(1, Math.floor(Math.sqrt(ring.length / 8000)));
-  let best = { shiftX: 0, shiftY: 0, error: Infinity };
-  // Prefer the SMALLEST shift among near-ties: on flat backgrounds every shift scores ~0,
-  // and "no shift" is the right explanation — otherwise featureless crops always "fail".
-  const shifts: [number, number][] = [];
-  for (let dy = -8; dy <= 8; dy++) for (let dx = -8; dx <= 8; dx++) shifts.push([dx, dy]);
-  shifts.sort((p, q) => Math.max(Math.abs(p[0]), Math.abs(p[1])) - Math.max(Math.abs(q[0]), Math.abs(q[1])));
-  for (const [dx, dy] of shifts) {
+  const step = Math.max(1, Math.floor(Math.sqrt(ring.length / 3000)));
+  const samples: number[] = [];
+  for (let k = 0; k < ring.length; k += step) samples.push(ring[k]);
+  const errAt = (scale: number, dx: number, dy: number): number => {
     let sum = 0, n = 0;
-    for (let k = 0; k < ring.length; k += step) {
-      const p = ring[k], x = p % w, y = (p / w) | 0, ex = x + dx, ey = y + dy;
-      if (ex < 0 || ey < 0 || ex >= w || ey >= h) continue;
-      const oa = p * 3, ob = (ey * w + ex) * 3;
+    for (const p of samples) {
+      const x = p % w, y = (p / w) | 0;
+      const qx = Math.round(cx + (x - cx) * scale + dx), qy = Math.round(cy + (y - cy) * scale + dy);
+      if (qx < 0 || qy < 0 || qx >= w || qy >= h) continue;
+      const oa = p * 3, ob = (qy * w + qx) * 3;
       sum += (Math.abs(a.data[oa] - b.data[ob]) + Math.abs(a.data[oa + 1] - b.data[ob + 1]) + Math.abs(a.data[oa + 2] - b.data[ob + 2])) / 3; n++;
     }
-    const err = n ? sum / n : Infinity;
-    if (err < best.error) best = { shiftX: dx, shiftY: dy, error: err };
+    return n ? sum / n : Infinity;
+  };
+  // Coarse pass (±24px every 4px, all scales), preferring the smallest transform among ties.
+  let best = { shiftX: 0, shiftY: 0, scale: 1, error: Infinity };
+  const consider = (scale: number, dx: number, dy: number) => {
+    const e = errAt(scale, dx, dy);
+    const mag = Math.max(Math.abs(dx), Math.abs(dy)) + Math.abs(scale - 1) * 100;
+    const bestMag = Math.max(Math.abs(best.shiftX), Math.abs(best.shiftY)) + Math.abs(best.scale - 1) * 100;
+    if (e < best.error - 1e-9 || (Math.abs(e - best.error) <= 1e-9 && mag < bestMag)) best = { shiftX: dx, shiftY: dy, scale, error: e };
+  };
+  for (const s of ALIGNMENT_SCALES) for (let dy = -24; dy <= 24; dy += 4) for (let dx = -24; dx <= 24; dx += 4) consider(s, dx, dy);
+  // Fine pass: ±3px around the coarse best, at its scale.
+  const { scale: bs, shiftX: bx, shiftY: by } = best;
+  for (let dy = by - 3; dy <= by + 3; dy++) for (let dx = bx - 3; dx <= bx + 3; dx++) consider(bs, dx, dy);
+  return { ...best, aligned: best.error <= ALIGNMENT_MAX_RESIDUAL };
+}
+
+/**
+ * Warp an edited crop BACK onto the original grid (inverse of the estimated transform):
+ * output pixel p samples the edited image at c + (p − c)·scale + shift, bilinear, with
+ * out-of-frame samples falling back to the original pixel. Uses sharp only for decode/encode.
+ */
+export async function alignEditedCrop(originalDataUrl: string, editedDataUrl: string, est: AlignmentEstimate): Promise<string> {
+  if (est.shiftX === 0 && est.shiftY === 0 && est.scale === 1) return editedDataUrl;
+  const a = await rawOf(originalDataUrl);
+  const b = await rawOf(editedDataUrl, a.width, a.height);
+  const w = a.width, h = a.height, cx = w / 2, cy = h / 2;
+  const out = Buffer.alloc(w * h * 3);
+  const sample = (qx: number, qy: number, ch: number): number => {
+    const x0 = Math.floor(qx), y0 = Math.floor(qy), fx = qx - x0, fy = qy - y0;
+    const px = (xx: number, yy: number) => b.data[(Math.max(0, Math.min(h - 1, yy)) * w + Math.max(0, Math.min(w - 1, xx))) * 3 + ch];
+    return px(x0, y0) * (1 - fx) * (1 - fy) + px(x0 + 1, y0) * fx * (1 - fy) + px(x0, y0 + 1) * (1 - fx) * fy + px(x0 + 1, y0 + 1) * fx * fy;
+  };
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const qx = cx + (x - cx) * est.scale + est.shiftX, qy = cy + (y - cy) * est.scale + est.shiftY;
+    const o = (y * w + x) * 3;
+    if (qx < 0 || qy < 0 || qx >= w - 1 || qy >= h - 1) { out[o] = a.data[o]; out[o + 1] = a.data[o + 1]; out[o + 2] = a.data[o + 2]; continue; }
+    for (let ch = 0; ch < 3; ch++) out[o + ch] = Math.round(sample(qx, qy, ch));
   }
-  return { ...best, aligned: Math.max(Math.abs(best.shiftX), Math.abs(best.shiftY)) <= 2 && best.error <= 25 };
+  return bufferToDataUrl(await sharp(out, { raw: { width: w, height: h, channels: 3 } }).png().toBuffer());
 }
 
 /** JPEG copy for PROVIDER calls only (same dimensions, ~10x smaller than a photo PNG — large

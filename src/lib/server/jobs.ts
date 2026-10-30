@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { enforceSpacing, maskToBBox, maskCentroid, normalizeBBox } from '../engine/geometry';
 import type { Providers, Mode, Difference, Region } from '../engine/types';
-import { normalizeImage, cropDataUrl, expandBox, diffMask, providerImage, clampBox, recolorCrop, squareContextBox, compositeMaskedEdit, alignmentCheck, cropColorStats, colorDeltaE, targetHueFromColor } from './imageOps';
+import { normalizeImage, cropDataUrl, expandBox, diffMask, providerImage, clampBox, recolorCrop, squareContextBox, compositeMaskedEdit, estimateAlignment, alignEditedCrop, ALIGNMENT_MAX_RESIDUAL, cropColorStats, colorDeltaE, targetHueFromColor } from './imageOps';
 import { saveImageLevel } from '../serverStore';
 import { persistJob, loadJob } from './db';
 
@@ -99,24 +99,26 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
       // A: square CONTEXT box to Muse; separate smaller PASTE box (object + small margin).
       const contextBox = squareContextBox(region.bbox, width, height);
       const pasteBox = expandBox(region.bbox, 0.15, width, height);
+      const relPaste = { x: pasteBox.x - contextBox.x, y: pasteBox.y - contextBox.y, width: pasteBox.width, height: pasteBox.height };
       const { cropDataUrl: contextCrop } = await cropDataUrl(base, contextBox);
-      const prompts = [prompt, `${prompt} Keep the exact same camera position, framing, scale and alignment as the input image; do not shift, zoom, crop or reframe.`];
-      for (let attempt = 0; attempt < prompts.length; attempt++) {
-        const edited = await providers.imageEdit.editMaskedRegion(await providerImage(contextCrop), { id: region.id, bbox: { x: pasteBox.x - contextBox.x, y: pasteBox.y - contextBox.y, width: pasteBox.width, height: pasteBox.height } }, prompts[attempt]);
-        // C: measurable alignment guard BEFORE pasting — reject shifted/reframed edits.
-        const align = await alignmentCheck(contextCrop, edited, { x: pasteBox.x - contextBox.x, y: pasteBox.y - contextBox.y, width: pasteBox.width, height: pasteBox.height });
-        if (!align.aligned) {
-          console.info(`[generate ${job.id}] change ${ch.id} attempt ${attempt + 1} rejected by alignment guard (shift ${align.shiftX},${align.shiftY}px, ring error ${align.error.toFixed(1)})`);
-          continue;
-        }
-        // B: mask composition from large diff components inside the paste box only.
-        const next = await compositeMaskedEdit(base, edited, contextBox, pasteBox);
-        const mask = await diffMask(base, next, width, height);
-        const bbox = maskToBBox(mask, width, height);
-        if (!bbox || !measuredOk(bbox)) continue;
-        return { next, mask, bbox, local: false, notes: '' };
+      // ONE Muse call per attempt: a "keep the framing" re-prompt does not change Muse's
+      // systematic shift and only doubles cost. Instead the shift/scale is measured and
+      // compensated geometrically; rejection happens only on high RESIDUAL error.
+      const edited = await providers.imageEdit.editMaskedRegion(await providerImage(contextCrop), { id: region.id, bbox: relPaste }, prompt);
+      const est = await estimateAlignment(contextCrop, edited, relPaste);
+      console.info(`[generate ${job.id}] change ${ch.id} alignment: shift (${est.shiftX}, ${est.shiftY})px · scale ${est.scale.toFixed(2)} · residual error ${est.error.toFixed(1)}`);
+      if (!est.aligned) {
+        console.info(`[generate ${job.id}] change ${ch.id} discarded: residual alignment error ${est.error.toFixed(1)} exceeds ${ALIGNMENT_MAX_RESIDUAL} after compensating shift (${est.shiftX}, ${est.shiftY})px scale ${est.scale.toFixed(2)} — edit likely repainted/reframed`);
+        return null;
       }
-      return null;
+      const alignedEdited = await alignEditedCrop(contextCrop, edited, est);
+      // B: mask composition from large diff components inside the paste box only.
+      const next = await compositeMaskedEdit(base, alignedEdited, contextBox, pasteBox);
+      const mask = await diffMask(base, next, width, height);
+      const bbox = maskToBBox(mask, width, height);
+      if (!bbox) { console.info(`[generate ${job.id}] change ${ch.id} discarded: no measurable diff after masked composite`); return null; }
+      if (!measuredOk(bbox)) { console.info(`[generate ${job.id}] change ${ch.id} discarded: measured diff ${bbox.width}x${bbox.height} exceeds size cap`); return null; }
+      return { next, mask, bbox, local: false, notes: '' };
     };
 
     const applyLocalRecolor = async (base: string, ch: (typeof plan)[number], region: Region): Promise<Candidate | null> => {
