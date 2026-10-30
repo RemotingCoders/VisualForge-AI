@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { enforceSpacing, maskToBBox, maskCentroid, normalizeBBox } from '../engine/geometry';
 import type { Providers, Mode, Difference, Region } from '../engine/types';
-import { normalizeImage, cropDataUrl, expandBox, compositeCrop, diffMask, providerImage, clampBox } from './imageOps';
+import { normalizeImage, cropDataUrl, expandBox, compositeCrop, diffMask, providerImage, clampBox, recolorCrop } from './imageOps';
 import { saveImageLevel } from '../serverStore';
 import { persistJob, loadJob } from './db';
 
@@ -85,9 +85,25 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
       setStage(`editing ${editIdx}/${plan.length}`);
       const cropBox = expandBox(region.bbox, 0.25, width, height);
       const { cropDataUrl: cropUrl } = await cropDataUrl(current, cropBox);
-      const edited = await providers.imageEdit.editMaskedRegion(await providerImage(cropUrl), { id: region.id, bbox: cropBox }, ch.editPrompt);
-      const next = await compositeCrop(current, edited, cropBox);
-      masks.set(ch.id, await diffMask(current, next, width, height));
+      let next: string; let mask: boolean[];
+      if (/colou?r/i.test(ch.type)) {
+        // Pure color change: deterministic local recolor (shape pixel-identical, zero deformation,
+        // zero API cost). Falls back to Muse only if the recolor is invisible (e.g. gray object).
+        const shifts = [105, 145, -105, -145, 180];
+        const shift = shifts[[...ch.id].reduce((a, c) => a + c.charCodeAt(0), 0) % shifts.length];
+        next = await compositeCrop(current, await recolorCrop(cropUrl, shift), cropBox);
+        mask = await diffMask(current, next, width, height);
+        if (mask.filter(Boolean).length < 30) {
+          const edited = await providers.imageEdit.editMaskedRegion(await providerImage(cropUrl), { id: region.id, bbox: cropBox }, ch.editPrompt);
+          next = await compositeCrop(current, edited, cropBox);
+          mask = await diffMask(current, next, width, height);
+        }
+      } else {
+        const edited = await providers.imageEdit.editMaskedRegion(await providerImage(cropUrl), { id: region.id, bbox: cropBox }, ch.editPrompt);
+        next = await compositeCrop(current, edited, cropBox);
+        mask = await diffMask(current, next, width, height);
+      }
+      masks.set(ch.id, mask);
       current = next;
     }
 

@@ -187,7 +187,9 @@ class MetaProvider implements SegmentationProvider, VisionReasoningProvider, Ima
   async editMaskedRegion(imageRef: string, _r: Region, prompt: string): Promise<string> {
     // Crop+margin -> edit crop -> resize back -> feathered composite happens in the worker (worker/composite.py);
     // the verified Muse Image call itself has no mask parameter and returns 1600x1600 WebP (spike 3/6).
-    return extractEditedImage(await museImageEdit(imageRef, prompt));
+    // Preservation clause: Muse repaints what it returns, so the prompt must pin everything else down.
+    const guarded = `${prompt}. IMPORTANT: change ONLY what is described. Keep every other element exactly the same — identical shapes, positions, colors, lighting, shadows and photographic style. Do not redraw, move or deform anything else.`;
+    return extractEditedImage(await museImageEdit(imageRef, guarded));
   }
   async generateScene(_theme: string): Promise<string> {
     assertMetaConfigured();

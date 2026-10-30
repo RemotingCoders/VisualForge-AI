@@ -76,6 +76,30 @@ export async function providerImage(dataUrl: string, quality = 82): Promise<stri
   return `data:image/jpeg;base64,${buf.toString('base64')}`;
 }
 
+/**
+ * Deterministic pure-color change: rotate the hue of a crop while preserving lightness and
+ * shading — the SHAPE stays pixel-identical, only the color changes (no generative repaint,
+ * no deformation, no API cost). Low-saturation pixels (grays, whites) barely move, weighted
+ * by saturation, so backgrounds inside the crop are mostly untouched.
+ */
+export async function recolorCrop(cropDataUrl: string, hueShiftDeg: number): Promise<string> {
+  const { data, info } = await sharp(dataUrlToBuffer(cropDataUrl)).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+  const out = Buffer.from(data);
+  for (let i = 0; i < data.length; i += 3) {
+    const r = data[i] / 255, g = data[i + 1] / 255, b = data[i + 2] / 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2, d = max - min;
+    if (d === 0) continue; // pure gray: hue undefined, leave untouched
+    const s = d / (1 - Math.abs(2 * l - 1) || 1);
+    let h = max === r ? ((g - b) / d) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+    h = ((h * 60) + hueShiftDeg + 360) % 360;
+    const c = (1 - Math.abs(2 * l - 1)) * s, x = c * (1 - Math.abs(((h / 60) % 2) - 1)), m = l - c / 2;
+    const rgb = h < 60 ? [c, x, 0] : h < 120 ? [x, c, 0] : h < 180 ? [0, c, x] : h < 240 ? [0, x, c] : h < 300 ? [x, 0, c] : [c, 0, x];
+    const wgt = Math.min(1, s * 1.8); // blend by saturation: vivid colors shift fully, muted ones gently
+    for (let k = 0; k < 3; k++) out[i + k] = Math.round((data[i + k] / 255 * (1 - wgt) + (rgb[k] + m) * wgt) * 255);
+  }
+  return bufferToDataUrl(await sharp(out, { raw: { width: info.width, height: info.height, channels: 3 } }).png().toBuffer());
+}
+
 /** Boolean per-pixel diff mask (row-major w*h) between two same-size images. */
 export async function diffMask(aDataUrl: string, bDataUrl: string, width: number, height: number, threshold = 12): Promise<boolean[]> {
   const raw = async (d: string) => sharp(dataUrlToBuffer(d)).resize(width, height, { fit: 'fill' }).removeAlpha().raw().toBuffer();
