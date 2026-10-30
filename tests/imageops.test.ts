@@ -143,6 +143,29 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
     expect(diffs[0].centroid!.x).toBeLessThanOrEqual(50);
   });
 
+  it('never removes/replaces a fragment — downgraded to a color change (no broken objects)', async () => {
+    let museCalled = false;
+    const base = await sharp({ create: { width: 100, height: 80, channels: 3, background: { r: 120, g: 120, b: 120 } } })
+      .composite([{ input: await sharp({ create: { width: 10, height: 8, channels: 3, background: { r: 220, g: 30, b: 30 } } }).png().toBuffer(), left: 44, top: 35 }])
+      .png().toBuffer();
+    const fake: Providers = {
+      // Only ONE huge region: it gets center-shrunk (wholeObject=false), so remove would cut the object in half.
+      segmentation: { name: 'fake', isMock: true, segment: async () => [{ id: 'big', bbox: { x: 0, y: 0, width: 99, height: 79 } }] },
+      vision: {
+        name: 'fake', isMock: true,
+        moderate: async () => ({ ok: true, reason: 'ok' }),
+        plan: async () => [{ id: 'c1', regionId: 'big', type: 'remove object', description: 'remove it', editPrompt: 'remove it' }],
+        verify: async () => ({ ok: true, notes: 'ok' }),
+      },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { museCalled = true; throw new Error('must not be called'); }, generateScene: async () => '' },
+    };
+    const job = createJob('game', true);
+    await runGeneration(job, bufferToDataUrl(base), 1, fake);
+    expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
+    expect(museCalled).toBe(false);
+    expect(getDifferences(job.levelId!)![0].type).toBe('change color');
+  });
+
   it('marks the job failed when moderation rejects (no silent fallback)', async () => {
     const fake: Providers = {
       segmentation: { name: 'fake', isMock: true, segment: async () => [] },

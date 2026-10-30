@@ -63,17 +63,25 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
     const capW = Math.max(8, Math.floor(width * MAX_REGION_FRACTION));
     const capH = Math.max(8, Math.floor(height * MAX_REGION_FRACTION));
     const capRegion = (r: Region): Region => {
-      if (r.bbox.width <= capW && r.bbox.height <= capH) return r;
+      // wholeObject=false marks a center-cut FRAGMENT of a larger object: usable for color
+      // changes only. Removing/replacing a fragment is what makes objects look "broken/split".
+      if (r.bbox.width <= capW && r.bbox.height <= capH) return { ...r, wholeObject: true };
       const w = Math.min(r.bbox.width, capW), h = Math.min(r.bbox.height, capH);
       const cx = r.bbox.x + r.bbox.width / 2, cy = r.bbox.y + r.bbox.height / 2;
-      return { ...r, bbox: clampBox({ x: cx - w / 2, y: cy - h / 2, width: w, height: h }, width, height) };
+      return { ...r, bbox: clampBox({ x: cx - w / 2, y: cy - h / 2, width: w, height: h }, width, height), wholeObject: false };
     };
     const regions = enforceSpacing(rawRegions.map(capRegion));
     if (!regions.length) throw new Error('segmentation found no usable regions');
 
     setStage('planning');
-    const plan = (await providers.vision.plan(aiImg, regions, job.mode, count)).slice(0, count);
-    if (!plan.length) throw new Error('planner returned no changes');
+    const planned = (await providers.vision.plan(aiImg, regions, job.mode, count)).slice(0, count);
+    if (!planned.length) throw new Error('planner returned no changes');
+    // Hard rule (not just a prompt wish): remove/replace on a FRAGMENT makes objects look broken.
+    // Downgrade those to a color change, which is always safe on any region.
+    const plan = planned.map(ch => {
+      const r = regions.find(x => x.id === ch.regionId);
+      return r && r.wholeObject === false && !/colou?r/i.test(ch.type) ? { ...ch, type: 'change color' } : ch;
+    });
 
     setStage('editing');
     const masks = new Map<string, boolean[]>();

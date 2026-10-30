@@ -1,7 +1,7 @@
 export type Mode = 'game' | 'qc';
 export type BBox = { x: number; y: number; width: number; height: number };
 
-export interface Region { id: string; bbox: BBox; maskRef?: string; label?: string }
+export interface Region { id: string; bbox: BBox; maskRef?: string; label?: string; wholeObject?: boolean }
 
 export interface PlannedChange {
   id: string; regionId: string; type: string; description: string; editPrompt: string; severity?: 'low' | 'medium' | 'high';

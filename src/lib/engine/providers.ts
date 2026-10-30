@@ -171,9 +171,9 @@ class MetaProvider implements SegmentationProvider, VisionReasoningProvider, Ima
   async plan(imageRef: string, regions: Region[], mode: Mode, count: number): Promise<PlannedChange[]> {
     const rules = mode === 'qc'
       ? 'Change types allowed (QC defects): scratch, crack, dent, missing component, corrosion, misalignment, wrong color, foreign object. Defects must be localized and realistic, not covering the whole part.'
-      : 'Change types allowed (game): remove object, change color, add object, alter shape. Difficulty: every change must be SUBTLE and hard to spot at a glance — a slight shade or hue shift, removing one small detail, a minor shape tweak. Never repaint a whole object into a drastically different look, never add large new elements. MIX: make about half of the changes "change color" (same object, same shape, clearly different color); use the other types sparingly.';
+      : 'Change types allowed (game) — ONLY these three: "change color", "remove object", "replace object". Difficulty: every change must be SUBTLE and hard to spot at a glance. Never use shape deformation, never add large new elements, never partially transform an object. "change color": same object, same shape, clearly different color (can use ANY region). "remove object": the whole object disappears and the background is filled naturally, as if it had never been there — ONLY on regions with wholeObject=true. "replace object": the whole object is swapped for a DIFFERENT but similar object of similar size in the same place — ONLY on regions with wholeObject=true. MIX: about half "change color"; the rest split between remove/replace on wholeObject regions only. Each editPrompt must describe the change applied COMPLETELY and cleanly to the entire object — never a half-changed, split or broken-looking result.';
     const out = await sparkStructured<{ changes: PlannedChange[] }>({
-      prompt: `Plan exactly ${count} realistic, localized visual changes to this image. ${rules} Use ONLY these regionIds, at most one change per region, regions must not overlap: ${JSON.stringify(regions.map(r => ({ regionId: r.id, bbox: r.bbox, label: r.label ?? '' })))}. Each editPrompt must describe a precise, subtle image edit confined to that region, preserving the region's overall appearance except for the one small change.`,
+      prompt: `Plan exactly ${count} realistic, localized visual changes to this image. ${rules} Use ONLY these regionIds, at most one change per region, regions must not overlap: ${JSON.stringify(regions.map(r => ({ regionId: r.id, bbox: r.bbox, label: r.label ?? '', wholeObject: r.wholeObject ?? true })))}. Each editPrompt must describe a precise, subtle image edit confined to that region, preserving the region's overall appearance except for the one small change.`,
       images: [imageRef], schemaName: 'ChangePlan', schema: SPARK_SCHEMAS.plan,
     });
     return out.changes.slice(0, count);
@@ -188,7 +188,7 @@ class MetaProvider implements SegmentationProvider, VisionReasoningProvider, Ima
     // Crop+margin -> edit crop -> resize back -> feathered composite happens in the worker (worker/composite.py);
     // the verified Muse Image call itself has no mask parameter and returns 1600x1600 WebP (spike 3/6).
     // Preservation clause: Muse repaints what it returns, so the prompt must pin everything else down.
-    const guarded = `${prompt}. IMPORTANT: change ONLY what is described. Keep every other element exactly the same — identical shapes, positions, colors, lighting, shadows and photographic style. Do not redraw, move or deform anything else.`;
+    const guarded = `${prompt}. IMPORTANT: change ONLY what is described, and apply it to the object COMPLETELY and cleanly — a fully removed object with naturally filled background, or a fully replaced object; never a half-changed, split, torn or broken-looking object. Keep every other element exactly the same — identical shapes, positions, colors, lighting, shadows and photographic style. Do not redraw, move or deform anything else.`;
     return extractEditedImage(await museImageEdit(imageRef, guarded));
   }
   async generateScene(_theme: string): Promise<string> {
@@ -208,7 +208,7 @@ export class MockProviders implements SegmentationProvider, VisionReasoningProvi
   }
   async moderate() { return { ok: true, reason: 'MOCK moderation — not a real safety check' }; }
   async plan(_i: string, regions: Region[], _m: string, count: number): Promise<PlannedChange[]> {
-    const types = ['remove object', 'change color', 'add object', 'alter shape'];
+    const types = ['remove object', 'change color', 'replace object'];
     return regions.slice(0, count).map((r, i) => ({ id: `change-${i + 1}`, regionId: r.id, type: types[i % types.length], description: `MOCK change ${i + 1}: ${types[i % types.length]}`, editPrompt: `mock edit ${i + 1}` }));
   }
   async verify() { return { ok: true, notes: 'MOCK verification — not real visual verification' }; }
