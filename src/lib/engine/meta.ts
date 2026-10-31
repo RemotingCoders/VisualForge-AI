@@ -2,7 +2,7 @@
 export const META_BASE_URL = 'https://api.meta.ai/v1';
 export const META_MODELS = { image: 'muse-image-1.0', sam: 'sam-3.1', spark: 'muse-spark-1.3' } as const;
 // META_BASE_URL already ends in /v1 — endpoints must NOT repeat it (tests caught a /v1/v1 double-prefix).
-export const META_ENDPOINTS = { imageEdits: '/images/edits', responses: '/responses', chatCompletions: '/chat/completions' } as const;
+export const META_ENDPOINTS = { imageEdits: '/images/edits', imageGenerations: '/images/generations', responses: '/responses', chatCompletions: '/chat/completions' } as const;
 
 /** Key lives in .env.local as MODEL_API_KEY (docs naming) or META_API_KEY (alias). Never NEXT_PUBLIC_. */
 export function metaApiKey(env: Record<string, string | undefined> = process.env): string | null {

@@ -36,17 +36,24 @@ export interface DifferenceReview { index: number; ok: boolean; description: str
 export interface VisionReasoningProvider {
   readonly name: string; readonly isMock: boolean;
   moderate(imageRef: string): Promise<{ ok: boolean; reason: string }>;
+  /** Text-only theme moderation (VF_THEME_GENERATION): Spark judges the theme BEFORE any
+   *  paid image generation. Optional like reviewDifferences — the theme path fails loudly
+   *  when a provider does not implement it. */
+  moderateTheme?(text: string): Promise<{ ok: boolean; reason: string }>;
   plan(imageRef: string, regions: Region[], mode: Mode, count: number, difficulty?: Difficulty): Promise<PlannedChange[]>;
   verify(imageRef: string, modifiedRef: string, change: PlannedChange, measured: BBox): Promise<{ ok: boolean; notes: string }>;
   /** ONE call reviewing N crop pairs (before/after interleaved in `pairs` order). Used by one-pass mode. */
   reviewDifferences?(pairs: { index: number; before: string; after: string; bbox: BBox }[]): Promise<DifferenceReview[]>;
 }
+/** A generated scene (VF_THEME_GENERATION): the image plus the prompt Muse Image
+ *  actually used, which the API echoes back as data[].revised_prompt. */
+export interface GeneratedScene { image: string; revisedPrompt?: string }
 export interface ImageEditProvider {
   readonly name: string; readonly isMock: boolean;
   editMaskedRegion(imageRef: string, region: Region, prompt: string): Promise<string>;
   /** Full-image edit with the RAW prompt (no preservation-guard suffix — the one-pass prompt
    *  already carries its own "keep everything else pixel-identical" clause). One-pass mode. */
   editFullImage?(imageRef: string, prompt: string): Promise<string>;
-  generateScene(theme: string): Promise<string>;
+  generateScene(theme: string): Promise<GeneratedScene>;
 }
 export interface Providers { segmentation: SegmentationProvider; vision: VisionReasoningProvider; imageEdit: ImageEditProvider }

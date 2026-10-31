@@ -115,12 +115,12 @@ describe('VF_SAM_MASKS in runGeneration (fake providers, offline)', () => {
         plan: async () => [{ id: 'c1', regionId: 'r1', type: 'change color', description: 'square turned yellow', editPrompt: 'turn it yellow', targetColor: 'yellow' }],
         verify: async () => ({ ok: true, notes: 'ok' }),
       },
-      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { throw new Error('local recolor must handle it'); }, generateScene: async () => '' },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { throw new Error('local recolor must handle it'); }, generateScene: async () => ({ image: '' }) },
     };
     process.env.VF_SAM_MASKS = 'true';
     try {
       const job = createJob('game', true);
-      await runGeneration(job, bufferToDataUrl(base), 1, fake);
+      await runGeneration(job, { imageDataUrl: bufferToDataUrl(base) }, 1, fake);
       expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
       const payload = getLevelPayload(job.levelId!)!;
       const { data, width } = await rawPixels(payload.modified);

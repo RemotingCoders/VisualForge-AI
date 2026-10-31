@@ -1,9 +1,16 @@
-import type { Providers, Region, PlannedChange, Mode, Difficulty, BBox, SegmentationProvider, VisionReasoningProvider, ImageEditProvider, DifferenceReview } from './types';
+import { createHash } from 'node:crypto';
+import type { Providers, Region, PlannedChange, Mode, Difficulty, BBox, SegmentationProvider, VisionReasoningProvider, ImageEditProvider, DifferenceReview, GeneratedScene } from './types';
 import { META_BASE_URL, META_MODELS, META_ENDPOINTS, metaApiKey, parseSamOutput, parseSseOutputText, type SamObject } from './meta';
 import { logAiCall } from '../server/db';
 
 export class MetaNotConfiguredError extends Error {
   constructor(missing: string[]) { super(`Meta provider not configured (missing: ${missing.join(', ')})`); this.name = 'MetaNotConfiguredError'; }
+}
+/** A theme was rejected — by Spark text moderation or by Muse Image's own safety system
+ *  (400 content_policy_violation). Jobs map this to the `theme_rejected` sentinel so the
+ *  UI can show a friendly "pick another theme" message instead of a raw API error. */
+export class ThemeRejectedError extends Error {
+  constructor(reason: string) { super(reason); this.name = 'ThemeRejectedError'; }
 }
 export function assertMetaConfigured(env: Record<string, string | undefined> = process.env): void {
   if (env.META_REAL_CALLS_ENABLED !== 'true') throw new MetaNotConfiguredError(['META_REAL_CALLS_ENABLED=true (paid-call kill switch is off)']);
@@ -14,7 +21,7 @@ type FetchFn = typeof fetch;
 /** Hard ceiling per Meta call (spike latencies were 3-17s; big photos can be slower).
  *  Without this, a stalled connection/stream hangs a generation job forever with no error. */
 export const META_CALL_TIMEOUT_MS = 180_000;
-export async function metaPost(path: string, body: unknown, env: Record<string, string | undefined> = process.env, fetchFn: FetchFn = fetch): Promise<unknown> {
+export async function metaPost(path: string, body: unknown, env: Record<string, string | undefined> = process.env, fetchFn: FetchFn = fetch, estimatedCostUsd = 0): Promise<unknown> {
   assertMetaConfigured(env);
   const t0 = Date.now();
   let res: Response;
@@ -24,7 +31,7 @@ export async function metaPost(path: string, body: unknown, env: Record<string, 
     const cause = (e as { cause?: { code?: string; message?: string } })?.cause;
     throw new Error(`Meta ${path} fetch failed: ${(e as Error).message}${cause ? ` (cause: ${cause.code ?? cause.message ?? 'unknown'})` : ''}`);
   }
-  void logAiCall(path.includes('images') ? META_MODELS.image : META_MODELS.spark, path, Date.now() - t0);
+  void logAiCall(path.includes('images') ? META_MODELS.image : META_MODELS.spark, path, Date.now() - t0, false, estimatedCostUsd);
   if (!res.ok) throw new Error(`Meta API ${path} → HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`);
   return res.json();
 }
@@ -41,6 +48,49 @@ export function extractEditedImage(res: unknown): string {
   const b64 = r?.data?.[0]?.b64_json;
   if (!b64) throw new Error('Muse Image: no data[0].b64_json in edit response');
   return `data:image/${r.output_format ?? 'webp'};base64,${b64}`;
+}
+
+/** Generation response also carries data[].revised_prompt — the prompt Muse Image
+ *  actually used (docs, Image generation page). Surfaced in the UI as the scene caption. */
+export function extractGeneratedScene(res: unknown): GeneratedScene {
+  const r = res as { data?: { b64_json?: string; revised_prompt?: string }[]; output_format?: string };
+  const d = r?.data?.[0];
+  if (!d?.b64_json) throw new Error('Muse Image: no data[0].b64_json in generation response');
+  return { image: `data:image/${r.output_format ?? 'webp'};base64,${d.b64_json}`, ...(d.revised_prompt ? { revisedPrompt: d.revised_prompt } : {}) };
+}
+
+/** Docs recommend a stable opaque per-user id (never PII). Ours derives from the API key
+ *  itself: stable across calls, reveals nothing, rotates with the key. */
+export function anonymousUserId(env: Record<string, string | undefined> = process.env): string {
+  return `vf-${createHash('sha256').update(metaApiKey(env) ?? '').digest('hex').slice(0, 24)}`;
+}
+
+/**
+ * Real Muse Image GENERATION (theme -> scene) — shape VERIFIED in official docs
+ * (dev.meta.ai/docs/muse-image, Image generation page, read 2026-10-30):
+ * POST /images/generations {model, prompt, n, size, reasoning_strength, tool_enablement,
+ * user}. `size` is ASPECT ONLY (longest edge <= 1024) so "1024x768" yields a 4:3 scene.
+ * NO `moderation` field: muse-image-1.0 rejects it with 400 (enum is Spark-only) — safety
+ * is Spark pre-moderation (moderateTheme) + a 400 content_policy_violation mapped to
+ * ThemeRejectedError. Flat $0.01/image. The scene brief demands >= 8 clearly separated
+ * objects and forbids people/text so SAM + the planner get segmentable material.
+ */
+export async function museImageGenerateScene(theme: string, env: Record<string, string | undefined> = process.env, fetchFn: FetchFn = fetch): Promise<GeneratedScene> {
+  const prompt = `A rich, detailed scene for a spot-the-difference game: ${theme}. Show at least 8 clearly separated, distinct objects, no people, no text, no watermark, static scene seen from a fixed camera.`;
+  let res: unknown;
+  try {
+    res = await metaPost(META_ENDPOINTS.imageGenerations, {
+      model: META_MODELS.image, prompt, n: 1, size: '1024x768',
+      reasoning_strength: env.VF_SCENE_REASONING || 'high',
+      tool_enablement: { web_search: false, use_entertainment_tool: false, use_sports_tool: false },
+      user: anonymousUserId(env),
+    }, env, fetchFn, 0.01);
+  } catch (e) {
+    if ((e as Error).message.includes('content_policy_violation'))
+      throw new ThemeRejectedError('Muse Image safety system rejected this theme (content_policy_violation)');
+    throw e;
+  }
+  return extractGeneratedScene(res);
 }
 
 /**
@@ -186,6 +236,15 @@ class MetaProvider implements SegmentationProvider, VisionReasoningProvider, Ima
       images: [imageRef], schemaName: 'Moderation', schema: SPARK_SCHEMAS.moderation,
     });
   }
+  /** Text-only theme gate (VF_THEME_GENERATION): judges the theme BEFORE any paid image
+   *  generation. Same moderation schema, no images — the Responses content then carries a
+   *  single input_text part (sparkStructured already omits input_image when images is []). */
+  async moderateTheme(text: string): Promise<{ ok: boolean; reason: string }> {
+    return sparkStructured({
+      prompt: `A user wants to generate a spot-the-difference game scene from this theme: "${text}". Is this theme safe and appropriate for a general audience? Answer ok=false if it requests or implies sexual, violent, graphic, hateful, illegal or otherwise unsafe imagery, with a short reason. Innocent scenes (places, objects, animals, seasons, fantasy worlds without adult content) are ok=true.`,
+      schemaName: 'Moderation', schema: SPARK_SCHEMAS.moderation,
+    });
+  }
   async plan(imageRef: string, regions: Region[], mode: Mode, count: number, difficulty: Difficulty = 'medium'): Promise<PlannedChange[]> {
     const difficultyRule = difficulty === 'easy'
       ? 'Difficulty EASY: prefer the LARGEST suitable objects and the strongest, most clearly visible version of each change.'
@@ -229,9 +288,9 @@ class MetaProvider implements SegmentationProvider, VisionReasoningProvider, Ima
     // clause); adding the crop-mode guard suffix would contradict its instructions.
     return extractEditedImage(await museImageEdit(imageRef, prompt));
   }
-  async generateScene(_theme: string): Promise<string> {
-    assertMetaConfigured();
-    throw new MetaNotConfiguredError(['Muse Image generation request shape not yet verified in official docs — not guessed']);
+  async generateScene(theme: string): Promise<GeneratedScene> {
+    // VF_THEME_GENERATION: request shape verified in official docs (see museImageGenerateScene).
+    return museImageGenerateScene(theme);
   }
 }
 
@@ -245,6 +304,7 @@ export class MockProviders implements SegmentationProvider, VisionReasoningProvi
     return out;
   }
   async moderate() { return { ok: true, reason: 'MOCK moderation — not a real safety check' }; }
+  async moderateTheme() { return { ok: true, reason: 'MOCK theme moderation — not a real safety check' }; }
   async plan(_i: string, regions: Region[], mode: Mode, count: number): Promise<PlannedChange[]> {
     const types = mode === 'qc'
       ? ['scratch', 'crack', 'dent', 'missing component', 'corrosion']
@@ -257,7 +317,7 @@ export class MockProviders implements SegmentationProvider, VisionReasoningProvi
   }
   async editMaskedRegion(imageRef: string) { return imageRef; }
   async editFullImage(imageRef: string) { return imageRef; } // unchanged image -> one-pass finds 0 edits -> crop fallback
-  async generateScene(theme: string) { return `mock-scene:${theme}`; }
+  async generateScene(theme: string): Promise<GeneratedScene> { return { image: `mock-scene:${theme}`, revisedPrompt: `MOCK scene prompt for: ${theme}` }; }
 }
 
 export function selectProviders(env: Record<string, string | undefined> = process.env): { providers: Providers; label: string } {

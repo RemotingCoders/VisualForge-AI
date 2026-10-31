@@ -208,7 +208,7 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
       imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async (imageRef: string, region: { bbox: { x: number; y: number; width: number; height: number } }) => paintPatternBlue(imageRef, region), generateScene: async () => { throw new Error('not used'); } },
     };
     const job = createJob('game', true);
-    await runGeneration(job, await solidPng(100, 80, [120, 120, 120]), 1, fake);
+    await runGeneration(job, { imageDataUrl: await solidPng(100, 80, [120, 120, 120]) }, 1, fake);
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     const diffs = getDifferences(job.levelId!)!;
     expect(diffs).toHaveLength(1);
@@ -243,7 +243,7 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
       imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async (imageRef: string, region: { bbox: { x: number; y: number; width: number; height: number } }) => paintPatternBlue(imageRef, region), generateScene: async () => { throw new Error('not used'); } },
     };
     const job = createJob('game', true);
-    await runGeneration(job, await solidPng(100, 80, [120, 120, 120]), 2, fake);
+    await runGeneration(job, { imageDataUrl: await solidPng(100, 80, [120, 120, 120]) }, 2, fake);
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     expect(seenWhole).toEqual({ big: false, small: true });
     const diffs = getDifferences(job.levelId!)!;
@@ -266,10 +266,10 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
         plan: async () => [{ id: 'c1', regionId: 'r1', type: 'change color', description: 'square changed color', editPrompt: 'recolor it' }],
         verify: async () => ({ ok: true, notes: 'ok' }),
       },
-      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { museCalled = true; throw new Error('must not be called for color changes'); }, generateScene: async () => '' },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { museCalled = true; throw new Error('must not be called for color changes'); }, generateScene: async () => ({ image: '' }) },
     };
     const job = createJob('game', true);
-    await runGeneration(job, bufferToDataUrl(base), 1, fake);
+    await runGeneration(job, { imageDataUrl: bufferToDataUrl(base) }, 1, fake);
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     expect(museCalled).toBe(false); // pure recolor: zero deformation, zero API cost
     const diffs = getDifferences(job.levelId!)!;
@@ -293,10 +293,10 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
         plan: async () => [{ id: 'c1', regionId: 'big', type: 'remove object', description: 'remove it', editPrompt: 'remove it' }],
         verify: async () => ({ ok: true, notes: 'ok' }),
       },
-      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { museCalled = true; throw new Error('must not be called'); }, generateScene: async () => '' },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { museCalled = true; throw new Error('must not be called'); }, generateScene: async () => ({ image: '' }) },
     };
     const job = createJob('game', true);
-    await runGeneration(job, bufferToDataUrl(base), 1, fake);
+    await runGeneration(job, { imageDataUrl: bufferToDataUrl(base) }, 1, fake);
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     expect(museCalled).toBe(false);
     expect(getDifferences(job.levelId!)![0].type).toBe('change color');
@@ -312,10 +312,10 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
         plan: async () => [{ id: 'c1', regionId: 'big', type: 'scratch', description: 'scratch across the surface', editPrompt: 'add a realistic scratch' }],
         verify: async () => ({ ok: true, notes: 'ok' }),
       },
-      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async (imageRef: string, region: { bbox: { x: number; y: number; width: number; height: number } }) => { museCalled = true; return paintPatternBlue(imageRef, region); }, generateScene: async () => '' },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async (imageRef: string, region: { bbox: { x: number; y: number; width: number; height: number } }) => { museCalled = true; return paintPatternBlue(imageRef, region); }, generateScene: async () => ({ image: '' }) },
     };
     const job = createJob('qc', true);
-    await runGeneration(job, await solidPng(100, 80, [120, 120, 120]), 1, fake);
+    await runGeneration(job, { imageDataUrl: await solidPng(100, 80, [120, 120, 120]) }, 1, fake);
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     expect(museCalled).toBe(true); // NOT downgraded to a local recolor
     expect(getDifferences(job.levelId!)![0].type).toBe('scratch');
@@ -339,10 +339,10 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
         plan: async () => [{ id: 'c1', regionId: 'r1', type: 'flip', description: 'the flag is mirrored', editPrompt: 'Flip the flag horizontally.' }],
         verify: async () => { verifyCalls++; return { ok: true, notes: 'ok' }; },
       },
-      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { museCalled = true; throw new Error('must not be called for local transforms'); }, generateScene: async () => '' },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { museCalled = true; throw new Error('must not be called for local transforms'); }, generateScene: async () => ({ image: '' }) },
     };
     const job = createJob('game', true);
-    await runGeneration(job, bufferToDataUrl(base), 1, fake);
+    await runGeneration(job, { imageDataUrl: bufferToDataUrl(base) }, 1, fake);
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     expect(museCalled).toBe(false);
     expect(verifyCalls).toBe(0); // deterministic: measured locally, no Spark call
@@ -367,10 +367,10 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
         ],
         verify: async () => ({ ok: true, notes: 'ok' }),
       },
-      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async (imageRef: string, region: { bbox: { x: number; y: number; width: number; height: number } }) => { editCalls++; return editCalls === 1 ? imageRef : paintPatternBlue(imageRef, region); }, generateScene: async () => '' },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async (imageRef: string, region: { bbox: { x: number; y: number; width: number; height: number } }) => { editCalls++; return editCalls === 1 ? imageRef : paintPatternBlue(imageRef, region); }, generateScene: async () => ({ image: '' }) },
     };
     const job = createJob('game', true);
-    await runGeneration(job, await solidPng(100, 80, [120, 120, 120]), 1, fake);
+    await runGeneration(job, { imageDataUrl: await solidPng(100, 80, [120, 120, 120]) }, 1, fake);
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     expect(editCalls).toBe(2);
     expect(getDifferences(job.levelId!)!.map(d => d.id)).toEqual(['c2']); // stopped after 1 achieved
@@ -386,10 +386,10 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
         plan: async () => [{ id: 'c1', regionId: 'r1', type: 'remove object', description: 'remove the block', editPrompt: 'Remove the block.' }],
         verify: async () => { verifyCalls++; return verifyCalls === 1 ? { ok: false, notes: 'still visible' } : { ok: true, notes: 'gone now' }; },
       },
-      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async (imageRef: string, region: { bbox: { x: number; y: number; width: number; height: number } }) => { editCalls++; return paintPatternBlue(imageRef, region); }, generateScene: async () => '' },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async (imageRef: string, region: { bbox: { x: number; y: number; width: number; height: number } }) => { editCalls++; return paintPatternBlue(imageRef, region); }, generateScene: async () => ({ image: '' }) },
     };
     const job = createJob('game', true);
-    await runGeneration(job, await solidPng(100, 80, [120, 120, 120]), 1, fake);
+    await runGeneration(job, { imageDataUrl: await solidPng(100, 80, [120, 120, 120]) }, 1, fake);
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     expect(editCalls).toBe(2);   // initial edit + exactly one re-edit
     expect(verifyCalls).toBe(2); // verified the NEW edit, not the same one twice
@@ -409,10 +409,10 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
         plan: async (_i, regions) => regions.map(r => ({ id: `c-${r.id}`, regionId: r.id, type: 'change color', description: `change in ${r.id}`, editPrompt: 'edit' })),
         verify: async () => ({ ok: true, notes: 'ok' }),
       },
-      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async (imageRef: string, region: { bbox: { x: number; y: number; width: number; height: number } }) => paintPatternBlue(imageRef, region), generateScene: async () => '' },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async (imageRef: string, region: { bbox: { x: number; y: number; width: number; height: number } }) => paintPatternBlue(imageRef, region), generateScene: async () => ({ image: '' }) },
     };
     const job = createJob('game', true);
-    await runGeneration(job, await solidPng(400, 300, [120, 120, 120]), 2, fake);
+    await runGeneration(job, { imageDataUrl: await solidPng(400, 300, [120, 120, 120]) }, 2, fake);
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     expect(getDifferences(job.levelId!)!.map(d => d.id)).toEqual(['c-r1']); // r2 dropped before planning
   });
@@ -425,10 +425,10 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
         moderate: async () => ({ ok: false, reason: 'blocked content' }),
         plan: async () => [], verify: async () => ({ ok: false, notes: '' }),
       },
-      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => '', generateScene: async () => '' },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => '', generateScene: async () => ({ image: '' }) },
     };
     const job = createJob('game', true);
-    await runGeneration(job, await solidPng(20, 20, [0, 0, 0]), 1, fake);
+    await runGeneration(job, { imageDataUrl: await solidPng(20, 20, [0, 0, 0]) }, 1, fake);
     expect(getJob(job.id)?.status).toBe('failed');
     expect(getJob(job.id)?.error).toContain('moderation rejected');
   });
@@ -446,10 +446,10 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
         plan: async () => [{ id: 'c1', regionId: 'r1', type: 'change color', description: 'square turned yellow', editPrompt: 'turn it yellow', targetColor: 'yellow' }],
         verify: async () => ({ ok: true, notes: 'ok' }),
       },
-      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { museCalled = true; throw new Error('local recolor must handle an exact target hue'); }, generateScene: async () => '' },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { museCalled = true; throw new Error('local recolor must handle an exact target hue'); }, generateScene: async () => ({ image: '' }) },
     };
     const job = createJob('game', true);
-    await runGeneration(job, bufferToDataUrl(base), 1, fake);
+    await runGeneration(job, { imageDataUrl: bufferToDataUrl(base) }, 1, fake);
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     expect(museCalled).toBe(false);
     const diffs = getDifferences(job.levelId!)!;
@@ -475,10 +475,10 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
         plan: async () => [{ id: 'c1', regionId: 'r1', type: 'remove object', description: 'remove block', editPrompt: 'remove it' }],
         verify: async (before: string, after: string) => { seen.push({ before, after }); return { ok: true, notes: 'ok' }; },
       },
-      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async (imageRef: string, region: { bbox: { x: number; y: number; width: number; height: number } }) => paintPatternBlue(imageRef, region), generateScene: async () => '' },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async (imageRef: string, region: { bbox: { x: number; y: number; width: number; height: number } }) => paintPatternBlue(imageRef, region), generateScene: async () => ({ image: '' }) },
     };
     const job = createJob('game', true);
-    await runGeneration(job, await solidPng(100, 80, [120, 120, 120]), 1, fake);
+    await runGeneration(job, { imageDataUrl: await solidPng(100, 80, [120, 120, 120]) }, 1, fake);
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     expect(seen).toHaveLength(1);
     // Crops are square context boxes, NOT the full 100x80 frame:
@@ -508,10 +508,10 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
         plan: async () => [], verify: async () => ({ ok: true, notes: 'ok' }),
         reviewDifferences: async (pairs: { index: number }[]) => { reviewCalls++; return pairs.map(p => ({ index: p.index, ok: true, description: 'A red square appeared', type: 'add object', notes: 'fake review ok' })); },
       },
-      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { cropEditCalls++; throw new Error('crop edit must not run when one-pass delivers'); }, editFullImage: editFull, generateScene: async () => '' },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { cropEditCalls++; throw new Error('crop edit must not run when one-pass delivers'); }, editFullImage: editFull, generateScene: async () => ({ image: '' }) },
     };
     const job = createJob('game', true);
-    await runGeneration(job, await solidPng(100, 80, [120, 120, 120]), 1, fake);
+    await runGeneration(job, { imageDataUrl: await solidPng(100, 80, [120, 120, 120]) }, 1, fake);
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     expect(fullImageCalls).toBe(1);
     expect(reviewCalls).toBe(1);

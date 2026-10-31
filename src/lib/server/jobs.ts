@@ -4,6 +4,7 @@ import { maskRasterToFrame } from '../engine/meta';
 import type { Providers, Mode, Difficulty, Difference, Region, PlannedChange } from '../engine/types';
 import { normalizeImage, cropDataUrl, expandBox, expandMask, diffMask, providerImage, clampBox, recolorCrop, squareContextBox, compositeMaskedEdit, estimateAlignment, alignEditedCrop, ALIGNMENT_MAX_RESIDUAL, cropColorStats, colorDeltaE, targetHueFromColor, cropDominantHue, transformObjectInPaste, duplicateObjectInPaste, extractOnePassComponents, compositeOnePassComponents, type OnePassComponent, type LocalTransformKind } from './imageOps';
 import { saveImageLevel } from '../serverStore';
+import { ThemeRejectedError } from '../engine/providers';
 import { persistJob, loadJob } from './db';
 
 export type JobStatus = 'queued' | 'running' | 'done' | 'failed';
@@ -16,6 +17,9 @@ export const MAX_MEASURED_AREA_FRACTION = 0.15;
 export interface Job {
   id: string; status: JobStatus; stage: string; mode: Mode; isMock: boolean;
   error?: string; levelId?: string; requestedChanges?: number; difficulty?: Difficulty; createdAt: number; updatedAt: number;
+  /** VF_THEME_GENERATION: the generated scene, exposed while the rest of the pipeline
+   *  runs so Play can preview it. In-memory only (not persisted with the job row). */
+  previewImage?: string;
 }
 const g = globalThis as unknown as { __vfJobs?: Map<string, Job> };
 if (!g.__vfJobs) g.__vfJobs = new Map();
@@ -42,7 +46,7 @@ export function createJob(mode: Mode, isMock: boolean, requestedChanges?: number
  * feathered composite -> REAL mask from pixel diff -> Spark verify (retry once, else needs_review).
  * Providers are injected so the whole loop is testable offline with fakes — no paid calls in tests.
  */
-export async function runGeneration(job: Job, imageDataUrl: string, count: number, providers: Providers): Promise<void> {
+export async function runGeneration(job: Job, input: { imageDataUrl?: string; theme?: string }, count: number, providers: Providers): Promise<void> {
   // Per-model call counters + per-stage wall time, printed in the final summary.
   const calls = { muse: 0, spark: 0, sam: 0 };
   const stageMs: Record<string, number> = {};
@@ -57,8 +61,27 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
   };
   try {
     job.status = 'running';
+    // VF_THEME_GENERATION: with a theme, the "original" is itself generated. Order is a
+    // hard rule: Spark text moderation FIRST (cheap, text-only) — the paid Muse Image
+    // generation call only happens after the theme passes. From the scene on, the
+    // pipeline is identical to the uploaded-photo path.
+    let sourceImage = input.imageDataUrl;
+    let theme: string | undefined; let revisedPrompt: string | undefined;
+    if (input.theme) {
+      theme = input.theme;
+      if (!providers.vision.moderateTheme) throw new Error('theme generation not supported by this provider (moderateTheme missing)');
+      setStage('moderating theme');
+      const themeMod = await providers.vision.moderateTheme(theme); calls.spark++;
+      if (!themeMod.ok) throw new ThemeRejectedError(themeMod.reason);
+      setStage('generating scene');
+      const scene = await providers.imageEdit.generateScene(theme); calls.muse++;
+      job.previewImage = scene.image;
+      revisedPrompt = scene.revisedPrompt;
+      sourceImage = scene.image;
+    }
+    if (!sourceImage) throw new Error('runGeneration requires imageDataUrl or theme');
     setStage('normalizing');
-    const img = await normalizeImage(imageDataUrl, 1024);
+    const img = await normalizeImage(sourceImage, 1024);
     const { width, height } = img;
     let current = img.dataUrl;
     const aiImg = await providerImage(img.dataUrl); // light JPEG twin for API calls (same dimensions)
@@ -443,10 +466,10 @@ export async function runGeneration(job: Job, imageDataUrl: string, count: numbe
     if (!differences.length) throw new Error('no change survived measurement/verification');
     logSummary(differences);
 
-    job.levelId = saveImageLevel({ differences, original: img.dataUrl, modified: current, width, height, isMock: providers.segmentation.isMock, mode: job.mode, jobId: job.id });
+    job.levelId = saveImageLevel({ differences, original: img.dataUrl, modified: current, width, height, isMock: providers.segmentation.isMock, mode: job.mode, jobId: job.id, theme, revisedPrompt });
     job.status = 'done'; setStage('done');
   } catch (e) {
-    job.status = 'failed'; job.error = e instanceof Error ? e.message : String(e); job.updatedAt = Date.now(); void persistJob(job); // keep job.stage = where it failed
+    job.status = 'failed'; job.error = e instanceof ThemeRejectedError ? 'theme_rejected' : (e instanceof Error ? e.message : String(e)); job.updatedAt = Date.now(); void persistJob(job); // keep job.stage = where it failed
     console.error(`[generate ${job.id}] FAILED at stage "${job.stage}":`, e);
   }
 }

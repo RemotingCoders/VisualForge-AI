@@ -42,6 +42,8 @@ export async function loadJob(id: string): Promise<(JobSnapshot & { levelId?: st
 export interface PersistLevelArgs {
   differences: Difference[]; original: string; modified: string;
   width: number; height: number; isMock: boolean; mode: Mode; jobId?: string;
+  /** VF_THEME_GENERATION: the user's theme and the prompt Muse Image actually used (needs migration 0003). */
+  theme?: string; revisedPrompt?: string;
 }
 
 /** Upload both images to Storage, insert image/level/difference rows. Returns nothing —
@@ -58,15 +60,22 @@ export async function persistImageLevel(levelId: string, args: PersistLevelArgs)
     const origPath = await upload('visualforge-originals', 'original', args.original);
     const modPath = await upload('visualforge-generated', 'modified', args.modified);
     const { data: origRow, error: e1 } = await sb.from('visualforge_images')
-      .insert({ storage_path: origPath, width: args.width, height: args.height, source: args.isMock ? 'mock' : 'upload' }).select('id').single();
+      .insert({ storage_path: origPath, width: args.width, height: args.height, source: args.theme ? 'generated' : (args.isMock ? 'mock' : 'upload') }).select('id').single();
     if (e1 || !origRow) throw e1 ?? new Error('original image row failed');
     const { data: modRow, error: e2 } = await sb.from('visualforge_images')
       .insert({ storage_path: modPath, width: args.width, height: args.height, source: 'generated' }).select('id').single();
     if (e2 || !modRow) throw e2 ?? new Error('modified image row failed');
-    const { error: e3 } = await sb.from('visualforge_levels').insert({
+    const levelRow = {
       id: levelId, job_id: args.jobId ?? null, original_image_id: origRow.id, modified_image_id: modRow.id,
       mode: args.mode, is_mock: args.isMock, published: true,
-    });
+    };
+    // The generated Database types predate migration 0003 (theme/revised_prompt):
+    // assert the pre-0003 row shape — the extra properties still travel at runtime,
+    // and a pre-0003 database errors the insert so we retry without them below.
+    const themedRow = { ...levelRow, theme: args.theme, revised_prompt: args.revisedPrompt ?? null } as typeof levelRow;
+    let e3 = (await sb.from('visualforge_levels').insert(args.theme ? themedRow : levelRow)).error;
+    if (e3 && args.theme) // pre-0003 database without theme columns — persist without them
+      e3 = (await sb.from('visualforge_levels').insert(levelRow)).error;
     if (e3) throw e3;
     if (args.differences.length) {
       const rows = args.differences.map(d => ({
@@ -116,13 +125,15 @@ export async function loadLevelPayload(levelId: string) {
     return {
       levelId, original: publicStorageUrl(orig.storage_path), modified: publicStorageUrl(mod.storage_path),
       width: orig.width, height: orig.height, total: count ?? 0, isMock: level.is_mock, mode: level.mode as Mode,
+      theme: (level as { theme?: string | null }).theme ?? undefined, revisedPrompt: (level as { revised_prompt?: string | null }).revised_prompt ?? undefined,
     };
   } catch (e) { console.error('[db] loadLevelPayload failed:', e); return null; }
 }
 
-/** Every real Meta call lands in visualforge_ai_calls (cost read from Meta dashboard; API returns none). */
-export async function logAiCall(model: string, operation: string, latencyMs: number, isMock = false): Promise<void> {
+/** Every real Meta call lands in visualforge_ai_calls. estimatedCostUsd: the API returns
+ *  no cost; only image generation has a known flat price ($0.01/image) — edits/vision stay 0. */
+export async function logAiCall(model: string, operation: string, latencyMs: number, isMock = false, estimatedCostUsd = 0): Promise<void> {
   const sb = getServiceClient(); if (!sb) return;
-  try { await sb.from('visualforge_ai_calls').insert({ model, operation, latency_ms: Math.round(latencyMs), is_mock: isMock }); }
+  try { await sb.from('visualforge_ai_calls').insert({ model, operation, latency_ms: Math.round(latencyMs), is_mock: isMock, estimated_cost_usd: estimatedCostUsd }); }
   catch (e) { console.error('[db] logAiCall failed:', e); }
 }
