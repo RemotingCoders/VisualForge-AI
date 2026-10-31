@@ -89,10 +89,11 @@ describe('runGeneration: hints call + visibility floor (fake providers)', () => 
     expect(hintCalls).toBe(1);
   });
 
-  it('medium visibility floor is a PRIORITY: the strong component ships first, the faint one may only fill', async () => {
+  it('medium visibility floor is a PRIORITY: the strong component ships first, the faint one is only held as last resort', async () => {
     // Fake Muse paints a STRONG red square (amp ~110, above the medium floor of 35)
-    // and a FAINT gray one (amp ~30, below it): with count=1 the strong one ships and
-    // the faint one — reviewed only as a filler candidate — is cut by the count cap.
+    // and a FAINT gray one (amp ~30, below it): with count=1 the strong one ships in
+    // the pass itself and the faint one is merely held — the count is already met,
+    // so the last-resort step never runs.
     const editFull = async (imageRef: string) => {
       const { data, width, height } = await rawPixels(imageRef);
       const out = Buffer.from(data);

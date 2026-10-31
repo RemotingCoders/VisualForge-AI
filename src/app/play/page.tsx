@@ -46,6 +46,7 @@ export default function Play() {
   const [accessCode, setAccessCode] = useState('');
   useEffect(() => { try { setAccessCode(localStorage.getItem('vf-access-code') ?? ''); } catch { /* private window */ } }, []);
   const fileRef = useRef<HTMLInputElement>(null);
+  const levelTopRef = useRef<HTMLHeadingElement>(null);
 
   const resetGame = (t: number) => { setTotal(t); setFound([]); setMistakes(0); setHints(0); setHintUsed({}); };
   /** Load an EXISTING level (gallery / share link): stored images only, generates nothing. */
@@ -72,13 +73,18 @@ export default function Play() {
     const lv = await res.json();
     if (lv.demo) { setMsg('❌ That level is no longer available — create your own above or pick one from the gallery.'); return; }
     setLevelId(lv.levelId); resetGame(lv.total); setRace(null); setRaceStart(null); setRaceHumanTime(null); setRaceMsg('');
-    setImg(lv); setMsg('✅ Level loaded — find all differences!');
+    setImg(lv); setMsg(''); // the "Level loaded" heading above the stats carries the message now
   };
   useEffect(() => {
     const shared = new URLSearchParams(location.search).get('level');
     if (shared) void loadById(shared);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  // When a level lands (gallery, share link or fresh generation), bring the
+  // "Level loaded" heading to the top of the viewport — NOT the page top.
+  useEffect(() => {
+    if (img && !busy) levelTopRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, [img, busy]);
 
   const onFile = (f: File | undefined | null) => {
     if (!f) return;
@@ -116,7 +122,7 @@ export default function Play() {
         setStep(finalStep);
         setLevelId(lv.levelId); resetGame(lv.total); finish();
         if (lv.demo) { setMsg('⚠️ Real generation is off right now — please play one of the levels in the gallery below.'); }
-        else { setImg(lv); setMsg('✅ Level ready — find all differences!'); }
+        else { setImg(lv); setMsg(''); } // heading above the stats announces the loaded level
         return;
       }
       await new Promise(r => setTimeout(r, 1000));
@@ -171,11 +177,17 @@ export default function Play() {
     <div className="relative w-full">
       {/* eslint-disable-next-line @next/next/no-img-element */}
       <img src={src} alt={alt} onClick={clickImg} className="w-full rounded-xl cursor-crosshair" />
-      {showAi && race?.findings.map((f, i) => (
-        <div key={i} className={`absolute border-[3px] border-fuchsia-400 pointer-events-none ${f.matched ? '' : 'border-dashed opacity-80'}`} style={{ left: `${f.bbox_normalized.x * 100}%`, top: `${f.bbox_normalized.y * 100}%`, width: `${f.bbox_normalized.width * 100}%`, height: `${f.bbox_normalized.height * 100}%` }}>
-          <span className="absolute left-0 -top-6 whitespace-nowrap bg-fuchsia-600 text-white text-[11px] font-bold px-1 rounded">🤖 {f.label}</span>
-        </div>
-      ))}
+      {showAi && race?.findings.map((f, i) => {
+        // Same scaling as the player's found circles below: diameter = max(w, h) × 1.15
+        // around the box center — Spark's raw boxes sit tight on the change and read tiny.
+        const d = Math.max(f.bbox_normalized.width, f.bbox_normalized.height) * 1.15;
+        const cx = f.bbox_normalized.x + f.bbox_normalized.width / 2;
+        const cy = f.bbox_normalized.y + f.bbox_normalized.height / 2;
+        return (
+        <div key={i} className={`absolute border-[3px] border-fuchsia-400 rounded-full aspect-square pointer-events-none ${f.matched ? '' : 'border-dashed opacity-80'}`} style={{ left: `${cx * 100}%`, top: `${cy * 100}%`, width: `${d * 100}%`, transform: 'translate(-50%, -50%)' }}>
+          <span className="absolute left-1/2 -translate-x-1/2 -top-6 whitespace-nowrap bg-fuchsia-600 text-white text-[11px] font-bold px-1 rounded">🤖 {f.label}</span>
+        </div>);
+      })}
       {img && found.map(f => {
         // Circle centered on the MEASURED center of the change (centroid), not the bbox corner box.
         const cx = f.centroid?.x ?? (f.bbox.x + f.bbox.width / 2);
@@ -240,12 +252,15 @@ export default function Play() {
       </div>
     </section>
 
+    {img && !busy && (
+      <h2 ref={levelTopRef} className="text-2xl md:text-3xl font-black mt-6">{done ? `🎉 Finished! Score ${scoreGame(found.length, total, mistakes, hints, elapsed, found.map(f => f.difficulty ?? 3))} · ${elapsed}s` : '✅ Level loaded — find the differences!'}</h2>
+    )}
     <div className="flex flex-wrap gap-3 my-5 text-sm"><span className="bg-white/10 px-3 py-1 rounded-full">Found {found.length}/{total}</span><span className="bg-white/10 px-3 py-1 rounded-full">Mistakes {mistakes}/5</span>
       <button className="bg-white/10 px-3 py-1 rounded-full" onClick={requestHint}>💡 Hint ({hints})</button>
       <button className="bg-fuchsia-600 px-3 py-1 rounded-full font-bold disabled:opacity-50" disabled={!levelId || raceBusy || busy} onClick={startRace}>🤖 Race against Spark</button>
       <label className="bg-white/10 px-2 py-1 rounded-full">Spark sees <select aria-label="Spark race mode" value={raceMode} onChange={e => setRaceMode(e.target.value as 'no-reference' | 'with-reference')} className="bg-transparent text-white"><option value="no-reference">modified only</option><option value="with-reference">both images</option></select></label>
       {typeof window !== 'undefined' && levelId && <button className="bg-white/10 px-3 py-1 rounded-full" onClick={() => navigator.clipboard?.writeText(`${location.origin}/play?level=${levelId}`)}>🔗 Share link</button>}</div>
-    <p aria-live="polite" className="font-semibold">{done ? `🎉 Finished! Score ${scoreGame(found.length, total, mistakes, hints, elapsed, found.map(f => f.difficulty ?? 3))} · ${elapsed}s` : msg}</p>
+    <p aria-live="polite" className="font-semibold">{done ? '' : msg}</p>
     {img?.theme && <p className="text-sm opacity-80 mt-1">🎨 Scene: “{img.revisedPrompt || img.theme}”</p>}
     {busy ? (
       <section aria-label="Generating level" className="mt-4 rounded-xl bg-white/5 border border-indigo-400/30 p-8 text-center overflow-hidden">
@@ -301,6 +316,6 @@ export default function Play() {
     )}
     <ul className="mt-4 text-sm">{found.map(f => <li key={f.id}>✅ {f.description}</li>)}</ul>
     {mistakes >= 5 && !done && <p className="text-red-300 font-bold mt-3">Out of mistakes — generate or load a new level to try again.</p>}
-    <Gallery mode="game" onPlay={id => { if (busy) { setMsg('⏳ Please wait for the current level to finish generating…'); return; } void loadById(id); window.scrollTo({ top: 0, behavior: 'smooth' }); }} />
+    <Gallery mode="game" onPlay={id => { if (busy) { setMsg('⏳ Please wait for the current level to finish generating…'); return; } void loadById(id); }} />
   </main>);
 }

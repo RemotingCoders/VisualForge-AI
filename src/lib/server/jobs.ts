@@ -189,6 +189,11 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     // Dedupe memory across ALL one-pass passes of this job: a change kept in pass 1
     // must not be re-kept as a phantom by the completion pass below (same text key).
     const seenChanges = new Map<string, number>();
+    // Below-visibility-floor one-pass components are HELD here instead of filling
+    // the count immediately: they become the very last resort, tried only after the
+    // crop path and its replacement plan (and, in game mode, the completion pass)
+    // are exhausted. Each entry keeps the aligned edited image its pixels come from.
+    const heldBelowFloor: { comp: OnePassComponent; aligned: string; fromPass: string }[] = [];
     const reviewMeasured = async (composed: string, measured: (Measured & { comp: OnePassComponent })[]): Promise<(Measured & { comp: OnePassComponent; description: string; type: string; notes: string })[]> => {
       if (!measured.length) return [];
       if (!providers.vision.reviewDifferences) {
@@ -221,6 +226,16 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       }
       return kept;
     };
+    type KeptMeasured = Measured & { comp: OnePassComponent; description: string; type: string; notes: string };
+    const pushKept = (kept: KeptMeasured[], tagOf: (k: KeptMeasured) => string): void => {
+      for (const k of kept) differences.push({
+        id: `onepass-${differences.length + 1}`, type: k.type, description: k.description, bbox: k.bbox, bbox_normalized: normalizeBBox(k.bbox, width, height),
+        segmentation: maskToPolygon(k.mask, width, height) ?? undefined,
+        area_px: k.mask.reduce((a, v) => a + (v ? 1 : 0), 0),
+        centroid: maskCentroid(k.mask, width, height) ?? { x: k.bbox.x + k.bbox.width / 2, y: k.bbox.y + k.bbox.height / 2 },
+        mask_url: null, severity: 'medium', verification_status: 'verified', verifier_notes: `${tagOf(k)}: ${k.notes}`,
+      });
+    };
     const runOnePassPass = async (passBase: string, want: number, label: string): Promise<string | null> => {
       if (!providers.imageEdit.editFullImage || want <= 0) return null;
       const prompt = job.mode === 'qc'
@@ -252,35 +267,50 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
         }
         return true;
       });
-      // Visibility floor BY JOB DIFFICULTY — a PRIORITY, not a gate. Components above
-      // the floor (minimum measured area as a fraction of the image + minimum mean
-      // per-pixel amplitude) go first, in score order; if they alone don't reach the
-      // requested count, below-floor components fill the remaining slots, also in
-      // score order and logged as such. A level short by one barely-sub-threshold
-      // difference (field case: amp 39.9 against a gate of 40) is worse than a
-      // slightly subtle one. Hard imposes no floor (subtle is the point).
+      // Visibility floor BY JOB DIFFICULTY — a PRIORITY, not a gate (easy 0.25 % of
+      // the image / amp 40, medium 0.12 % / 35, hard none: subtle is the point).
+      // Above-floor components are reviewed now, in score order. Below-floor ones
+      // are NO LONGER fillers: they are HELD BACK as the last resort, tried only
+      // after the crop path and its replacement plan are exhausted — a subtle
+      // one-pass leftover must never pre-empt a real crop candidate. On top of
+      // that, an ABSOLUTE floor rejects specks outright even if the level stays
+      // short: easy/medium area < 0.08 % of the image or mean amp < 30, hard
+      // 0.04 % / 25.
       const VISIBILITY_FLOOR: Record<Difficulty, { minAreaFraction: number; minAmp: number }> = {
         easy: { minAreaFraction: 0.0025, minAmp: 40 },
         medium: { minAreaFraction: 0.0012, minAmp: 35 },
         hard: { minAreaFraction: 0, minAmp: 0 },
       };
+      const ABSOLUTE_FLOOR: Record<Difficulty, { minAreaFraction: number; minAmp: number }> = {
+        easy: { minAreaFraction: 0.0008, minAmp: 30 },
+        medium: { minAreaFraction: 0.0008, minAmp: 30 },
+        hard: { minAreaFraction: 0.0004, minAmp: 25 },
+      };
       const floor = VISIBILITY_FLOOR[difficulty];
+      const absFloor = ABSOLUTE_FLOOR[difficulty];
       const aboveFloor: OnePassComponent[] = []; const belowFloor: OnePassComponent[] = [];
       for (const c of local) {
         const areaFraction = c.area / (width * height);
+        if (areaFraction < absFloor.minAreaFraction || c.meanAmp < absFloor.minAmp) {
+          console.info(`[generate ${job.id}] onepass ${label} component rejected BELOW the ABSOLUTE ${difficulty} floor: ${c.area}px amp ${c.meanAmp.toFixed(1)} bbox (${c.bbox.x},${c.bbox.y}) ${c.bbox.width}x${c.bbox.height} (area ${(areaFraction * 100).toFixed(3)}% vs ${(absFloor.minAreaFraction * 100).toFixed(2)}% · amp ${c.meanAmp.toFixed(1)} vs ${absFloor.minAmp})`);
+          continue;
+        }
         (areaFraction >= floor.minAreaFraction && c.meanAmp >= floor.minAmp ? aboveFloor : belowFloor).push(c);
       }
-      // Review up to 2 EXTRA candidates in the same single batched Spark call, so a
-      // rejection or a duplicate can be replaced from this very call — kept is capped
-      // at `want` below and the surplus never reaches the composed image.
-      const chosen = [...aboveFloor, ...belowFloor].slice(0, want + 2);
-      const belowSet = new Set(belowFloor);
-      const belowChosen = chosen.filter(c => belowSet.has(c));
-      for (const c of belowChosen) {
+      // Held, not chosen (deduped against the pool — a later pass re-extracts the
+      // same change and must not queue it twice).
+      let heldNow = 0;
+      for (const c of belowFloor) {
+        if (heldBelowFloor.some(h => overlaps(h.comp.bbox, c.bbox, 4))) continue;
+        heldBelowFloor.push({ comp: c, aligned, fromPass: label }); heldNow++;
         const areaFraction = c.area / (width * height);
-        console.info(`[generate ${job.id}] onepass ${label} component accepted BELOW the ${difficulty} visibility floor to complete the count: ${c.area}px amp ${c.meanAmp.toFixed(1)} bbox (${c.bbox.x},${c.bbox.y}) ${c.bbox.width}x${c.bbox.height} (area ${(areaFraction * 100).toFixed(2)}% vs ${(floor.minAreaFraction * 100).toFixed(2)}% · amp ${c.meanAmp.toFixed(1)} vs ${floor.minAmp})`);
+        console.info(`[generate ${job.id}] onepass ${label} component held BELOW the ${difficulty} visibility floor as last resort: ${c.area}px amp ${c.meanAmp.toFixed(1)} bbox (${c.bbox.x},${c.bbox.y}) ${c.bbox.width}x${c.bbox.height} (area ${(areaFraction * 100).toFixed(3)}% vs ${(floor.minAreaFraction * 100).toFixed(2)}% · amp ${c.meanAmp.toFixed(1)} vs ${floor.minAmp})`);
       }
-      console.info(`[generate ${job.id}] onepass ${label}: chose ${chosen.length}/${components.length} components (${aboveFloor.length} above the ${difficulty} visibility floor, ${belowChosen.length} below-floor fillers, ${local.length} local, not overlapping existing differences)`);
+      // Review up to 2 EXTRA above-floor candidates in the same single batched Spark
+      // call, so a rejection or a duplicate can be replaced from this very call —
+      // kept is capped at `want` below and the surplus never reaches the composed image.
+      const chosen = aboveFloor.slice(0, want + 2);
+      console.info(`[generate ${job.id}] onepass ${label}: chose ${chosen.length}/${components.length} components (${aboveFloor.length} above the ${difficulty} visibility floor, ${heldNow} held below-floor as last resort, ${local.length} local, not overlapping existing differences)`);
       if (!chosen.length) return null;
       let composed = await compositeOnePassComponents(passBase, aligned, chosen);
       let kept = await reviewMeasured(composed, await measureComposed(composed, chosen));
@@ -293,16 +323,46 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
         kept = remeasured.map(m => { const prev = kept.find(k => k.comp === m.comp)!; return { ...m, description: prev.description, type: prev.type, notes: prev.notes }; });
         if (!kept.length) return null;
       }
-      for (const k of kept) {
-        differences.push({
-          id: `onepass-${differences.length + 1}`, type: k.type, description: k.description, bbox: k.bbox, bbox_normalized: normalizeBBox(k.bbox, width, height),
-          segmentation: maskToPolygon(k.mask, width, height) ?? undefined,
-          area_px: k.mask.reduce((a, v) => a + (v ? 1 : 0), 0),
-          centroid: maskCentroid(k.mask, width, height) ?? { x: k.bbox.x + k.bbox.width / 2, y: k.bbox.y + k.bbox.height / 2 },
-          mask_url: null, severity: 'medium', verification_status: 'verified', verifier_notes: `one-pass ${label}: ${k.notes}`,
-        });
-      }
+      pushKept(kept, () => `one-pass ${label}`);
       return composed;
+    };
+
+    // ============ LAST RESORT: held below-floor one-pass components ============
+    // Only once the crop path + its replacement plan (and, in game mode, the
+    // completion one-pass) are exhausted: compose the held below-floor components
+    // (each already passed the ABSOLUTE floor when it was held) onto the current
+    // image, re-measure and run the same batched Spark review. If even this leaves
+    // the level short, the existing per-mode rule applies (game fails loudly; QC
+    // publishes partial with its notice).
+    const applyLastResort = async (): Promise<void> => {
+      const missing = count - differences.length;
+      if (missing <= 0) return;
+      const pool = heldBelowFloor.filter(h => !differences.some(d => overlaps(d.bbox, h.comp.bbox, 4))).slice(0, missing + 2);
+      if (!pool.length) { console.info(`[generate ${job.id}] last resort: no held below-floor components available — level stays at ${differences.length}/${count}`); return; }
+      setStage('one-pass: last-resort below-floor components');
+      console.info(`[generate ${job.id}] last resort: trying ${pool.length} held below-floor component(s) for the missing ${missing} (crop path, replacement plan and completion pass already exhausted)`);
+      const composeOntoCurrent = async (entries: { comp: OnePassComponent; aligned: string }[]): Promise<string> => {
+        let out = current;
+        const byAligned = new Map<string, OnePassComponent[]>();
+        for (const h of entries) byAligned.set(h.aligned, [...(byAligned.get(h.aligned) ?? []), h.comp]);
+        for (const [alignedImg, comps] of byAligned) out = await compositeOnePassComponents(out, alignedImg, comps);
+        return out;
+      };
+      let composed = await composeOntoCurrent(pool);
+      const comps = pool.map(h => h.comp);
+      let kept = await reviewMeasured(composed, await measureComposed(composed, comps));
+      if (kept.length > missing) kept = kept.slice(0, missing);
+      if (!kept.length) { console.info(`[generate ${job.id}] last resort: no held component survived review — level stays at ${differences.length}/${count}`); return; }
+      if (kept.length < comps.length) { // recompose without the Spark-rejected components, re-measure only (no second review)
+        const keptComps = new Set(kept.map(k => k.comp));
+        composed = await composeOntoCurrent(pool.filter(h => keptComps.has(h.comp)));
+        const remeasured = await measureComposed(composed, kept.map(k => k.comp));
+        kept = remeasured.map(m => { const prev = kept.find(k => k.comp === m.comp)!; return { ...m, description: prev.description, type: prev.type, notes: prev.notes }; });
+        if (!kept.length) return;
+      }
+      pushKept(kept, k => `one-pass ${pool.find(h => h.comp === k.comp)?.fromPass ?? '?'} below-floor last resort`);
+      current = composed;
+      console.info(`[generate ${job.id}] last resort delivered ${kept.length} below-floor difference(s) — now ${differences.length}/${count}`);
     };
 
     // One-pass runs FIRST in both modes (game's main path; QC's defect painter with its
@@ -611,6 +671,12 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       } catch (e) {
         console.info(`[generate ${job.id}] completion one-pass failed (${e instanceof Error ? e.message : String(e)})`);
       }
+    }
+    // Below-floor one-pass components are the LAST resort: only now, with the crop
+    // path, its replacement plan and (game) the completion pass all exhausted.
+    if (differences.length < count) {
+      try { await applyLastResort(); }
+      catch (e) { console.info(`[generate ${job.id}] last-resort below-floor step failed (${e instanceof Error ? e.message : String(e)}) — keeping the ${differences.length} difference(s) accepted so far`); }
     }
     if (job.mode === 'game' && differences.length) {
       const hasCrop = differences.some(d => !d.id.startsWith('onepass-'));

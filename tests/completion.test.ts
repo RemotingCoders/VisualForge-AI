@@ -88,12 +88,13 @@ describe('completion guarantee (fake providers)', () => {
     expect(getJob(job.id)?.levelId).toBeUndefined(); // no short level was published
   });
 
-  it('below-floor components FILL the count when nothing above the floor exists', async () => {
+  it('below-floor components are HELD and delivered only as the last resort (after crops + completion pass)', async () => {
     // A STRONG but TINY change: amp ~110 (way above the easy amp floor of 40) yet its
     // measured area (~0.1% of this 400x300 image) is below the easy area floor of
-    // 0.25%. (An amp-only case can't be built on a small canvas: extraction needs
-    // meanLp >= 25, which already implies amp close to the floor.) The floor is a
-    // priority, not a gate: the level still delivers its 1 difference.
+    // 0.25% — but above the easy ABSOLUTE floor (0.08% / amp 30), so it is held, not
+    // rejected. Nothing else can deliver (the crop candidate's edit throws, the
+    // completion pass re-extracts the same component), so the last-resort step —
+    // held below-floor components, tried only after every other path — ships it.
     const editFullImage = async (imageRef: string) => {
       const { data, width, height } = await rawPixels(imageRef);
       const out = Buffer.from(data);

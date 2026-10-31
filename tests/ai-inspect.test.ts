@@ -8,8 +8,9 @@ import { POST as aiInspectPOST } from '../src/app/api/ai-inspect/route';
 import type { Difference } from '../src/lib/engine/types';
 
 // Challenge the AI inspector (offline — MOCK/fake data only, no paid calls):
-// Spark findings are validated with the human click rule, the verdict compares
-// coverage then speed, detectability accumulates, and the route enforces the
+// Spark findings are validated with the box-overlap rule (16 px expansion /
+// either center inside), the verdict compares coverage then speed,
+// detectability accumulates, and the route enforces the
 // 10-challenges/hour/IP limit without any access code.
 
 const diff = (id: string, bbox: Difference['bbox'], over: Partial<Difference> = {}): Difference => ({
@@ -22,8 +23,8 @@ const box = (cx: number, cy: number, s = 0.02) => ({ x: cx - s / 2, y: cy - s / 
 const A = diff('A', { x: 100, y: 100, width: 100, height: 100 });
 const B = diff('B', { x: 600, y: 600, width: 80, height: 80 }, { type: 'dent', classifiedType: 'crack' });
 
-describe('validateAiFindings (same rule as validate-click)', () => {
-  it('matches centers inside the real bbox (incl. 16px tolerance), counts the rest as false positives', () => {
+describe('validateAiFindings (overlap rule: box expanded 16px overlaps, or either center inside)', () => {
+  it('matches boxes overlapping the real bbox (incl. 16px tolerance), counts the rest as false positives', () => {
     const r = validateAiFindings([
       { bbox_normalized: box(0.15, 0.15), label: 'scratch', confidence: 0.9 },   // center of A
       { bbox_normalized: box(0.9, 0.1), label: 'crack', confidence: 0.8 },       // empty corner -> FP
@@ -39,6 +40,19 @@ describe('validateAiFindings (same rule as validate-click)', () => {
   it('reports what Spark missed, with game descriptions as labels', () => {
     const r = validateAiFindings([{ bbox_normalized: box(0.15, 0.15), label: 'x', confidence: 1 }], [A, B], 1000, 1000, 'game');
     expect(r.missed).toEqual([{ id: 'B', label: 'desc B' }]);
+  });
+  it('counts a finding whose box overlaps the real one even when its center lands beyond the old tolerance (the logo case)', () => {
+    // Real A spans px 100–200; Spark's box (185,185,90,90) overlaps its corner but
+    // its center (230,230) sits 30px past A's edge — the old center rule missed it.
+    const r = validateAiFindings([
+      { bbox_normalized: { x: 0.185, y: 0.185, width: 0.09, height: 0.09 }, label: 'logo added', confidence: 0.9 },
+    ], [A], 1000, 1000, 'game');
+    expect(r.matchedIds).toEqual(['A']);
+    expect(r.falsePositives).toBe(0);
+    // Calibration: Spark box vs nearest real box + center distance are attached.
+    expect(r.findings[0].sparkBoxPx).toEqual({ x: 185, y: 185, width: 90, height: 90 });
+    expect(r.findings[0].nearestLabel).toBe('desc A');
+    expect(r.findings[0].centerDistancePx).toBe(113); // (230,230) vs A center (150,150)
   });
 });
 

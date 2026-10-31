@@ -55,6 +55,7 @@ export default function QC() {
    *  clock stops there even though Reveal may happen later. */
   const [finishedElapsed, setFinishedElapsed] = useState<number | null>(null);
   const imgRef = useRef<HTMLImageElement>(null); const sessionPosted = useRef(false);
+  const defectTopRef = useRef<HTMLHeadingElement>(null);
   /** Challenge the AI inspector: Spark races the trainee on this same level. The
    *  button restarts the human clock and fires /api/ai-inspect in parallel; Spark's
    *  boxes draw in fuchsia when they land, and the verdict compares coverage, then time. */
@@ -77,15 +78,16 @@ export default function QC() {
   /** Example QC levels from the gallery: already generated, inspectable by anyone
    *  without the access code (loading generates nothing). */
   const [qcGallery, setQcGallery] = useState<{ levelId: string; original: string; total: number }[]>([]);
+  const [qcGalleryLoading, setQcGalleryLoading] = useState(true);
   useEffect(() => {
-    void fetch('/api/gallery?mode=qc').then(r => r.json()).then(d => setQcGallery((d.levels ?? []).filter((l: { mode?: string }) => l.mode === 'qc'))).catch(() => { /* gallery is optional */ });
+    void fetch('/api/gallery?mode=qc').then(r => r.json()).then(d => setQcGallery((d.levels ?? []).filter((l: { mode?: string }) => l.mode === 'qc'))).catch(() => { /* gallery is optional */ }).finally(() => setQcGalleryLoading(false));
   }, []);
   const loadQcLevel = async (id: string) => {
     const res = await fetch(`/api/level?id=${encodeURIComponent(id)}`);
     if (!res.ok) { alert('That QC level could not be loaded.'); return; }
     const lv = await res.json();
     if (lv.demo || lv.mode !== 'qc') { alert('That is not a QC level.'); return; }
-    setReal(lv); window.scrollTo({ top: 0, behavior: 'smooth' });
+    setReal(lv); // the [real] effect below scrolls the "Find the defects" heading into view
   };
   /** Judge access code — same shared field as /play (remembered in localStorage). */
   const [accessCode, setAccessCode] = useState('');
@@ -96,6 +98,11 @@ export default function QC() {
     setRealFound([]); setRealFalsePos(0); setRealMisses([]); setRealRevealed(false); setRevealDiffs([]);
     setSessionMsg(''); sessionPosted.current = false; setStartedAt(Date.now()); setElapsed(0); setFinishedElapsed(null);
     setAiResult(null); setAiBusy(false); setAiMsg(''); setChallengeActive(false); setHumanFinal(null);
+  }, [real]);
+  // When a level lands in the trainer (generated or "Inspect this unit"), bring
+  // the "Find the defects" heading to the top of the viewport — NOT the page top.
+  useEffect(() => {
+    if (real) defectTopRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }, [real]);
   // Inspection timer: ticks while a real level is loaded, not yet completed or revealed.
   useEffect(() => {
@@ -273,6 +280,7 @@ export default function QC() {
         <p className="text-xs opacity-60 mt-4">This can take a few minutes. Keep this tab open.</p>
       </section>
       ) : real && (<div className="mt-4">
+        <h2 ref={defectTopRef} className="text-2xl md:text-3xl font-black mb-3">🔍 Find the defects!</h2>
         {real.notice && <p className="rounded bg-amber-500/20 border border-amber-400/40 text-amber-200 px-3 py-2 text-xs mb-3">⚠️ {real.notice} — this level ships with the defects that could be verified; inspect what is actually there.</p>}
         {real.theme && <p className="text-xs opacity-80 mb-3">🏭 Part created from your description: “{real.revisedPrompt || real.theme}”</p>}
         <div className="grid md:grid-cols-2 gap-5">
@@ -287,11 +295,17 @@ export default function QC() {
                 return (<div key={f.id} title={f.description} className="absolute rounded-full border-4 border-emerald-400 pointer-events-none" style={{ left: pct(c.x - f.bbox.width / 2, real.width), top: pct(c.y - f.bbox.height / 2, real.height), width: pct(f.bbox.width, real.width), height: pct(f.bbox.height, real.height) }} />);
               })}
               {!realRevealed && realMisses.map((m, i) => (<div key={i} className="absolute text-red-400 font-black pointer-events-none" style={{ left: `${m.x}%`, top: `${m.y}%`, transform: 'translate(-50%,-50%)' }}>✕</div>))}
-              {!realRevealed && aiResult?.findings.map((f, i) => (
-                <div key={i} className={`absolute border-[3px] border-fuchsia-400 pointer-events-none ${f.matched ? '' : 'border-dashed opacity-80'}`} style={{ left: `${f.bbox_normalized.x * 100}%`, top: `${f.bbox_normalized.y * 100}%`, width: `${f.bbox_normalized.width * 100}%`, height: `${f.bbox_normalized.height * 100}%` }}>
-                  <span className="absolute left-0 -top-6 whitespace-nowrap bg-fuchsia-600 text-white text-[11px] font-bold px-1 rounded">🤖 {f.label}{f.matched ? '' : ' ?'}</span>
-                </div>
-              ))}
+              {!realRevealed && aiResult?.findings.map((f, i) => {
+                // Same scaling as Play's circles: diameter = max(w, h) × 1.15 around the
+                // box center — Spark's raw boxes sit tight on the defect and read tiny.
+                const d = Math.max(f.bbox_normalized.width, f.bbox_normalized.height) * 1.15;
+                const cx = f.bbox_normalized.x + f.bbox_normalized.width / 2;
+                const cy = f.bbox_normalized.y + f.bbox_normalized.height / 2;
+                return (
+                <div key={i} className={`absolute border-[3px] border-fuchsia-400 rounded-full aspect-square pointer-events-none ${f.matched ? '' : 'border-dashed opacity-80'}`} style={{ left: `${cx * 100}%`, top: `${cy * 100}%`, width: `${d * 100}%`, transform: 'translate(-50%, -50%)' }}>
+                  <span className="absolute left-1/2 -translate-x-1/2 -top-6 whitespace-nowrap bg-fuchsia-600 text-white text-[11px] font-bold px-1 rounded">🤖 {f.label}{f.matched ? '' : ' ?'}</span>
+                </div>);
+              })}
               {realRevealed && revealDiffs.map(d => (
                 <div key={d.id} className="absolute border-[3px] border-red-500 pointer-events-none" style={{ left: pct(d.bbox.x, real.width), top: pct(d.bbox.y, real.height), width: pct(d.bbox.width, real.width), height: pct(d.bbox.height, real.height) }}>
                   <span className="absolute left-0 -top-6 whitespace-nowrap bg-red-500 text-white text-[11px] font-bold px-1 rounded">{d.type}{d.severity ? ` · sev ${d.severity}` : ''}</span>
@@ -339,9 +353,15 @@ export default function QC() {
         <p className="opacity-70 mt-2 text-xs">Exports include ONLY verified defects, labeled with the classified defect type, with the measured defect bbox (from the pixel-diff mask — not the edit crop). Defects classified with confidence under 60% are exported separately as needs_review. Clicks are validated by the server; the defect boxes stay server-side until you reveal. Synthetic data: validate before industrial use.</p>
       </div>)}
     </section>
-    {qcGallery.length > 0 && (
+    {(qcGalleryLoading || qcGallery.length > 0) && (
       <section className="mt-8 rounded bg-white/5 border border-white/10 p-4 text-sm">
         <h2 className="font-bold">🖼️ Example QC levels — no code needed</h2>
+        {qcGalleryLoading ? (
+          <div className="flex items-center gap-3 mt-4 text-sm opacity-80" role="status" aria-label="Loading gallery">
+            <span className="inline-block w-6 h-6 shrink-0 rounded-full border-[3px] border-white/20 border-t-indigo-400 animate-spin" aria-hidden="true" />
+            <span>Loading gallery…</span>
+          </div>
+        ) : (<>
         <p className="opacity-70 text-xs mt-1">Already generated and stored. Inspect one right away: find the defects, reveal &amp; score, export the dataset. Loading an example generates nothing.</p>
         <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mt-4">
           {qcGallery.map(l => (
@@ -355,6 +375,7 @@ export default function QC() {
             </div>
           ))}
         </div>
+        </>)}
       </section>
     )}
   </main>);

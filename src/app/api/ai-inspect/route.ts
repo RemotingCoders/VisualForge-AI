@@ -29,10 +29,12 @@ async function toProviderImage(ref: unknown): Promise<string | null> {
  *  inspector. ONE Muse Spark call inspects the level's target image (the
  *  defective/modified one; with-reference prepends the known-good original).
  *  The annotations NEVER leave the server: Spark's findings are validated here
- *  with the exact validate-click rule (finding center inside the real bbox,
- *  16 px tolerance), so human and AI play by identical rules. No access code —
- *  instead a per-IP limit of 10 challenges/hour (one Spark call each). Each
- *  challenge also accumulates per-difference Spark detectability (migration 0006). */
+ *  (finding box expanded 16 px overlapping an unclaimed real bbox, or the
+ *  center of either box inside the other; each difference claimable once,
+ *  duplicates count as false positives) and every finding is logged against
+ *  its nearest real box for calibration. No access code — instead a per-IP
+ *  limit of 10 challenges/hour (one Spark call each). Each challenge also
+ *  accumulates per-difference Spark detectability (migration 0006). */
 export async function POST(req: Request) {
   let body: { levelId?: string; mode?: string };
   try { body = await req.json(); } catch { return NextResponse.json({ error: 'invalid JSON' }, { status: 400 }); }
@@ -72,6 +74,13 @@ export async function POST(req: Request) {
   applyDetectability(diffs, validated.matchedIds, mode);
   void persistDetectability(levelId, diffs);
   console.info(`[ai-inspect] level=${levelId} kind=${kind} mode=${mode} latency=${(latencyMs / 1000).toFixed(1)}s findings=${validated.findings.length} matched=${validated.matchedIds.length}/${diffs.length} falsePositives=${validated.falsePositives}${providers.vision.isMock ? ' (MOCK provider — no real inspection)' : ''}`);
+  // Per-finding calibration: Spark's box vs its nearest real box + center
+  // distance — the data that tunes the 16 px overlap rule.
+  for (const f of validated.findings) {
+    const s = f.sparkBoxPx;
+    const n = f.nearestBoxPx;
+    console.info(`[ai-inspect] finding "${f.label}" conf=${(f.confidence ?? 0).toFixed(2)} spark=(${s.x},${s.y}) ${s.width}x${s.height} nearest="${f.nearestLabel ?? '—'}" real=${n ? `(${n.x},${n.y}) ${n.width}x${n.height}` : '—'} centerDist=${f.centerDistancePx ?? '—'}px → ${f.matched ? `MATCH "${f.truthLabel}"` : 'false positive'}`);
+  }
 
   return NextResponse.json({
     levelId, mode, kind, isMock: providers.vision.isMock,

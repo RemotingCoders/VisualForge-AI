@@ -17,7 +17,18 @@ export default function Gallery({ onPlay, mode }: { onPlay?: (levelId: string) =
       catch { setLevels([]); }
     })();
   }, [mode]);
-  if (!levels?.length) return null;
+  // Still fetching: say so (the stored originals can take a few seconds) instead
+  // of rendering nothing and making the page look gallery-less.
+  if (!levels) return (
+    <section className="mt-10" role="status" aria-label="Loading gallery">
+      <h2 className="font-bold text-xl">🖼️ Level gallery</h2>
+      <div className="flex items-center gap-3 mt-4 text-sm opacity-80">
+        <span className="inline-block w-6 h-6 shrink-0 rounded-full border-[3px] border-white/20 border-t-indigo-400 animate-spin" aria-hidden="true" />
+        <span>Loading gallery…</span>
+      </div>
+    </section>
+  );
+  if (!levels.length) return null;
   return (
     <section className="mt-10">
       <h2 className="font-bold text-xl">🖼️ Level gallery</h2>
