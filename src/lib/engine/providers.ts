@@ -92,8 +92,10 @@ export function anonymousUserId(env: Record<string, string | undefined> = proces
  * ThemeRejectedError. Flat $0.01/image. The scene brief demands >= 8 clearly separated
  * objects and forbids people/text so SAM + the planner get segmentable material.
  */
-export async function museImageGenerateScene(theme: string, env: Record<string, string | undefined> = process.env, fetchFn: FetchFn = fetch): Promise<GeneratedScene> {
-  const prompt = `A rich, detailed scene for a spot-the-difference game: ${theme}. Show at least 8 clearly separated, distinct objects, no people, no text, no watermark, static scene seen from a fixed camera.`;
+export async function museImageGenerateScene(theme: string, env: Record<string, string | undefined> = process.env, fetchFn: FetchFn = fetch, kind: 'scene' | 'part' = 'scene'): Promise<GeneratedScene> {
+  const prompt = kind === 'part'
+    ? `A photorealistic product photo of a single manufactured part for quality-control inspection: ${theme}. One part only, complete and centered, fully visible on a clean plain workbench or conveyor background, even studio lighting, sharp focus, realistic materials and surface detail, no people, no hands, no text, no watermark.`
+    : `A rich, detailed scene for a spot-the-difference game: ${theme}. Show at least 8 clearly separated, distinct objects, no people, no text, no watermark, static scene seen from a fixed camera.`;
   let res: unknown;
   try {
     res = await metaPost(META_ENDPOINTS.imageGenerations, {
@@ -402,9 +404,9 @@ class MetaProvider implements SegmentationProvider, VisionReasoningProvider, Ima
     // clause); adding the crop-mode guard suffix would contradict its instructions.
     return extractEditedImage(await museImageEdit(imageRef, prompt));
   }
-  async generateScene(theme: string): Promise<GeneratedScene> {
+  async generateScene(theme: string, kind: 'scene' | 'part' = 'scene'): Promise<GeneratedScene> {
     // VF_THEME_GENERATION: request shape verified in official docs (see museImageGenerateScene).
-    return museImageGenerateScene(theme);
+    return museImageGenerateScene(theme, process.env, fetch, kind);
   }
 }
 
@@ -454,7 +456,7 @@ export class MockProviders implements SegmentationProvider, VisionReasoningProvi
   }
   async editMaskedRegion(imageRef: string) { return imageRef; }
   async editFullImage(imageRef: string) { return imageRef; } // unchanged image -> one-pass finds 0 edits -> crop fallback
-  async generateScene(theme: string): Promise<GeneratedScene> { return { image: `mock-scene:${theme}`, revisedPrompt: `MOCK scene prompt for: ${theme}` }; }
+  async generateScene(theme: string, kind: 'scene' | 'part' = 'scene'): Promise<GeneratedScene> { return { image: `mock-scene:${theme}`, revisedPrompt: `MOCK ${kind} prompt for: ${theme}` }; }
 }
 
 export function selectProviders(env: Record<string, string | undefined> = process.env): { providers: Providers; label: string } {

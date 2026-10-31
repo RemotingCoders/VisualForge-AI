@@ -91,6 +91,8 @@ export interface ImageEditProvider {
   /** Full-image edit with the RAW prompt (no preservation-guard suffix — the one-pass prompt
    *  already carries its own "keep everything else pixel-identical" clause). One-pass mode. */
   editFullImage?(imageRef: string, prompt: string): Promise<string>;
-  generateScene(theme: string): Promise<GeneratedScene>;
+  /** kind 'scene' = spot-the-difference scene (Play theme); 'part' = a single
+   *  manufactured part photo (QC describe-a-part, no photo upload needed). */
+  generateScene(theme: string, kind?: 'scene' | 'part'): Promise<GeneratedScene>;
 }
 export interface Providers { segmentation: SegmentationProvider; vision: VisionReasoningProvider; imageEdit: ImageEditProvider }

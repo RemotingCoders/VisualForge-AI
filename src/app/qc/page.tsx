@@ -4,7 +4,7 @@ import { accuracy } from '@/lib/engine/geometry';
 import confetti from 'canvas-confetti';
 import { playFound, playMiss, playFanfare } from '@/lib/sounds';
 
-type RealLevel = { levelId: string; original: string; modified: string; width: number; height: number; total: number; isMock: boolean; notice?: string };
+type RealLevel = { levelId: string; original: string; modified: string; width: number; height: number; total: number; isMock: boolean; notice?: string; theme?: string; revisedPrompt?: string };
 
 /** Pipeline steps shown while generating (same processing animation as /play) —
  *  mapped from the server job stage strings, QC-flavored labels. */
@@ -17,15 +17,20 @@ const STEPS = [
   { label: 'Classifying defects', icon: '🏷️' },
   { label: 'Level ready', icon: '🎉' },
 ];
-function stageToStep(stage: string, status: string): number {
-  if (status === 'done') return STEPS.length - 1;
+/** Describe-a-part prepends one step: the part photo itself is created first. */
+const PART_STEP = { label: 'Creating your part photo', icon: '🏭' };
+function stageToStep(stage: string, status: string, withPart = false): number {
+  if (status === 'done') return withPart ? STEPS.length : STEPS.length - 1;
   const s = stage.toLowerCase();
-  if (s.includes('classif')) return 5;
-  if (s.includes('verif') || s.includes('measur') || s.includes('review') || s.includes('compos')) return 4;
-  if (s.includes('edit') || s.includes('one-pass') || s.includes('extract')) return 3;
-  if (s.includes('plan')) return 2;
-  if (s.includes('segment')) return 1;
-  return 0; // queued / creating / normalizing / moderating
+  if (withPart && (s.includes('generating scene') || s.includes('moderating theme'))) return 0;
+  let base: number;
+  if (s.includes('classif')) base = 5;
+  else if (s.includes('verif') || s.includes('measur') || s.includes('review') || s.includes('compos')) base = 4;
+  else if (s.includes('edit') || s.includes('one-pass') || s.includes('extract')) base = 3;
+  else if (s.includes('plan')) base = 2;
+  else if (s.includes('segment')) base = 1;
+  else base = 0; // queued / creating / normalizing / moderating
+  return withPart ? base + 1 : base;
 }
 type FoundDiff = { id: string; description: string; bbox: { x: number; y: number; width: number; height: number }; centroid: { x: number; y: number } | null };
 type RevealDiff = { id: string; type: string; plannedType: string; label: string; severity: number | null; confidence: number | null; needsReview: boolean; bbox: { x: number; y: number; width: number; height: number }; centroid: { x: number; y: number } | null };
@@ -35,6 +40,10 @@ export default function QC() {
   const [photo, setPhoto] = useState(''); const [photoName, setPhotoName] = useState(''); const [count, setCount] = useState(2); const [job, setJob] = useState(''); const [real, setReal] = useState<RealLevel | null>(null);
   const [dragOver, setDragOver] = useState(false); const [fileMsg, setFileMsg] = useState(''); const fileRef = useRef<HTMLInputElement>(null);
   const [step, setStep] = useState(0); const [jobElapsed, setJobElapsed] = useState(0);
+  /** Describe-a-part (same theme path as Play, QC prompt): no photo needed — the
+   *  part photo itself is generated, then defects are added to it. */
+  const [partText, setPartText] = useState(''); const [partUsed, setPartUsed] = useState(false); const [previewImage, setPreviewImage] = useState('');
+  const steps = partUsed ? [PART_STEP, ...STEPS] : STEPS;
   // --- Real-level trainer state (separate from the MOCK scene trainer below) ---
   const [realFound, setRealFound] = useState<FoundDiff[]>([]); const [realFalsePos, setRealFalsePos] = useState(0);
   const [realMisses, setRealMisses] = useState<{ x: number; y: number }[]>([]); const [realRevealed, setRealRevealed] = useState(false);
@@ -134,8 +143,10 @@ export default function QC() {
   const onDrop = (e: React.DragEvent) => { e.preventDefault(); setDragOver(false); onFile(e.dataTransfer.files?.[0]); };
   /** Real QC path: photo -> async generation job (mode 'qc') -> level -> trainer + COCO/YOLO export of that level. */
   const generateReal = async () => {
-    setJob('creating job…'); setStep(0); setJobElapsed(0);
-    const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ imageDataUrl: photo || undefined, count, mode: 'qc', accessCode: accessCode || undefined }) });
+    // A part description replaces the photo entirely: the part photo gets generated first.
+    const usingPart = partText.trim().length > 0;
+    setJob('creating job…'); setStep(0); setJobElapsed(0); setPartUsed(usingPart); setPreviewImage('');
+    const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(usingPart ? { theme: partText.trim(), count, mode: 'qc', accessCode: accessCode || undefined } : { imageDataUrl: photo || undefined, count, mode: 'qc', accessCode: accessCode || undefined }) });
     const data = await res.json();
     if (res.status === 401) { setJob(''); alert('Generating new levels needs the access code provided in the hackathon submission. You can still inspect the example QC levels in the gallery below.'); return; }
     if (!res.ok) { setJob(''); alert(data.error ?? 'generation failed'); return; }
@@ -144,18 +155,22 @@ export default function QC() {
       const s = await (await fetch(`/api/generate?id=${data.jobId}`)).json();
       setJob(`job ${s.status}${s.stage ? ` · ${s.stage}` : ''} · ${s.elapsedSec ?? '?'}s elapsed (each AI call takes 3-60s)`);
       setJobElapsed(Number(s.elapsedSec ?? 0));
-      setStep(prev => Math.max(prev, stageToStep(String(s.stage ?? ''), String(s.status ?? '')))); // monotonic: editing/verifying alternate per defect
-      if (s.status === 'failed') { setJob(''); alert(`Generation failed at stage "${s.stage}": ${s.error ?? 'unknown error'}`); return; }
-      if (s.status === 'done' && s.level && !s.level.demo) { setStep(STEPS.length - 1); setReal(s.level); setJob(''); return; }
+      if (s.previewImage) setPreviewImage(String(s.previewImage));
+      setStep(prev => Math.max(prev, stageToStep(String(s.stage ?? ''), String(s.status ?? ''), usingPart))); // monotonic: editing/verifying alternate per defect
+      if (s.status === 'failed') { setJob(''); alert(s.error === 'theme_rejected' ? 'Your part description was rejected by moderation — try describing a different part.' : `Generation failed at stage "${s.stage}": ${s.error ?? 'unknown error'}`); return; }
+      if (s.status === 'done' && s.level && !s.level.demo) { setStep(stageToStep('', 'done', usingPart)); setReal(s.level); setJob(''); return; }
       await new Promise(r => setTimeout(r, 1000));
     }
     setJob(''); alert('Generation timed out after 10 minutes — check Meta dashboard usage before retrying.');
   };
   const pct = (v: number, total: number) => `${(v / total) * 100}%`;
   return (<main className="max-w-5xl mx-auto px-5 py-8 font-mono">
-    <h1 className="text-3xl font-black">🏭 QC Inspection Trainer</h1><p className="opacity-70 mt-2 text-sm">Industrial mode · synthetic defects — validate before industrial use · generate a real defect level from your own photo, inspect the defective unit, then reveal &amp; score. Or start right away with a ready-made example from the gallery below — no code needed.</p>
+    <h1 className="text-3xl font-black">🏭 QC Inspection Trainer</h1><p className="opacity-70 mt-2 text-sm">Industrial mode · synthetic defects — validate before industrial use · generate a real defect level from your own photo — or just describe a part and we create its photo — inspect the defective unit, then reveal &amp; score. Or start right away with a ready-made example from the gallery below — no code needed.</p>
     <section className="mt-5 rounded bg-white/5 border border-white/10 p-4 text-sm">
-      <h2 className="font-bold">📸 Real QC level from a photo</h2>
+      <h2 className="font-bold">📸 Real QC level — from a photo or a description</h2>
+      <div className="grid md:grid-cols-2 gap-4">
+      <div>
+      <h3 className="font-bold text-sm mt-3">📷 Upload a product photo</h3>
       {/* Drag & drop zone — same pattern as /play: also clickable to open the file picker. */}
       <div
         role="button" tabIndex={0} aria-label="Drop a product photo here or click to choose a file"
@@ -186,9 +201,16 @@ export default function QC() {
         )}
       </div>
       {fileMsg && <p className="text-red-300 text-xs mt-2">{fileMsg}</p>}
+      </div>
+      <div>
+        <h3 className="font-bold text-sm mt-3">✍️ Or describe a part</h3>
+        <textarea aria-label="Describe a part" maxLength={200} rows={5} value={partText} onChange={e => setPartText(e.target.value)} placeholder="a steel flange with six bolt holes on a workbench" className="mt-2 w-full min-h-36 bg-white/10 px-3 py-2 rounded-lg text-white placeholder:text-white/40 resize-none" />
+        <p className="text-xs opacity-60 mt-2">No photo handy? We create the part photo for you, then add the verified defects to it. If you describe a part, the uploaded photo is not used.</p>
+      </div>
+      </div>
       <div className="flex flex-wrap items-center gap-3 mt-3">
         <label>Defects <select aria-label="Number of defects" value={count} onChange={e => setCount(Number(e.target.value))} className="bg-white/10 px-2 py-2 rounded text-white">{[1, 2, 3, 4, 5].map(n => <option key={n} value={n}>{n}</option>)}</select></label>
-        <button className="bg-indigo-500 font-bold px-4 py-2 rounded disabled:opacity-50" disabled={!!job || !photo} onClick={generateReal}>{job ? '⏳ Generating…' : '⚙️ Generate QC level'}</button>
+        <button className="bg-indigo-500 font-bold px-4 py-2 rounded disabled:opacity-50" disabled={!!job || (!photo && !partText.trim())} onClick={generateReal}>{job ? '⏳ Generating…' : '⚙️ Generate QC level'}</button>
         <label>Judge access code <input type="password" aria-label="Judge access code" value={accessCode} onChange={e => { setAccessCode(e.target.value); try { localStorage.setItem('vf-access-code', e.target.value); } catch { /* private window */ } }} placeholder="for judges" className="bg-white/10 px-2 py-2 rounded text-white w-36" /></label>
         {job && <span className="opacity-80">{job}</span>}
       </div>
@@ -199,35 +221,36 @@ export default function QC() {
           <div className="absolute inset-0 rounded-full border-8 border-white/10 border-t-indigo-400 animate-spin" />
           <div className="absolute inset-4 rounded-full border-4 border-dashed border-cyan-400/60 animate-[spin_7s_linear_infinite_reverse]" />
           <div className="absolute inset-9 rounded-full border-4 border-white/10 border-b-fuchsia-400 animate-[spin_3s_linear_infinite]" />
-          <div className="absolute inset-0 flex items-center justify-center text-5xl animate-pulse">{STEPS[step]?.icon}</div>
+          <div className="absolute inset-0 flex items-center justify-center text-5xl animate-pulse">{steps[step]?.icon}</div>
         </div>
         <h2 className="text-2xl font-black mt-6">Creating your QC level…</h2>
-        <p className="opacity-80 mt-1">{STEPS[step]?.label} · {jobElapsed}s elapsed</p>
-        {photo && (
+        <p className="opacity-80 mt-1">{steps[step]?.label} · {jobElapsed}s elapsed</p>
+        {(previewImage || photo) && (
           <figure className="mt-6 max-w-md mx-auto">
             {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img src={photo} alt="Your product photo being inspected" className="w-full rounded-xl border border-white/20" />
-            <figcaption className="text-xs opacity-70 mt-2">Your unit is being processed — the defective unit will appear here…</figcaption>
+            <img src={previewImage || photo} alt="Your product photo being inspected" className="w-full rounded-xl border border-white/20" />
+            <figcaption className="text-xs opacity-70 mt-2">{previewImage ? 'Your part photo is ready — adding the defects…' : 'Your unit is being processed — the defective unit will appear here…'}</figcaption>
           </figure>
         )}
         {/* Stepper: done = green check, current = pulsing, pending = dim */}
         <ol className="flex flex-wrap justify-center gap-x-2 gap-y-3 mt-7 max-w-2xl mx-auto">
-          {STEPS.map((s, i) => (
+          {steps.map((s, i) => (
             <li key={s.label} className="flex items-center gap-2">
               <span className={`flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1.5 rounded-full border ${i < step ? 'bg-green-500/20 border-green-400/50 text-green-300' : i === step ? 'bg-indigo-500/25 border-indigo-400 text-white animate-pulse' : 'bg-white/5 border-white/10 opacity-45'}`}>
                 {i < step ? '✓' : s.icon} <span className="hidden sm:inline">{s.label}</span>
               </span>
-              {i < STEPS.length - 1 && <span className={`w-3 h-0.5 ${i < step ? 'bg-green-400/60' : 'bg-white/15'}`} />}
+              {i < steps.length - 1 && <span className={`w-3 h-0.5 ${i < step ? 'bg-green-400/60' : 'bg-white/15'}`} />}
             </li>
           ))}
         </ol>
         <div className="h-2 rounded-full bg-white/10 mt-7 max-w-xl mx-auto overflow-hidden">
-          <div className="h-full rounded-full bg-gradient-to-r from-indigo-400 via-cyan-400 to-fuchsia-400 transition-all duration-700" style={{ width: `${Math.round(((step + 1) / STEPS.length) * 100)}%` }} />
+          <div className="h-full rounded-full bg-gradient-to-r from-indigo-400 via-cyan-400 to-fuchsia-400 transition-all duration-700" style={{ width: `${Math.round(((step + 1) / steps.length) * 100)}%` }} />
         </div>
         <p className="text-xs opacity-60 mt-4">This can take a few minutes. Keep this tab open.</p>
       </section>
       ) : real && (<div className="mt-4">
         {real.notice && <p className="rounded bg-amber-500/20 border border-amber-400/40 text-amber-200 px-3 py-2 text-xs mb-3">⚠️ {real.notice} — this level ships with the defects that could be verified; inspect what is actually there.</p>}
+        {real.theme && <p className="text-xs opacity-80 mb-3">🏭 Part created from your description: “{real.revisedPrompt || real.theme}”</p>}
         <div className="grid md:grid-cols-2 gap-5">
           <div><h3 className="font-bold mb-2">Reference (known-good)</h3>{/* eslint-disable-next-line @next/next/no-img-element */}<img src={real.original} alt="Original product" className="w-full rounded bg-slate-900" /></div>
           <div>

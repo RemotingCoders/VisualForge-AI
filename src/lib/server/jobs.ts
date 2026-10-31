@@ -74,7 +74,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       const themeMod = await providers.vision.moderateTheme(theme); calls.spark++;
       if (!themeMod.ok) throw new ThemeRejectedError(themeMod.reason);
       setStage('generating scene');
-      const scene = await providers.imageEdit.generateScene(theme); calls.muse++;
+      const scene = await providers.imageEdit.generateScene(theme, job.mode === 'qc' ? 'part' : 'scene'); calls.muse++;
       const sceneInfo = await imageInfo(scene.image).catch(() => null);
       console.info(`[generate ${job.id}] scene generated: resolution ${sceneInfo ? `${sceneInfo.width}x${sceneInfo.height}` : 'unknown'} · revised_prompt="${scene.revisedPrompt ?? ''}"${scene.revisedPrompt ? '' : ' (empty — using the user theme as-is)'}`);
       job.previewImage = scene.image;

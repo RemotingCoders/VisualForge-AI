@@ -44,6 +44,17 @@ describe('museImageGenerateScene (stub fetch, offline)', () => {
     expect(scene.revisedPrompt).toBe('a red fox in an autumn garden');
   });
 
+  it('kind "part" (QC describe-a-part) asks for ONE part photo, not a game scene', async () => {
+    const { calls, fetchFn } = captureFetch(() => ({ ok: true, status: 200, json: { data: [{ b64_json: 'QUJD' }], output_format: 'webp' } }));
+    await museImageGenerateScene('una brida de acero con seis agujeros', env, fetchFn, 'part');
+    const p = String(calls[0].body.prompt);
+    expect(p).toContain('una brida de acero con seis agujeros');
+    expect(p).toContain('single manufactured part');
+    expect(p).toContain('One part only');
+    expect(p).not.toContain('spot-the-difference');
+    expect(p).not.toContain('at least 8');
+  });
+
   it('honors VF_SCENE_REASONING and keeps the anonymous user id stable per key', async () => {
     const { calls, fetchFn } = captureFetch(() => ({ ok: true, status: 200, json: { data: [{ b64_json: 'QUJD' }], output_format: 'png' } }));
     const scene = await museImageGenerateScene('una playa al atardecer', { ...env, VF_SCENE_REASONING: 'low' }, fetchFn);
