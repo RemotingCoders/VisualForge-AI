@@ -4,6 +4,7 @@ import { accuracy } from '@/lib/engine/geometry';
 import { challengeVerdict } from '@/lib/aiInspect';
 import confetti from 'canvas-confetti';
 import { playFound, playMiss, playFanfare } from '@/lib/sounds';
+import { useVoiceDictation } from '@/lib/useVoiceDictation';
 
 type RealLevel = { levelId: string; original: string; modified: string; width: number; height: number; total: number; isMock: boolean; notice?: string; theme?: string; revisedPrompt?: string };
 
@@ -92,6 +93,22 @@ export default function QC() {
   /** Judge access code — same shared field as /play (remembered in localStorage). */
   const [accessCode, setAccessCode] = useState('');
   useEffect(() => { try { setAccessCode(localStorage.getItem('vf-access-code') ?? ''); } catch { /* private window */ } }, []);
+  /** Voice dictation → Spark tidy-up (same flow as /play's theme box): when dictation
+   *  stops, the part description is moderated ONCE (themeCheck) and Spark's tidied
+   *  rewrite is offered as "Spark suggests"; the one-time ticket then travels with
+   *  Generate so the job reuses that moderation. Manual typing clears both. */
+  const [partSuggestion, setPartSuggestion] = useState<string | null>(null);
+  const partTicketRef = useRef<string | null>(null);
+  const checkDictatedPart = async (text: string) => {
+    const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ theme: text, themeCheck: true, mode: 'qc', accessCode: accessCode || undefined }) }).catch(() => null);
+    const data = await res?.json().catch(() => null);
+    if (!res?.ok || !data) return; // dictation still worked; generation moderates in-job
+    if (data.ok === false) { partTicketRef.current = null; setPartSuggestion(null); alert('Your part description was rejected by moderation — try describing a different part.'); return; }
+    partTicketRef.current = typeof data.themeTicket === 'string' ? data.themeTicket : null;
+    const clean = typeof data.cleanTheme === 'string' ? data.cleanTheme.trim() : '';
+    setPartSuggestion(clean && clean !== text.trim() ? clean : null);
+  };
+  const partVoice = useVoiceDictation(partText, t => setPartText(t), t => { void checkDictatedPart(t); });
   // A fresh real level resets the trainer, starts the clock and folds the MOCK demo away.
   useEffect(() => {
     if (!real) return;
@@ -177,7 +194,7 @@ export default function QC() {
     // A part description replaces the photo entirely: the part photo gets generated first.
     const usingPart = partText.trim().length > 0;
     setJob('creating job…'); setStep(0); setJobElapsed(0); setPartUsed(usingPart); setPreviewImage('');
-    const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(usingPart ? { theme: partText.trim(), count, mode: 'qc', accessCode: accessCode || undefined } : { imageDataUrl: photo || undefined, count, mode: 'qc', accessCode: accessCode || undefined }) });
+    const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(usingPart ? { theme: partText.trim(), themeTicket: partTicketRef.current ?? undefined, count, mode: 'qc', accessCode: accessCode || undefined } : { imageDataUrl: photo || undefined, count, mode: 'qc', accessCode: accessCode || undefined }) });
     const data = await res.json();
     if (res.status === 401) { setJob(''); alert('Generating new levels needs the access code provided in the hackathon submission. You can still inspect the example QC levels in the gallery below.'); return; }
     if (!res.ok) { setJob(''); alert(data.error ?? 'generation failed'); return; }
@@ -211,7 +228,7 @@ export default function QC() {
         onDragEnter={e => { e.preventDefault(); setDragOver(true); }}
         onDragLeave={() => setDragOver(false)}
         onDrop={onDrop}
-        className={`mt-3 rounded border-2 border-dashed px-4 py-6 text-center cursor-pointer transition-all ${dragOver ? 'border-indigo-400 bg-indigo-500/20' : 'border-white/25 bg-white/5 hover:border-indigo-400/70 hover:bg-white/10'}`}
+        className={`mt-3 h-36 flex flex-col items-center justify-center rounded border-2 border-dashed px-4 text-center cursor-pointer transition-all ${dragOver ? 'border-indigo-400 bg-indigo-500/20' : 'border-white/25 bg-white/5 hover:border-indigo-400/70 hover:bg-white/10'}`}
       >
         <input ref={fileRef} type="file" accept="image/*" aria-label="Upload a product photo" onChange={e => { onFile(e.target.files?.[0]); e.target.value = ''; }} className="hidden" />
         {photo ? (
@@ -235,8 +252,21 @@ export default function QC() {
       </div>
       <div>
         <h3 className="font-bold text-sm mt-3">✍️ Or describe a part</h3>
-        <textarea aria-label="Describe a part" maxLength={200} rows={5} value={partText} onChange={e => setPartText(e.target.value)} placeholder="a steel flange with six bolt holes on a workbench" className="mt-2 w-full min-h-36 bg-white/10 px-3 py-2 rounded-lg text-white placeholder:text-white/40 resize-none" />
+        <div className="relative mt-2">
+          <textarea aria-label="Describe a part" maxLength={200} rows={5} value={partText} onChange={e => { setPartText(e.target.value); setPartSuggestion(null); partTicketRef.current = null; }} placeholder="a steel flange with six bolt holes on a workbench" className="w-full min-h-36 bg-white/10 px-3 py-2 rounded-lg text-white placeholder:text-white/40 resize-none" />
+          {partVoice.supported && (
+            <button type="button" onClick={partVoice.toggle} aria-pressed={partVoice.listening} aria-label={partVoice.listening ? 'Stop voice input' : 'Dictate the part description with your voice'} className={`absolute right-2 bottom-2 rounded-full px-3 py-1.5 text-sm font-bold ${partVoice.listening ? 'bg-red-500 animate-pulse' : 'bg-white/15 hover:bg-white/25'}`}>{partVoice.listening ? '⏺ Listening…' : '🎤 Voice'}</button>
+          )}
+        </div>
+        {partVoice.listening && <p className="text-xs text-red-300 mt-1" role="status">🎙️ Listening… speak now — dictation stops after 3 s of silence, or tap the button again.</p>}
+        {partSuggestion && (
+          <p className="text-sm mt-2 bg-indigo-500/15 border border-indigo-400/30 rounded-lg px-3 py-2">✨ Spark suggests: “{partSuggestion}”{' '}
+            <button type="button" className="bg-indigo-500 px-2 py-0.5 rounded-full text-xs font-bold" onClick={() => { setPartText(partSuggestion); setPartSuggestion(null); }}>Use this</button>{' '}
+            <button type="button" className="bg-white/10 px-2 py-0.5 rounded-full text-xs" onClick={() => setPartSuggestion(null)}>Keep mine</button>
+          </p>
+        )}
         <p className="text-xs opacity-60 mt-2">No photo handy? We create the part photo for you, then add the verified defects to it. If you describe a part, the uploaded photo is not used.</p>
+        {partVoice.supported && <p className="text-xs opacity-60 mt-1">Voice input uses your browser’s speech recognition. Muse Spark reviews and tidies the part description.</p>}
       </div>
       </div>
       <div className="flex flex-wrap items-center gap-3 mt-3">

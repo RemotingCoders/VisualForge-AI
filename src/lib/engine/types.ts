@@ -76,8 +76,9 @@ export interface VisionReasoningProvider {
   moderate(imageRef: string): Promise<{ ok: boolean; reason: string }>;
   /** Text-only theme moderation (VF_THEME_GENERATION): Spark judges the theme BEFORE any
    *  paid image generation. Optional like reviewDifferences — the theme path fails loudly
-   *  when a provider does not implement it. */
-  moderateTheme?(text: string): Promise<{ ok: boolean; reason: string }>;
+   *  when a provider does not implement it. cleanTheme: the same call's tidied rewrite of
+   *  the theme (voice-dictation "Spark suggests"); providers may omit it. */
+  moderateTheme?(text: string): Promise<{ ok: boolean; reason: string; cleanTheme?: string }>;
   plan(imageRef: string, regions: Region[], mode: Mode, count: number, difficulty?: Difficulty): Promise<PlannedChange[]>;
   verify(imageRef: string, modifiedRef: string, change: PlannedChange, measured: BBox): Promise<{ ok: boolean; notes: string }>;
   /** ONE call reviewing N crop pairs (before/after interleaved in `pairs` order). Used by one-pass mode. */

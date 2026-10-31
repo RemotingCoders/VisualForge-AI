@@ -46,7 +46,7 @@ export function createJob(mode: Mode, isMock: boolean, requestedChanges?: number
  * feathered composite -> REAL mask from pixel diff -> Spark verify (retry once, else needs_review).
  * Providers are injected so the whole loop is testable offline with fakes — no paid calls in tests.
  */
-export async function runGeneration(job: Job, input: { imageDataUrl?: string; theme?: string }, count: number, providers: Providers): Promise<void> {
+export async function runGeneration(job: Job, input: { imageDataUrl?: string; theme?: string; themePreModerated?: boolean }, count: number, providers: Providers): Promise<void> {
   // Per-model call counters + per-stage wall time, printed in the final summary.
   const calls = { muse: 0, spark: 0, sam: 0 };
   const stageMs: Record<string, number> = {};
@@ -70,9 +70,16 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     if (input.theme) {
       theme = input.theme;
       if (!providers.vision.moderateTheme) throw new Error('theme generation not supported by this provider (moderateTheme missing)');
-      setStage('moderating theme');
-      const themeMod = await providers.vision.moderateTheme(theme); calls.spark++;
-      if (!themeMod.ok) throw new ThemeRejectedError(themeMod.reason);
+      if (input.themePreModerated) {
+        // The dictation pre-check already ran this exact text through Spark (one-time
+        // ticket consumed by /api/generate) — re-moderating would be a second call.
+        console.info(`[generate ${job.id}] theme already moderated by the dictation pre-check — no duplicate moderation call`);
+      } else {
+        setStage('moderating theme');
+        const themeMod = await providers.vision.moderateTheme(theme); calls.spark++;
+        if (!themeMod.ok) throw new ThemeRejectedError(themeMod.reason);
+        if (themeMod.cleanTheme && themeMod.cleanTheme !== theme) console.info(`[generate ${job.id}] theme moderation cleanTheme="${themeMod.cleanTheme}" (generation uses the submitted text)`);
+      }
       setStage('generating scene');
       const scene = await providers.imageEdit.generateScene(theme, job.mode === 'qc' ? 'part' : 'scene'); calls.muse++;
       const sceneInfo = await imageInfo(scene.image).catch(() => null);

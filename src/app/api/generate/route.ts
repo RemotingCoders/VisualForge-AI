@@ -7,6 +7,7 @@ import { persistJob, loadLevelPayload, countJobsToday } from '@/lib/server/db';
 import { accessCodeOk, accessCodeRequired, clientIp } from '@/lib/server/access';
 import { hitGenerationRateLimit, RATE_LIMIT_MAX } from '@/lib/server/rateLimit';
 import { createDemoLevel, getLevelPayload, getDemoPayload } from '@/lib/serverStore';
+import { issueThemeTicket, consumeThemeTicket } from '@/lib/server/themeTickets';
 
 export const runtime = 'nodejs';
 const MAX_IMAGE_CHARS = 12_000_000; // ~9 MB base64 — abuse/credit guard
@@ -14,17 +15,16 @@ const MAX_IMAGE_CHARS = 12_000_000; // ~9 MB base64 — abuse/credit guard
 /** POST {imageDataUrl, count, mode} — or {theme, count, mode} with VF_THEME_GENERATION — -> {jobId, isMock, label}. Generation runs async (Meta calls take 3-17s each).
  *  Public-demo credit protection, checked BEFORE any provider work: VF_ACCESS_CODE
  *  (401), per-IP rate limit of 5 generations/hour (429), daily job cap counted from
- *  visualforge_generation_jobs (429). Playing existing levels needs none of this. */
+ *  visualforge_generation_jobs (429). Playing existing levels needs none of this.
+ *  Voice dictation sends {themeCheck: true} when dictation stops: ONE Spark
+ *  moderation call (the same one generation would make) returns ok + cleanTheme
+ *  ("Spark suggests") + a one-time ticket, so the real generation that follows
+ *  reuses it instead of moderating twice. A check creates no job and burns no
+ *  generation quota — it runs before the rate-limit/daily-cap guards below. */
 export async function POST(req: Request) {
-  let body: { imageDataUrl?: string; count?: number; mode?: 'game' | 'qc'; difficulty?: string; theme?: string; accessCode?: string };
+  let body: { imageDataUrl?: string; count?: number; mode?: 'game' | 'qc'; difficulty?: string; theme?: string; accessCode?: string; themeCheck?: boolean; themeTicket?: string };
   try { body = await req.json(); } catch { return NextResponse.json({ error: 'invalid JSON' }, { status: 400 }); }
   if (!accessCodeOk(body.accessCode)) return NextResponse.json({ error: 'access code required' }, { status: 401 });
-  // Both public-demo guards switch on together: with VF_ACCESS_CODE unset (local
-  // dev) there is no code AND no per-IP limit; the daily cap below always applies.
-  if (accessCodeRequired()) {
-    const rate = hitGenerationRateLimit(clientIp(req));
-    if (!rate.ok) return NextResponse.json({ error: `Too many generations from this network — the limit is ${RATE_LIMIT_MAX} per hour. Please try again in about ${Math.ceil(rate.retryAfterSec / 60)} min, or play the demo level and the gallery below.` }, { status: 429 });
-  }
   // VF_THEME_GENERATION: a theme (>= 3 chars after trim, capped at 200) replaces the
   // uploaded photo — the scene itself is generated. Flag-gated; rejected BEFORE any
   // provider work so a disabled feature never reaches a paid call.
@@ -33,6 +33,28 @@ export async function POST(req: Request) {
     if (process.env.VF_THEME_GENERATION !== 'true') return NextResponse.json({ error: 'theme generation is disabled (VF_THEME_GENERATION)' }, { status: 400 });
     if (theme.length < 3) return NextResponse.json({ error: 'theme too short (min 3 characters)' }, { status: 400 });
     if (theme.length > 200) return NextResponse.json({ error: 'theme too long (max 200 characters)' }, { status: 400 });
+  }
+  // Voice-dictation pre-check: moderate the dictated theme NOW (one Spark call) and
+  // hand back the tidied rewrite + a one-time ticket. Deliberately BEFORE the
+  // generation guards below: checking a dictation is not a generation.
+  if (body.themeCheck) {
+    if (!theme) return NextResponse.json({ error: 'theme required' }, { status: 400 });
+    const { providers } = selectProviders();
+    if (!providers.vision.moderateTheme) return NextResponse.json({ error: 'theme moderation is not available on this provider' }, { status: 501 });
+    try {
+      const mod = await providers.vision.moderateTheme(theme);
+      if (!mod.ok) return NextResponse.json({ ok: false, reason: mod.reason });
+      const cleanTheme = mod.cleanTheme?.trim() ? mod.cleanTheme.trim() : theme;
+      return NextResponse.json({ ok: true, reason: mod.reason, cleanTheme, themeTicket: issueThemeTicket(theme, cleanTheme), isMock: providers.vision.isMock });
+    } catch (e) {
+      return NextResponse.json({ error: `theme check failed: ${e instanceof Error ? e.message : String(e)}` }, { status: 502 });
+    }
+  }
+  // Both public-demo guards switch on together: with VF_ACCESS_CODE unset (local
+  // dev) there is no code AND no per-IP limit; the daily cap below always applies.
+  if (accessCodeRequired()) {
+    const rate = hitGenerationRateLimit(clientIp(req));
+    if (!rate.ok) return NextResponse.json({ error: `Too many generations from this network — the limit is ${RATE_LIMIT_MAX} per hour. Please try again in about ${Math.ceil(rate.retryAfterSec / 60)} min, or play the demo level and the gallery below.` }, { status: 429 });
   }
   const count = Math.max(1, Math.min(10, body.count ?? 5));
   const mode = body.mode === 'qc' ? 'qc' : 'game';
@@ -55,7 +77,10 @@ export async function POST(req: Request) {
   try { assertMetaConfigured(); } catch (e) { return NextResponse.json({ error: e instanceof Error ? e.message : 'meta not configured' }, { status: 400 }); }
   if (theme) {
     const job = createJob(mode, false, count, difficulty);
-    void runGeneration(job, { theme }, count, providers); // async by design — poll GET
+    // A dictation pre-check ticket for THIS exact text means Spark already moderated
+    // it — the job skips its own moderation call (exactly one per theme, total).
+    const themePreModerated = consumeThemeTicket(body.themeTicket, theme);
+    void runGeneration(job, { theme, themePreModerated }, count, providers); // async by design — poll GET
     return NextResponse.json({ jobId: job.id, isMock: false, label });
   }
   const imageDataUrl = body.imageDataUrl ?? '';

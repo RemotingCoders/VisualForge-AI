@@ -154,6 +154,15 @@ export const SPARK_SCHEMAS = {
     properties: { ok: { type: 'boolean' }, reason: { type: 'string' } },
     required: ['ok', 'reason'], additionalProperties: false,
   },
+  /** Theme moderation (VF_THEME_GENERATION): the image-moderation verdict PLUS
+   *  cleanTheme — the same dictation-ready rewrite Spark returns in the SAME call
+   *  (no extra Spark call): the theme as one short, clear phrase, dictation filler
+   *  and spoken self-corrections removed, original language kept. */
+  themeModeration: {
+    type: 'object',
+    properties: { ok: { type: 'boolean' }, reason: { type: 'string' }, cleanTheme: { type: 'string' } },
+    required: ['ok', 'reason', 'cleanTheme'], additionalProperties: false,
+  },
   concepts: {
     type: 'object',
     properties: { concepts: { type: 'array', items: { type: 'string' } } },
@@ -345,13 +354,18 @@ class MetaProvider implements SegmentationProvider, VisionReasoningProvider, Ima
     });
   }
   /** Text-only theme gate (VF_THEME_GENERATION): judges the theme BEFORE any paid image
-   *  generation. Same moderation schema, no images — the Responses content then carries a
-   *  single input_text part (sparkStructured already omits input_image when images is []). */
-  async moderateTheme(text: string): Promise<{ ok: boolean; reason: string }> {
-    return sparkStructured({
-      prompt: `A user wants to generate a spot-the-difference game scene from this theme: "${text}". Is this theme safe and appropriate for a general audience? Answer ok=false if it requests or implies sexual, violent, graphic, hateful, illegal or otherwise unsafe imagery, with a short reason. Innocent scenes (places, objects, animals, seasons, fantasy worlds without adult content) are ok=true.`,
-      schemaName: 'Moderation', schema: SPARK_SCHEMAS.moderation,
+   *  generation. No images — the Responses content then carries a single input_text part
+   *  (sparkStructured already omits input_image when images is []). The SAME call also
+   *  returns cleanTheme (the theme tidied for the voice-dictation "Spark suggests" UX);
+   *  generation always uses the text the user actually submitted, never the rewrite
+   *  unless they accepted it. */
+  async moderateTheme(text: string): Promise<{ ok: boolean; reason: string; cleanTheme: string }> {
+    const out = await sparkStructured<{ ok: boolean; reason: string; cleanTheme?: string }>({
+      prompt: `A user wants to generate an image from this theme: "${text}". Is this theme safe and appropriate for a general audience? Answer ok=false if it requests or implies sexual, violent, graphic, hateful, illegal or otherwise unsafe imagery, with a short reason. Innocent themes (places, objects, animals, seasons, fantasy worlds without adult content, manufactured parts) are ok=true. Also return cleanTheme: the theme rewritten as ONE short, clear phrase in the SAME language as the user's text, dropping filler words, hesitations and spoken self-corrections ("ehm", "no wait, better…", restarts) while keeping the intended subject exactly. If the theme is already short and clear, return it unchanged as cleanTheme.`,
+      schemaName: 'ThemeModeration', schema: SPARK_SCHEMAS.themeModeration,
     });
+    const clean = typeof out.cleanTheme === 'string' && out.cleanTheme.trim() ? out.cleanTheme.trim() : text;
+    return { ok: out.ok, reason: out.reason, cleanTheme: clean };
   }
   async plan(imageRef: string, regions: Region[], mode: Mode, count: number, difficulty: Difficulty = 'medium'): Promise<PlannedChange[]> {
     const difficultyRule = difficulty === 'easy'
@@ -459,7 +473,7 @@ export class MockProviders implements SegmentationProvider, VisionReasoningProvi
     return out;
   }
   async moderate() { return { ok: true, reason: 'MOCK moderation — not a real safety check' }; }
-  async moderateTheme() { return { ok: true, reason: 'MOCK theme moderation — not a real safety check' }; }
+  async moderateTheme(text: string) { return { ok: true, reason: 'MOCK theme moderation — not a real safety check', cleanTheme: text }; }
   async plan(_i: string, regions: Region[], mode: Mode, count: number): Promise<PlannedChange[]> {
     const types = mode === 'qc'
       ? ['scratch', 'crack', 'dent', 'missing component', 'corrosion']

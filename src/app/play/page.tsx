@@ -4,6 +4,7 @@ import confetti from 'canvas-confetti';
 import { scoreGame } from '@/lib/engine/geometry';
 import { challengeVerdict } from '@/lib/aiInspect';
 import { playFound, playMiss, playFanfare } from '@/lib/sounds';
+import { useVoiceDictation } from '@/lib/useVoiceDictation';
 import Gallery from '@/components/Gallery';
 
 type Found = { id: string; description: string; bbox: { x: number; y: number; width: number; height: number }; centroid?: { x: number; y: number } | null; difficulty?: number };
@@ -45,6 +46,24 @@ export default function Play() {
    *  hints always work without it. */
   const [accessCode, setAccessCode] = useState('');
   useEffect(() => { try { setAccessCode(localStorage.getItem('vf-access-code') ?? ''); } catch { /* private window */ } }, []);
+  /** Voice dictation → Spark tidy-up. When dictation stops, the dictated theme is
+   *  checked ONCE (themeCheck): Spark moderates it (the same call generation would
+   *  make) and returns a tidied rewrite, shown as "Spark suggests" when it differs.
+   *  The returned one-time ticket travels with Generate so the job reuses that
+   *  moderation — no second call. Silent on any failure: dictation already worked,
+   *  and generation moderates in-job as usual. Manual typing clears both. */
+  const [themeSuggestion, setThemeSuggestion] = useState<string | null>(null);
+  const themeTicketRef = useRef<string | null>(null);
+  const checkDictatedTheme = async (text: string) => {
+    const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ theme: text, themeCheck: true, mode: 'game', accessCode: accessCode || undefined }) }).catch(() => null);
+    const data = await res?.json().catch(() => null);
+    if (!res?.ok || !data) return;
+    if (data.ok === false) { themeTicketRef.current = null; setThemeSuggestion(null); setMsg('❌ Your theme was rejected by moderation — try a different theme.'); return; }
+    themeTicketRef.current = typeof data.themeTicket === 'string' ? data.themeTicket : null;
+    const clean = typeof data.cleanTheme === 'string' ? data.cleanTheme.trim() : '';
+    setThemeSuggestion(clean && clean !== text.trim() ? clean : null);
+  };
+  const voice = useVoiceDictation(theme, t => setTheme(t), t => { void checkDictatedTheme(t); });
   const fileRef = useRef<HTMLInputElement>(null);
   const levelTopRef = useRef<HTMLHeadingElement>(null);
 
@@ -107,7 +126,7 @@ export default function Play() {
     setThemeUsed(usingTheme); setPreviewImage('');
     setMsg('Creating your level — this can take a couple of minutes.');
     const finish = () => { setBusy(false); };
-    const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(usingTheme ? { theme: theme.trim(), count, mode: 'game', difficulty, accessCode: accessCode || undefined } : { imageDataUrl: photo || undefined, count, mode: 'game', difficulty, accessCode: accessCode || undefined }) });
+    const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(usingTheme ? { theme: theme.trim(), themeTicket: themeTicketRef.current ?? undefined, count, mode: 'game', difficulty, accessCode: accessCode || undefined } : { imageDataUrl: photo || undefined, count, mode: 'game', difficulty, accessCode: accessCode || undefined }) });
     const data = await res.json();
     if (res.status === 401) { finish(); setMsg('Generating new levels needs the access code provided in the hackathon submission. You can still play the levels in the gallery below.'); return; }
     if (!res.ok) { finish(); setMsg(`❌ ${data.error ?? 'generation failed'}`); return; }
@@ -215,7 +234,7 @@ export default function Play() {
         onDragEnter={e => { e.preventDefault(); setDragOver(true); }}
         onDragLeave={e => { e.preventDefault(); setDragOver(false); }}
         onDrop={onDrop}
-        className={`mt-2 flex-1 rounded-xl border-2 border-dashed px-4 py-6 text-center cursor-pointer transition-all ${dragOver ? 'border-indigo-400 bg-indigo-500/20 scale-[1.01]' : 'border-white/25 bg-white/5 hover:border-indigo-400/70 hover:bg-white/10'}`}
+        className={`mt-2 h-36 flex flex-col items-center justify-center rounded-xl border-2 border-dashed px-4 text-center cursor-pointer transition-all ${dragOver ? 'border-indigo-400 bg-indigo-500/20 scale-[1.01]' : 'border-white/25 bg-white/5 hover:border-indigo-400/70 hover:bg-white/10'}`}
       >
         <input ref={fileRef} type="file" accept="image/*" aria-label="Upload a photo" onChange={e => { onFile(e.target.files?.[0]); e.target.value = ''; }} className="hidden" />
         {photo ? (
@@ -239,8 +258,21 @@ export default function Play() {
       </div>
       <div className="flex flex-col">
       <h3 className="font-bold text-sm">🎨 Or describe a scene</h3>
-      <textarea aria-label="Scene theme" maxLength={200} rows={5} value={theme} onChange={e => setTheme(e.target.value)} placeholder="an autumn garden with a cozy cabin" className="mt-2 flex-1 min-h-36 w-full bg-white/10 px-3 py-2 rounded-lg text-white placeholder:text-white/40 resize-none" />
+      <div className="relative mt-2">
+        <textarea aria-label="Scene theme" maxLength={200} rows={5} value={theme} onChange={e => { setTheme(e.target.value); setThemeSuggestion(null); themeTicketRef.current = null; }} placeholder="an autumn garden with a cozy cabin" className="min-h-36 w-full bg-white/10 px-3 py-2 rounded-lg text-white placeholder:text-white/40 resize-none" />
+        {voice.supported && (
+          <button type="button" onClick={voice.toggle} aria-pressed={voice.listening} aria-label={voice.listening ? 'Stop voice input' : 'Dictate the theme with your voice'} className={`absolute right-2 bottom-2 rounded-full px-3 py-1.5 text-sm font-bold ${voice.listening ? 'bg-red-500 animate-pulse' : 'bg-white/15 hover:bg-white/25'}`}>{voice.listening ? '⏺ Listening…' : '🎤 Voice'}</button>
+        )}
+      </div>
+      {voice.listening && <p className="text-xs text-red-300 mt-1" role="status">🎙️ Listening… speak now — dictation stops after 3 s of silence, or tap the button again.</p>}
+      {themeSuggestion && (
+        <p className="text-sm mt-2 bg-indigo-500/15 border border-indigo-400/30 rounded-lg px-3 py-2">✨ Spark suggests: “{themeSuggestion}”{' '}
+          <button type="button" className="bg-indigo-500 px-2 py-0.5 rounded-full text-xs font-bold" onClick={() => { setTheme(themeSuggestion); setThemeSuggestion(null); }}>Use this</button>{' '}
+          <button type="button" className="bg-white/10 px-2 py-0.5 rounded-full text-xs" onClick={() => setThemeSuggestion(null)}>Keep mine</button>
+        </p>
+      )}
       <p className="text-xs opacity-60 mt-2">We create the scene for you, then hide the differences in it. If you describe a scene, the photo is not used.</p>
+      {voice.supported && <p className="text-xs opacity-60 mt-1">Voice input uses your browser’s speech recognition. Muse Spark reviews and tidies the theme.</p>}
       </div>
       </div>
       <div className="flex flex-wrap items-center gap-3 mt-3 text-sm">
