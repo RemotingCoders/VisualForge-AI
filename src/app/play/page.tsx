@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState } from 'react';
 import confetti from 'canvas-confetti';
 import { scoreGame } from '@/lib/engine/geometry';
+import { challengeVerdict } from '@/lib/aiInspect';
 import { playFound, playMiss, playFanfare } from '@/lib/sounds';
 import Gallery from '@/components/Gallery';
 
@@ -48,12 +49,29 @@ export default function Play() {
 
   const resetGame = (t: number) => { setTotal(t); setFound([]); setMistakes(0); setHints(0); setHintUsed({}); };
   /** Load an EXISTING level (gallery / share link): stored images only, generates nothing. */
+  /** Race against Spark: same /api/ai-inspect challenge as QC, on game levels —
+   *  Spark's findings (descriptions, not defect types) draw in fuchsia on Modified. */
+  const [raceMode, setRaceMode] = useState<'no-reference' | 'with-reference'>('no-reference');
+  const [raceBusy, setRaceBusy] = useState(false);
+  const [race, setRace] = useState<{ mode: string; isMock: boolean; latencySec: number; total: number; matchedCount: number; falsePositives: number; findings: { bbox_normalized: { x: number; y: number; width: number; height: number }; label: string; confidence: number; matched: boolean; differenceId?: string }[] } | null>(null);
+  const [raceMsg, setRaceMsg] = useState(''); const [raceStart, setRaceStart] = useState<number | null>(null);
+  const [raceHumanTime, setRaceHumanTime] = useState<number | null>(null);
+  const startRace = async () => {
+    if (!levelId || raceBusy || busy) return;
+    resetGame(total); setRace(null); setRaceHumanTime(null); setRaceStart(Date.now()); setRaceBusy(true);
+    setRaceMsg('🤖 Spark is inspecting the modified image… find them first!');
+    const res = await fetch('/api/ai-inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ levelId, mode: raceMode }) }).catch(() => null);
+    const data = await res?.json().catch(() => null);
+    setRaceBusy(false);
+    if (!res?.ok || !data?.findings) { setRaceMsg(`❌ ${data?.error ?? 'Spark could not run the race.'}`); return; }
+    setRace(data); setRaceMsg(`🤖 Spark finished in ${data.latencySec}s — keep going!`);
+  };
   const loadById = async (id: string) => {
     const res = await fetch(`/api/level?id=${encodeURIComponent(id)}`);
     if (!res.ok) { setMsg('❌ That level could not be loaded — create your own above or pick another from the gallery.'); return; }
     const lv = await res.json();
     if (lv.demo) { setMsg('❌ That level is no longer available — create your own above or pick one from the gallery.'); return; }
-    setLevelId(lv.levelId); resetGame(lv.total);
+    setLevelId(lv.levelId); resetGame(lv.total); setRace(null); setRaceStart(null); setRaceHumanTime(null); setRaceMsg('');
     setImg(lv); setMsg('✅ Level loaded — find all differences!');
   };
   useEffect(() => {
@@ -78,7 +96,7 @@ export default function Play() {
     const usingTheme = theme.trim().length > 0;
     const finalStep = STEPS.length + (usingTheme ? 1 : 0) - 1;
     // Clear the previous level immediately so only the processing animation is visible.
-    setImg(null); setLevelId(''); resetGame(0);
+    setImg(null); setLevelId(''); resetGame(0); setRace(null); setRaceStart(null); setRaceHumanTime(null); setRaceMsg('');
     setBusy(true); setStep(0); setJobElapsed(0);
     setThemeUsed(usingTheme); setPreviewImage('');
     setMsg('Creating your level — this can take a couple of minutes.');
@@ -131,6 +149,8 @@ export default function Play() {
   };
 
   const done = total > 0 && found.length >= total; const elapsed = Math.round((Date.now() - start) / 1000);
+  // Race against Spark: freeze the human time the moment the level is completed.
+  useEffect(() => { if (done && raceStart !== null && raceHumanTime === null) setRaceHumanTime(Math.round((Date.now() - raceStart) / 1000)); }, [done, raceStart, raceHumanTime]);
   const steps = themeUsed ? [SCENE_STEP, ...STEPS] : STEPS;
   const celebrated = useRef(false);
   useEffect(() => {
@@ -147,10 +167,15 @@ export default function Play() {
     })();
   }, [done]);
   useEffect(() => { if (!done) celebrated.current = false; }, [done]);
-  const ImgPanel = ({ src, alt }: { src: string; alt: string }) => (
+  const ImgPanel = ({ src, alt, showAi = false }: { src: string; alt: string; showAi?: boolean }) => (
     <div className="relative w-full">
       {/* eslint-disable-next-line @next/next/no-img-element */}
       <img src={src} alt={alt} onClick={clickImg} className="w-full rounded-xl cursor-crosshair" />
+      {showAi && race?.findings.map((f, i) => (
+        <div key={i} className={`absolute border-[3px] border-fuchsia-400 pointer-events-none ${f.matched ? '' : 'border-dashed opacity-80'}`} style={{ left: `${f.bbox_normalized.x * 100}%`, top: `${f.bbox_normalized.y * 100}%`, width: `${f.bbox_normalized.width * 100}%`, height: `${f.bbox_normalized.height * 100}%` }}>
+          <span className="absolute left-0 -top-6 whitespace-nowrap bg-fuchsia-600 text-white text-[11px] font-bold px-1 rounded">🤖 {f.label}</span>
+        </div>
+      ))}
       {img && found.map(f => {
         // Circle centered on the MEASURED center of the change (centroid), not the bbox corner box.
         const cx = f.centroid?.x ?? (f.bbox.x + f.bbox.width / 2);
@@ -217,6 +242,8 @@ export default function Play() {
 
     <div className="flex flex-wrap gap-3 my-5 text-sm"><span className="bg-white/10 px-3 py-1 rounded-full">Found {found.length}/{total}</span><span className="bg-white/10 px-3 py-1 rounded-full">Mistakes {mistakes}/5</span>
       <button className="bg-white/10 px-3 py-1 rounded-full" onClick={requestHint}>💡 Hint ({hints})</button>
+      <button className="bg-fuchsia-600 px-3 py-1 rounded-full font-bold disabled:opacity-50" disabled={!levelId || raceBusy || busy} onClick={startRace}>🤖 Race against Spark</button>
+      <label className="bg-white/10 px-2 py-1 rounded-full">Spark sees <select aria-label="Spark race mode" value={raceMode} onChange={e => setRaceMode(e.target.value as 'no-reference' | 'with-reference')} className="bg-transparent text-white"><option value="no-reference">modified only</option><option value="with-reference">both images</option></select></label>
       {typeof window !== 'undefined' && levelId && <button className="bg-white/10 px-3 py-1 rounded-full" onClick={() => navigator.clipboard?.writeText(`${location.origin}/play?level=${levelId}`)}>🔗 Share link</button>}</div>
     <p aria-live="polite" className="font-semibold">{done ? `🎉 Finished! Score ${scoreGame(found.length, total, mistakes, hints, elapsed, found.map(f => f.difficulty ?? 3))} · ${elapsed}s` : msg}</p>
     {img?.theme && <p className="text-sm opacity-80 mt-1">🎨 Scene: “{img.revisedPrompt || img.theme}”</p>}
@@ -256,12 +283,20 @@ export default function Play() {
       </section>
     ) : img ? (
       <div className="grid md:grid-cols-2 gap-5 mt-4"><div><h2 className="font-bold mb-2">Original — click differences</h2><ImgPanel src={img.original} alt="Original — click differences" /></div>
-        <div><h2 className="font-bold mb-2">Modified — click differences</h2><ImgPanel src={img.modified} alt="Modified — click differences" /></div></div>
+        <div><h2 className="font-bold mb-2">Modified — click differences</h2><ImgPanel src={img.modified} alt="Modified — click differences" showAi /></div></div>
     ) : (
       <div className="mt-4 rounded-xl border-2 border-dashed border-white/15 bg-white/5 px-6 py-14 text-center">
         <p className="text-4xl">🖼️</p>
         <p className="font-bold mt-3">Your level will appear here</p>
         <p className="text-sm opacity-70 mt-1">Generate one from your photo or a scene above — or pick a ready-made level from the gallery below. No code needed to play those.</p>
+      </div>
+    )}
+    {(raceBusy || race) && (
+      <div className="mt-4 rounded-xl bg-fuchsia-500/10 border border-fuchsia-400/40 px-4 py-3 text-sm">
+        <p className="font-bold">🤖 Race against Spark{race ? ` · ${race.mode === 'with-reference' ? 'with reference' : 'no reference'}` : ''}</p>
+        {raceMsg && <p className="mt-1 opacity-90">{raceMsg}</p>}
+        {race && <p className="mt-1">You: {found.length}/{total} found · {mistakes} mistakes · {raceHumanTime !== null ? `${raceHumanTime}s` : 'still playing…'} — Spark: {race.matchedCount}/{race.total} found · {race.falsePositives} false positives · {race.latencySec}s{race.isMock ? ' (MOCK provider — no real inspection)' : ''}. Fuchsia boxes on the modified image are Spark’s.</p>}
+        {race && done && raceHumanTime !== null && <p className="font-bold mt-1">🏁 {challengeVerdict({ foundIds: found.map(f => f.id), falsePositives: mistakes, timeSec: raceHumanTime }, { foundIds: race.findings.filter(f => f.matched && f.differenceId).map(f => f.differenceId!), falsePositives: race.falsePositives, timeSec: race.latencySec }, 'differences', 'Spark')}</p>}
       </div>
     )}
     <ul className="mt-4 text-sm">{found.map(f => <li key={f.id}>✅ {f.description}</li>)}</ul>

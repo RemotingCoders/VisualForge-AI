@@ -10,7 +10,7 @@ export default function Home() {
     <p className="mt-5 text-lg opacity-80 max-w-3xl">VisualForge AI takes any image and produces a modified version with realistic, localized, <b>verified</b> changes — plus the exact bounding box and mask of every change. SAM 3.1 segments, Muse Spark plans &amp; verifies, Muse Image edits only the masked region, and pixel measurement derives the <i>real</i> annotation.</p>
     <div className="grid md:grid-cols-3 gap-5 mt-10">
       <Card href="/play" emoji="🔎" title="Diferia: Play Your Photo" text="Upload your photo or describe a theme, we forge N differences, you find them against the clock." />
-      <Card href="/online" emoji="🏁" title="Diferia Online" text="Real-time races for 2–4 players. First to find a difference claims it — server decides, best of 3." />
+      <Card href="/qc" emoji="🤖" title="Challenge the AI" text="Race Muse Spark to find the defects. Can you beat the AI inspector?" />
       <Card href="/qc" emoji="🏭" title="QC Inspection Trainer" text="The same engine generates scratches, cracks and missing parts to train inspectors and export labeled COCO/YOLO datasets." />
     </div>
     <div className="mt-10 bg-indigo-500/10 border border-indigo-400/30 rounded-2xl p-6 font-mono text-sm overflow-x-auto whitespace-pre">{`original ─► SAM 3.1 segment ─► Muse Spark plan ─► Muse Image edit (masked only)

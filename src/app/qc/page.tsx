@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
 import { accuracy } from '@/lib/engine/geometry';
+import { challengeVerdict } from '@/lib/aiInspect';
 import confetti from 'canvas-confetti';
 import { playFound, playMiss, playFanfare } from '@/lib/sounds';
 
@@ -33,7 +34,8 @@ function stageToStep(stage: string, status: string, withPart = false): number {
   return withPart ? base + 1 : base;
 }
 type FoundDiff = { id: string; description: string; bbox: { x: number; y: number; width: number; height: number }; centroid: { x: number; y: number } | null };
-type RevealDiff = { id: string; type: string; plannedType: string; label: string; severity: number | null; confidence: number | null; needsReview: boolean; bbox: { x: number; y: number; width: number; height: number }; centroid: { x: number; y: number } | null };
+type RevealDiff = { id: string; type: string; plannedType: string; label: string; severity: number | null; confidence: number | null; needsReview: boolean; detectability: number | null; aiChallenges: number; aiHits: number; aiFoundModes: string[]; bbox: { x: number; y: number; width: number; height: number }; centroid: { x: number; y: number } | null };
+type AiResult = { mode: string; isMock: boolean; latencySec: number; total: number; matchedCount: number; falsePositives: number; findings: { bbox_normalized: { x: number; y: number; width: number; height: number }; label: string; confidence: number; matched: boolean; differenceId?: string; truthLabel?: string }[] };
 const fmtTime = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 
 export default function QC() {
@@ -53,6 +55,25 @@ export default function QC() {
    *  clock stops there even though Reveal may happen later. */
   const [finishedElapsed, setFinishedElapsed] = useState<number | null>(null);
   const imgRef = useRef<HTMLImageElement>(null); const sessionPosted = useRef(false);
+  /** Challenge the AI inspector: Spark races the trainee on this same level. The
+   *  button restarts the human clock and fires /api/ai-inspect in parallel; Spark's
+   *  boxes draw in fuchsia when they land, and the verdict compares coverage, then time. */
+  const [aiMode, setAiMode] = useState<'no-reference' | 'with-reference'>('no-reference');
+  const [aiBusy, setAiBusy] = useState(false); const [aiResult, setAiResult] = useState<AiResult | null>(null);
+  const [aiMsg, setAiMsg] = useState(''); const [challengeActive, setChallengeActive] = useState(false);
+  const [humanFinal, setHumanFinal] = useState<{ foundIds: string[]; falsePositives: number; timeSec: number } | null>(null);
+  const startChallenge = async () => {
+    if (!real || aiBusy) return;
+    setRealFound([]); setRealFalsePos(0); setRealMisses([]); setRealRevealed(false); setRevealDiffs([]);
+    setSessionMsg(''); setFinishedElapsed(null); setStartedAt(Date.now()); setElapsed(0);
+    setChallengeActive(true); setHumanFinal(null); setAiResult(null); setAiBusy(true);
+    setAiMsg('🤖 The AI inspector is looking at the defective unit… your clock is running — find them first!');
+    const res = await fetch('/api/ai-inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ levelId: real.levelId, mode: aiMode }) }).catch(() => null);
+    const data = await res?.json().catch(() => null);
+    setAiBusy(false);
+    if (!res?.ok || !data?.findings) { setAiMsg(`❌ ${data?.error ?? 'The AI inspector could not run.'}`); return; }
+    setAiResult(data); setAiMsg('');
+  };
   /** Example QC levels from the gallery: already generated, inspectable by anyone
    *  without the access code (loading generates nothing). */
   const [qcGallery, setQcGallery] = useState<{ levelId: string; original: string; total: number }[]>([]);
@@ -74,6 +95,7 @@ export default function QC() {
     if (!real) return;
     setRealFound([]); setRealFalsePos(0); setRealMisses([]); setRealRevealed(false); setRevealDiffs([]);
     setSessionMsg(''); sessionPosted.current = false; setStartedAt(Date.now()); setElapsed(0); setFinishedElapsed(null);
+    setAiResult(null); setAiBusy(false); setAiMsg(''); setChallengeActive(false); setHumanFinal(null);
   }, [real]);
   // Inspection timer: ticks while a real level is loaded, not yet completed or revealed.
   useEffect(() => {
@@ -110,6 +132,7 @@ export default function QC() {
     celebrated.current = true;
     const durationSec = startedAt ? Math.floor((Date.now() - startedAt) / 1000) : elapsed;
     setFinishedElapsed(durationSec); setElapsed(durationSec);
+    if (challengeActive) setHumanFinal(h => h ?? { foundIds: realFound.map(f => f.id), falsePositives: realFalsePos, timeSec: durationSec });
     playFanfare();
     const colors = ['#6366f1', '#22c55e', '#fbbf24', '#06b6d4', '#f472b6'];
     confetti({ particleCount: 130, spread: 80, origin: { y: 0.6 }, colors });
@@ -131,6 +154,7 @@ export default function QC() {
     if (!res.ok || !data?.differences) { alert(data?.error ?? 'Could not reveal this level.'); return; }
     const durationSec = finishedElapsed ?? (startedAt ? Math.floor((Date.now() - startedAt) / 1000) : elapsed);
     setElapsed(durationSec); setRevealDiffs(data.differences); setRealRevealed(true);
+    if (challengeActive) setHumanFinal(h => h ?? { foundIds: realFound.map(f => f.id), falsePositives: realFalsePos, timeSec: durationSec });
     // If the trainee already found everything, the session was saved at the fanfare
     // with the frozen time; saveSession's once-guard makes this a no-op then.
     await saveSession(realFound.length, Math.max(0, real.total - realFound.length), realFalsePos, durationSec);
@@ -263,6 +287,11 @@ export default function QC() {
                 return (<div key={f.id} title={f.description} className="absolute rounded-full border-4 border-emerald-400 pointer-events-none" style={{ left: pct(c.x - f.bbox.width / 2, real.width), top: pct(c.y - f.bbox.height / 2, real.height), width: pct(f.bbox.width, real.width), height: pct(f.bbox.height, real.height) }} />);
               })}
               {!realRevealed && realMisses.map((m, i) => (<div key={i} className="absolute text-red-400 font-black pointer-events-none" style={{ left: `${m.x}%`, top: `${m.y}%`, transform: 'translate(-50%,-50%)' }}>✕</div>))}
+              {!realRevealed && aiResult?.findings.map((f, i) => (
+                <div key={i} className={`absolute border-[3px] border-fuchsia-400 pointer-events-none ${f.matched ? '' : 'border-dashed opacity-80'}`} style={{ left: `${f.bbox_normalized.x * 100}%`, top: `${f.bbox_normalized.y * 100}%`, width: `${f.bbox_normalized.width * 100}%`, height: `${f.bbox_normalized.height * 100}%` }}>
+                  <span className="absolute left-0 -top-6 whitespace-nowrap bg-fuchsia-600 text-white text-[11px] font-bold px-1 rounded">🤖 {f.label}{f.matched ? '' : ' ?'}</span>
+                </div>
+              ))}
               {realRevealed && revealDiffs.map(d => (
                 <div key={d.id} className="absolute border-[3px] border-red-500 pointer-events-none" style={{ left: pct(d.bbox.x, real.width), top: pct(d.bbox.y, real.height), width: pct(d.bbox.width, real.width), height: pct(d.bbox.height, real.height) }}>
                   <span className="absolute left-0 -top-6 whitespace-nowrap bg-red-500 text-white text-[11px] font-bold px-1 rounded">{d.type}{d.severity ? ` · sev ${d.severity}` : ''}</span>
@@ -278,8 +307,18 @@ export default function QC() {
           <span className="bg-white/10 px-3 py-1 rounded">⏱ {fmtTime(finishedElapsed ?? elapsed)}</span>
           {realDone && !realRevealed && <span className="bg-emerald-500/25 border border-emerald-400/40 px-3 py-1 rounded">🎉 All {real.total} defects found in {fmtTime(finishedElapsed ?? elapsed)}!</span>}
           <button className="bg-amber-500 text-black font-bold px-3 py-1 rounded disabled:opacity-50" disabled={realRevealed} onClick={revealReal}>Reveal &amp; score</button>
+          <button className="bg-fuchsia-600 font-bold px-3 py-1 rounded disabled:opacity-50" disabled={aiBusy} onClick={startChallenge}>🤖 Challenge the AI inspector</button>
+          <label className="bg-white/10 px-2 py-1 rounded">AI sees <select aria-label="AI inspector mode" value={aiMode} onChange={e => setAiMode(e.target.value as 'no-reference' | 'with-reference')} className="bg-transparent text-white"><option value="no-reference">defective unit only</option><option value="with-reference">unit + reference</option></select></label>
           {sessionMsg && <span className="opacity-80">{sessionMsg}</span>}
         </div>
+        {(challengeActive || aiBusy || aiResult) && (<div className="mt-3 rounded bg-fuchsia-500/10 border border-fuchsia-400/40 px-3 py-2 text-xs">
+          <p className="font-bold text-sm">🤖 Challenge the AI inspector{aiResult ? ` · ${aiResult.mode === 'with-reference' ? 'with reference' : 'no reference'}` : ''}</p>
+          {aiBusy && <p className="mt-1">{aiMsg}</p>}
+          {aiMsg && !aiBusy && <p className="mt-1">{aiMsg}</p>}
+          {aiResult && (<p className="mt-1">You: {humanFinal ? humanFinal.foundIds.length : realFound.length}/{real.total} found · {humanFinal ? humanFinal.falsePositives : realFalsePos} false positives · {humanFinal ? `${humanFinal.timeSec}s` : 'still inspecting…'} — AI inspector: {aiResult.matchedCount}/{aiResult.total} found · {aiResult.falsePositives} false positives · {aiResult.latencySec}s{aiResult.isMock ? ' (MOCK provider — no real inspection)' : ''}. Fuchsia boxes are the AI’s.</p>)}
+          {aiResult && humanFinal && (<p className="font-bold text-sm mt-1">🏁 {challengeVerdict(humanFinal, { foundIds: aiResult.findings.filter(f => f.matched && f.differenceId).map(f => f.differenceId!), falsePositives: aiResult.falsePositives, timeSec: aiResult.latencySec }, 'defects')}</p>)}
+          {aiResult && !humanFinal && <p className="mt-1 opacity-80">The AI is done — finish your inspection (find them all, or Reveal &amp; score) to see who won.</p>}
+        </div>)}
         {realRevealed && (<div className="mt-3 text-xs">
           <p>Missed: {Math.max(0, real.total - realFound.length)} of {real.total} defects.</p>
           <ul className="mt-2 space-y-1">
@@ -287,6 +326,7 @@ export default function QC() {
               {realFound.some(f => f.id === d.id) ? '✅' : '❌'} <b>{d.type}</b> — {d.label}
               {d.severity ? ` · severity ${d.severity}/5` : ''}{d.confidence !== null ? ` · confidence ${Math.round(d.confidence * 100)}%` : ''}
               {d.type !== d.plannedType ? ` · planned as “${d.plannedType}”` : ''}{d.needsReview ? ' · ⚠️ needs review (low confidence)' : ''}
+              {d.aiChallenges > 0 ? ` · 🤖 AI detectability ${Math.round((d.detectability ?? 0) * 100)}% (${d.aiHits}/${d.aiChallenges} challenges${d.aiFoundModes.length ? `, found in ${d.aiFoundModes.join(' + ')}` : ''})` : ''}
             </li>))}
           </ul>
         </div>)}

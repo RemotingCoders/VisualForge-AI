@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { Providers, Region, PlannedChange, Mode, Difficulty, BBox, SegmentationProvider, VisionReasoningProvider, ImageEditProvider, DifferenceReview, DifferenceHints, GeneratedScene, DefectClassification } from './types';
+import type { Providers, Region, PlannedChange, Mode, Difficulty, BBox, SegmentationProvider, VisionReasoningProvider, ImageEditProvider, DifferenceReview, DifferenceHints, GeneratedScene, DefectClassification, AiFinding } from './types';
 import { QC_DEFECT_CATEGORIES } from './types';
 import { META_BASE_URL, META_MODELS, META_ENDPOINTS, metaApiKey, parseSamOutput, parseSseOutputText, type SamObject } from './meta';
 import { logAiCall } from '../server/db';
@@ -222,6 +222,28 @@ export const SPARK_SCHEMAS = {
     },
     required: ['items'], additionalProperties: false,
   },
+  /** AI-inspector challenge: Spark's findings on a target image (normalized boxes). */
+  aiInspect: {
+    type: 'object',
+    properties: {
+      findings: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            bbox_normalized: {
+              type: 'object',
+              properties: { x: { type: 'number' }, y: { type: 'number' }, width: { type: 'number' }, height: { type: 'number' } },
+              required: ['x', 'y', 'width', 'height'], additionalProperties: false,
+            },
+            label: { type: 'string' }, confidence: { type: 'number' },
+          },
+          required: ['bbox_normalized', 'label', 'confidence'], additionalProperties: false,
+        },
+      },
+    },
+    required: ['findings'], additionalProperties: false,
+  },
   verification: {
     type: 'object',
     properties: { ok: { type: 'boolean' }, notes: { type: 'string' } },
@@ -392,6 +414,23 @@ class MetaProvider implements SegmentationProvider, VisionReasoningProvider, Ima
     });
     return out.items;
   }
+  async inspectImage(imageRefs: string[], opts: { kind: 'qc' | 'game'; withReference: boolean }): Promise<AiFinding[]> {
+    // Challenge the AI inspector: ONE Spark call. The annotations NEVER leave the
+    // server — Spark gets pixels only (the inspected image, preceded by the
+    // known-good reference when withReference). Findings are validated server-side
+    // against the real boxes with the same rule human clicks play by.
+    const refNote = opts.withReference
+      ? 'You are given TWO images: the FIRST is the known-good reference, the SECOND is the unit to inspect. Compare them.'
+      : 'You are given ONE image: the unit to inspect. There is no reference — judge from the image alone.';
+    const mission = opts.kind === 'qc'
+      ? `Find every manufacturing defect on the part (scratches, cracks, dents, missing components or screws, corrosion, misalignments, wrong colors, foreign objects). For each defect return: bbox_normalized — a TIGHT box around the defect itself in 0..1 coordinates (x grows right, y grows down); label — exactly one of ${JSON.stringify(QC_DEFECT_CATEGORIES)}; confidence — 0 to 1, how sure you are it is a real defect (below 0.6 if unsure). Report ONLY real visible defects: do not invent defects, do not box normal part features (holes, edges, reflections, shadows). If there are no defects, return an empty findings array.`
+      : `Find every spot-the-difference style change or oddity in the scene (an object that was added, removed, recolored, replaced or altered — anything that looks edited or out of place). For each one return: bbox_normalized — a TIGHT box around it in 0..1 coordinates (x grows right, y grows down); label — a short description of the difference you see; confidence — 0 to 1. Report ONLY real visible changes: do not invent changes, do not box ordinary scene objects. If there are none, return an empty findings array.`;
+    const out = await sparkStructured<{ findings: AiFinding[] }>({
+      prompt: `${refNote} ${mission}`,
+      images: imageRefs, schemaName: 'AiInspect', schema: SPARK_SCHEMAS.aiInspect,
+    });
+    return (out.findings ?? []).filter(f => f && f.bbox_normalized && typeof f.label === 'string');
+  }
   async editMaskedRegion(imageRef: string, _r: Region, prompt: string): Promise<string> {
     // Crop+margin -> edit crop -> resize back -> feathered composite happens in the worker (worker/composite.py);
     // the verified Muse Image call itself has no mask parameter and returns 1600x1600 WebP (spike 3/6).
@@ -454,6 +493,7 @@ export class MockProviders implements SegmentationProvider, VisionReasoningProvi
       return { index: it.index, defectType, severity: 3, confidence: 0.92, label: `MOCK classification: ${defectType}` };
     });
   }
+  async inspectImage(): Promise<AiFinding[]> { return []; } // MOCK inspector finds nothing — never a fake find
   async editMaskedRegion(imageRef: string) { return imageRef; }
   async editFullImage(imageRef: string) { return imageRef; } // unchanged image -> one-pass finds 0 edits -> crop fallback
   async generateScene(theme: string, kind: 'scene' | 'part' = 'scene'): Promise<GeneratedScene> { return { image: `mock-scene:${theme}`, revisedPrompt: `MOCK ${kind} prompt for: ${theme}` }; }

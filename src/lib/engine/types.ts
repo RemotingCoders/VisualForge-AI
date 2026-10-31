@@ -44,6 +44,13 @@ export interface Difference {
   classifiedSeverity?: number; // 1 (cosmetic) .. 5 (critical)
   classificationConfidence?: number; // 0..1
   classificationLabel?: string;
+  /** Challenge the AI inspector (migration 0006): how detectable this difference is
+   *  FOR SPARK, accumulated over AI challenges — attempts, hits, the modes Spark has
+   *  found it in, and detectability = hits / attempts (0..1). Absent until challenged. */
+  detectability?: number;
+  aiChallenges?: number;
+  aiHits?: number;
+  aiFoundModes?: string[];
 }
 
 export interface SegmentationProvider {
@@ -58,6 +65,8 @@ export interface SegmentationProvider {
 export interface DifferenceReview { index: number; ok: boolean; description: string; type: string; notes: string }
 /** Capability 2: Spark's hints + difficulty rating for one measured difference. */
 export interface DifferenceHints { index: number; difficulty: number; hints: string[] }
+/** One Spark finding in the AI-inspector challenge (bbox normalized 0..1). */
+export interface AiFinding { bbox_normalized: BBox; label: string; confidence: number }
 /** QC defect classification for one measured defect (before/after crops judged by Spark). */
 export interface DefectClassification { index: number; defectType: string; severity: number; confidence: number; label: string }
 /** The canonical QC defect categories (planner, classifier schema, COCO/YOLO exports). */
@@ -81,6 +90,11 @@ export interface VisionReasoningProvider {
    *  from its before/after crops (defectType within QC_DEFECT_CATEGORIES, severity 1-5,
    *  confidence 0-1, short label). Optional: QC levels still generate without it. */
   classifyDefects?(items: { index: number; before: string; after: string; plannedType: string }[]): Promise<DefectClassification[]>;
+  /** Challenge the AI inspector: ONE call — Spark inspects the target image (plus the
+   *  reference first when withReference) and returns findings with normalized boxes.
+   *  It NEVER receives the annotations; the server validates findings against them.
+   *  Optional: the challenge endpoint fails loudly when a provider lacks it. */
+  inspectImage?(imageRefs: string[], opts: { kind: 'qc' | 'game'; withReference: boolean }): Promise<AiFinding[]>;
 }
 /** A generated scene (VF_THEME_GENERATION): the image plus the prompt Muse Image
  *  actually used, which the API echoes back as data[].revised_prompt. */

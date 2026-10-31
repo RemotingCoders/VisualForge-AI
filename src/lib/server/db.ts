@@ -134,6 +134,25 @@ export async function persistDifferenceHints(levelId: string, differences: Diffe
   } catch (e) { console.error('[db] persistDifferenceHints failed:', e); }
 }
 
+/** AI-inspector detectability (migration 0006): accumulated per difference over
+ *  Spark challenges, written after each challenge. Rows are matched by level +
+ *  description + type (difference rows carry fresh UUIDs — same as hints). */
+export async function persistDetectability(levelId: string, differences: Difference[]): Promise<void> {
+  const sb = getServiceClient(); if (!sb) return;
+  try {
+    for (const d of differences) {
+      if (d.aiChallenges === undefined) continue;
+      const { error } = await sb.from('visualforge_differences')
+        .update({
+          detectability: d.detectability ?? null, ai_challenges: d.aiChallenges, ai_hits: d.aiHits ?? 0,
+          ai_found_modes: d.aiFoundModes?.length ? d.aiFoundModes.join(',') : null,
+        })
+        .eq('level_id', levelId).eq('description', d.description).eq('type', d.type);
+      if (error) { warnOnce('diff-detectability-update', `[db] difference detectability not persisted for level ${levelId}: ${error.message} (migration 0006 not applied?)`); return; }
+    }
+  } catch (e) { console.error('[db] persistDetectability failed:', e); }
+}
+
 /** QC trainer session (recorded at Reveal & score): mirrors the in-memory record. */
 export async function persistQcSession(levelId: string, s: { correct: number; missed: number; falsePositives: number; accuracy: number; durationSec: number }): Promise<void> {
   const sb = getServiceClient(); if (!sb) return;
@@ -163,6 +182,11 @@ const rowToDifference = (r: Record<string, unknown>): Difference => ({
   classifiedSeverity: typeof r.classified_severity === 'number' ? r.classified_severity : undefined,
   classificationConfidence: typeof r.classification_confidence === 'number' ? r.classification_confidence : undefined,
   classificationLabel: typeof r.classification_label === 'string' ? r.classification_label : undefined,
+  // AI-inspector detectability (migration 0006): absent on pre-0006 rows.
+  detectability: typeof r.detectability === 'number' ? r.detectability : undefined,
+  aiChallenges: typeof r.ai_challenges === 'number' ? r.ai_challenges : undefined,
+  aiHits: typeof r.ai_hits === 'number' ? r.ai_hits : undefined,
+  aiFoundModes: typeof r.ai_found_modes === 'string' && r.ai_found_modes ? r.ai_found_modes.split(',') : undefined,
 });
 
 export async function loadDifferences(levelId: string): Promise<Difference[] | null> {

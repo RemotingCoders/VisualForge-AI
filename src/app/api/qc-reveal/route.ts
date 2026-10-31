@@ -26,6 +26,8 @@ export async function GET(req: Request) {
       severity: d.classifiedSeverity ?? null,
       confidence: d.classificationConfidence ?? null,
       needsReview: d.classificationConfidence !== undefined && d.classificationConfidence < 0.6,
+      detectability: d.detectability ?? null,
+      aiChallenges: d.aiChallenges ?? 0, aiHits: d.aiHits ?? 0, aiFoundModes: d.aiFoundModes ?? [],
       bbox: d.bbox, bbox_normalized: d.bbox_normalized, centroid: d.centroid ?? null,
     })),
   });
