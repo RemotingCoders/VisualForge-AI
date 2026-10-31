@@ -6,7 +6,7 @@ import { renderShapes } from '@/lib/demoScene';
 import { scoreGame } from '@/lib/engine/geometry';
 import { playFound, playMiss, playFanfare } from '@/lib/sounds';
 
-type Found = { id: string; description: string; bbox: { x: number; y: number; width: number; height: number }; centroid?: { x: number; y: number } | null };
+type Found = { id: string; description: string; bbox: { x: number; y: number; width: number; height: number }; centroid?: { x: number; y: number } | null; difficulty?: number };
 type ImgLevel = { levelId: string; original: string; modified: string; width: number; height: number; total: number; isMock: boolean; theme?: string; revisedPrompt?: string };
 
 /** Pipeline steps shown while generating — mapped from the server job stage strings. */
@@ -37,13 +37,13 @@ export default function Play() {
   const [levelId, setLevelId] = useState(''); const [orig, setOrig] = useState<Shape[]>([]); const [mod, setMod] = useState<Shape[]>([]);
   const [img, setImg] = useState<ImgLevel | null>(null);
   const [total, setTotal] = useState(0); const [found, setFound] = useState<Found[]>([]); const [mistakes, setMistakes] = useState(0);
-  const [hints, setHints] = useState(0); const [msg, setMsg] = useState('Loading sample level…'); const [start] = useState(Date.now());
+  const [hints, setHints] = useState(0); const [hintUsed, setHintUsed] = useState<Record<string, number>>({}); const [msg, setMsg] = useState('Loading sample level…'); const [start] = useState(Date.now());
   const [photo, setPhoto] = useState(''); const [photoName, setPhotoName] = useState(''); const [count, setCount] = useState(5); const [difficulty, setDifficulty] = useState('medium');
   const [busy, setBusy] = useState(false); const [dragOver, setDragOver] = useState(false); const [step, setStep] = useState(0); const [jobElapsed, setJobElapsed] = useState(0);
   const [theme, setTheme] = useState(''); const [themeUsed, setThemeUsed] = useState(false); const [previewImage, setPreviewImage] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const resetGame = (t: number) => { setTotal(t); setFound([]); setMistakes(0); setHints(0); };
+  const resetGame = (t: number) => { setTotal(t); setFound([]); setMistakes(0); setHints(0); setHintUsed({}); };
   const load = async (seed = Math.floor(Math.random() * 9999)) => { setImg(null); const d = await (await fetch(`/api/demo-level?seed=${seed}`)).json(); setLevelId(d.levelId); setOrig(d.original); setMod(d.modified); resetGame(d.total); setMsg('Find all differences! Click them in either image — original or modified.'); };
   useEffect(() => { load(7); }, []);
 
@@ -107,6 +107,19 @@ export default function Play() {
     if (!img || found.length >= total || mistakes >= 5) return;
     const r = e.currentTarget.getBoundingClientRect();
     void validate(((e.clientX - r.left) / r.width) * img.width, ((e.clientY - r.top) / r.height) * img.height);
+  };
+
+  /** Capability 2: server delivers the next progressive hint for the easiest pending
+   *  difference (Spark wrote 3 per difference at generation time). Each hint costs
+   *  score points, same as before — but now it's a real clue, not a fixed tip. */
+  const requestHint = async () => {
+    if (!levelId || done) return;
+    const res = await (await fetch('/api/hint', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ levelId, foundIds: found.map(f => f.id), used: hintUsed }) })).json();
+    if (res.exhausted) { setMsg('💡 No more hints for the differences that are left — you are on your own now!'); return; }
+    if (res.error) { setMsg(`❌ ${res.error}`); return; }
+    setHintUsed(u => ({ ...u, [res.differenceId]: (u[res.differenceId] ?? 0) + 1 }));
+    setHints(h => h + 1);
+    setMsg(`💡 Hint ${res.hintNumber}/${res.totalHints}: ${res.hint}`);
   };
 
   const done = total > 0 && found.length >= total; const elapsed = Math.round((Date.now() - start) / 1000);
@@ -196,10 +209,10 @@ export default function Play() {
     </section>
 
     <div className="flex flex-wrap gap-3 my-5 text-sm"><span className="bg-white/10 px-3 py-1 rounded-full">Found {found.length}/{total}</span><span className="bg-white/10 px-3 py-1 rounded-full">Mistakes {mistakes}/5</span>
-      <button className="bg-white/10 px-3 py-1 rounded-full" onClick={() => { setHints(h => h + 1); setMsg('💡 Hint: compare corners and large shapes first.'); }}>💡 Hint ({hints})</button>
+      <button className="bg-white/10 px-3 py-1 rounded-full" onClick={requestHint}>💡 Hint ({hints})</button>
       <button className="bg-indigo-500 px-3 py-1 rounded-full font-bold" onClick={() => load()}>↻ New demo level</button>
       {typeof window !== 'undefined' && levelId && <button className="bg-white/10 px-3 py-1 rounded-full" onClick={() => navigator.clipboard?.writeText(`${location.origin}/play?level=${levelId}`)}>🔗 Share link</button>}</div>
-    <p aria-live="polite" className="font-semibold">{done ? `🎉 Finished! Score ${scoreGame(found.length, total, mistakes, hints, elapsed)} · ${elapsed}s` : msg}</p>
+    <p aria-live="polite" className="font-semibold">{done ? `🎉 Finished! Score ${scoreGame(found.length, total, mistakes, hints, elapsed, found.map(f => f.difficulty ?? 3))} · ${elapsed}s` : msg}</p>
     {img?.theme && <p className="text-sm opacity-80 mt-1">🎨 Scene: “{img.revisedPrompt || img.theme}”</p>}
     {busy ? (
       <section aria-label="Generating level" className="mt-4 rounded-xl bg-white/5 border border-indigo-400/30 p-8 text-center overflow-hidden">

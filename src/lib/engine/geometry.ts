@@ -99,10 +99,15 @@ export function clickHits(click: { x: number; y: number }, bbox: BBox, tolerance
          click.y >= bbox.y - tolerance && click.y <= bbox.y + bbox.height + tolerance;
 }
 
-export function scoreGame(found: number, total: number, mistakes: number, hintsUsed: number, elapsedSec: number): number {
+export function scoreGame(found: number, total: number, mistakes: number, hintsUsed: number, elapsedSec: number, foundDifficulties: number[] = []): number {
   if (total <= 0) return 0;
+  const penalties = mistakes * 50 + hintsUsed * 75 + Math.min(200, elapsedSec * 0.5);
+  // Difficulty-weighted (capability 2): when the found differences carry Spark ratings,
+  // each find earns difficulty x 200 points (100 for a difficulty-1 gimme, 1000 for a
+  // difficulty-5 needle) instead of an equal share of 1000.
+  if (foundDifficulties.length) return Math.max(0, Math.round(foundDifficulties.reduce((a, d) => a + d * 200, 0) - penalties));
   const base = (found / total) * 1000;
-  return Math.max(0, Math.round(base - mistakes * 50 - hintsUsed * 75 - Math.min(200, elapsedSec * 0.5)));
+  return Math.max(0, Math.round(base - penalties));
 }
 export function accuracy(correct: number, totalClicks: number): number {
   return totalClicks === 0 ? 1 : Math.round((correct / totalClicks) * 1000) / 1000;

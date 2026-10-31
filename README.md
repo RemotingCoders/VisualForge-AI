@@ -30,6 +30,7 @@ The Play page is intentionally user-facing — none of this appears in the UI. R
 - `VF_THEME_GENERATION=true`: enables theme→scene generation on `/play`. Flow: Muse Spark **text-only moderation first** (a rejected theme never reaches a paid call and fails as `theme_rejected`), then one Muse Image generation (`POST /v1/images/generations`, docs-verified shape: aspect-only `size`, no `moderation` field — that enum is Spark-only; flat $0.01/image, logged per call in `visualforge_ai_calls`), then the standard pipeline. The theme and the model's `revised_prompt` are stored on the level (migration `0003_level_theme.sql`; pre-0003 databases simply persist without them).
 - `VF_SCENE_REASONING` (`low|medium|high`, default `high`): reasoning effort for the scene-generation call only.
 - `VF_SAM_MASKS=true`: use real SAM masks (official `@meta-sam/parser`) for local recolor/compositing, with per-change fallback to bbox behavior.
+- Hints & per-difference difficulty (capability 2, always on with the real provider): after all differences are measured, **one** extra Muse Spark call per level writes 3 progressive hints and a difficulty rating (1–5) per difference (migration `0004_difference_hints.sql`; pre-0004 databases persist without them). `POST /api/hint` serves the next hint of the easiest pending difference; the score weights each find by its difficulty. One-pass component selection also applies a visibility floor by job difficulty (easy: area ≥ 0.4 % of the image and mean amplitude ≥ 45; medium: ≥ 0.25 % / ≥ 40; hard: no extra floor).
 - Credit guards: `MAX_CHANGES_PER_JOB`, `MAX_JOBS_PER_DAY`, `ESTIMATED_COST_PER_LEVEL_USD` (see [src/lib/limits.ts](src/lib/limits.ts)).
 - Supabase persistence is best-effort and additive: jobs/levels/differences/images/ai-calls are mirrored to `visualforge_*` tables when `NEXT_PUBLIC_SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` are set; the game also works fully in-memory without them.
 
@@ -39,13 +40,13 @@ npm test            # Vitest: pipeline, composite invariant, mask→bbox, click 
 .venv/bin/python -m pytest tests/test_composite.py   # Python env lives in .venv (git-ignored)
 npm run test:e2e    # Playwright: single-player flow on MOCK
 ```
-**Status (2026-10-30):** Vitest 63/63 (incl. the async generation loop with fake providers, the one-pass path, duplicate-difference dedupe, theme generation, and sharp composite/measurement invariants) and Playwright 1/1 verified 2026-10-30; pytest 2/2 last verified 2026-10-29.
+**Status (2026-10-30):** Vitest 71/71 (incl. the async generation loop with fake providers, the one-pass path, duplicate-difference dedupe, the difficulty visibility floor, Spark hints + difficulty, theme generation, and sharp composite/measurement invariants) and Playwright 1/1 verified 2026-10-30; pytest 2/2 last verified 2026-10-29.
 
 ## Feature status
 | Feature | Status |
 |---|---|
 | Engine pipeline + providers + credit limits | ✅ real Meta spike-validated + wired as async jobs |
-| Play Your Photo (upload or theme → generate → server-validated play, click either image) | ✅ playable · theme→scene ✅ (VF_THEME_GENERATION) |
+| Play Your Photo (upload or theme → generate → server-validated play, click either image) | ✅ playable · theme→scene ✅ (VF_THEME_GENERATION) · hints + difficulty ✅ (capability 2) |
 | Diferia Online (room/race/best-of-3 UI + DB race guard) | 🟡 local simulation · ⏳ Supabase Realtime wiring |
 | QC Trainer + COCO/YOLO export | ✅ playable slice · ⏳ batch dataset review flow |
 | Landing "one engine, three uses" | ✅ |

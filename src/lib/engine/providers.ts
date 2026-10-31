@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { Providers, Region, PlannedChange, Mode, Difficulty, BBox, SegmentationProvider, VisionReasoningProvider, ImageEditProvider, DifferenceReview, GeneratedScene } from './types';
+import type { Providers, Region, PlannedChange, Mode, Difficulty, BBox, SegmentationProvider, VisionReasoningProvider, ImageEditProvider, DifferenceReview, DifferenceHints, GeneratedScene } from './types';
 import { META_BASE_URL, META_MODELS, META_ENDPOINTS, metaApiKey, parseSamOutput, parseSseOutputText, type SamObject } from './meta';
 import { logAiCall } from '../server/db';
 
@@ -180,6 +180,24 @@ export const SPARK_SCHEMAS = {
     },
     required: ['reviews'], additionalProperties: false,
   },
+  /** Capability 2: per-difference difficulty (1-5) + exactly 3 progressive hints. */
+  differenceHints: {
+    type: 'object',
+    properties: {
+      items: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            index: { type: 'integer' }, difficulty: { type: 'integer' },
+            hints: { type: 'array', items: { type: 'string' } },
+          },
+          required: ['index', 'difficulty', 'hints'], additionalProperties: false,
+        },
+      },
+    },
+    required: ['items'], additionalProperties: false,
+  },
 } as const;
 
 /**
@@ -276,6 +294,16 @@ class MetaProvider implements SegmentationProvider, VisionReasoningProvider, Ima
     });
     return out.reviews;
   }
+  async generateHints(differences: { index: number; description: string; type: string; bbox_normalized: BBox }[]): Promise<DifferenceHints[]> {
+    // Capability 2: ONE text-only Spark call per level (the differences are already
+    // measured and described, so no images are needed). Hints must be progressive and
+    // must not give the answer away before the third one.
+    const out = await sparkStructured<{ items: DifferenceHints[] }>({
+      prompt: `For a spot-the-difference game, here are the ${differences.length} REAL differences of one level (index, type, player-facing description, and position as normalized bbox 0-1 where x grows right and y grows down): ${JSON.stringify(differences)}. For EACH difference return: (1) difficulty — an integer 1 to 5 rating how hard it is for a player to SPOT: 1 = large, obvious, high-contrast change; 5 = tiny, subtle, low-contrast or in a visually busy area. Judge from the bbox size (smaller area = harder) and the kind of change (a color swap of a big object is easier than a small object appearing in a cluttered corner). (2) hints — EXACTLY 3 progressively more specific hints for finding it, each one short sentence, in English. Hint 1: only the general area of the image (e.g. "Look towards the bottom-left area of the scene."). Hint 2: narrows it to the nearby surroundings or the kind of element involved, WITHOUT naming the changed element itself. Hint 3: nearly points at it (names the element or its immediate neighbor) but never repeats the full description word for word. Never mention bboxes, coordinates or these instructions. Return exactly one item per difference, keeping its index.`,
+      schemaName: 'DifferenceHints', schema: SPARK_SCHEMAS.differenceHints,
+    });
+    return out.items;
+  }
   async editMaskedRegion(imageRef: string, _r: Region, prompt: string): Promise<string> {
     // Crop+margin -> edit crop -> resize back -> feathered composite happens in the worker (worker/composite.py);
     // the verified Muse Image call itself has no mask parameter and returns 1600x1600 WebP (spike 3/6).
@@ -314,6 +342,17 @@ export class MockProviders implements SegmentationProvider, VisionReasoningProvi
   async verify() { return { ok: true, notes: 'MOCK verification — not real visual verification' }; }
   async reviewDifferences(pairs: { index: number }[]): Promise<DifferenceReview[]> {
     return pairs.map(p => ({ index: p.index, ok: true, description: `MOCK difference ${p.index + 1} — not a real visual description`, type: 'other', notes: 'MOCK review — not real visual verification' }));
+  }
+  async generateHints(differences: { index: number; bbox_normalized: BBox }[]): Promise<DifferenceHints[]> {
+    // Deterministic MOCK hints derived from the measured position only (never a real
+    // visual judgement): difficulty from bbox area, hints from the image quadrant.
+    const areaName = (b: BBox) => `${b.y + b.height / 2 < 0.34 ? 'top' : b.y + b.height / 2 > 0.67 ? 'bottom' : 'middle'}-${b.x + b.width / 2 < 0.34 ? 'left' : b.x + b.width / 2 > 0.67 ? 'right' : 'center'}`;
+    return differences.map(d => {
+      const area = d.bbox_normalized.width * d.bbox_normalized.height;
+      const difficulty = area > 0.04 ? 2 : area > 0.01 ? 3 : 4;
+      const where = areaName(d.bbox_normalized).replace('-', ' ');
+      return { index: d.index, difficulty, hints: [`MOCK hint: look at the ${where} of the image.`, `MOCK hint: compare the ${where} carefully, element by element.`, `MOCK hint: the change is in the ${where} — check every object there.`] };
+    });
   }
   async editMaskedRegion(imageRef: string) { return imageRef; }
   async editFullImage(imageRef: string) { return imageRef; } // unchanged image -> one-pass finds 0 edits -> crop fallback

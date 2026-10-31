@@ -23,6 +23,13 @@ export interface Difference {
   severity: 'low' | 'medium' | 'high';
   verification_status: 'verified' | 'needs_review' | 'rejected';
   verifier_notes: string;
+  /** Capability 2: exactly 3 progressive hints (vague → precise), written by ONE Spark
+   *  call per level after measurement. Absent on levels generated before the capability
+   *  or when the hint call failed — /api/hint synthesizes positional fallbacks then. */
+  hints?: string[];
+  /** Capability 2: Spark-rated difficulty of THIS difference, 1 (easiest) to 5 (hardest).
+   *  Drives hint targeting (easiest pending first) and difficulty-weighted scoring. */
+  difficulty?: number;
 }
 
 export interface SegmentationProvider {
@@ -33,6 +40,8 @@ export interface SegmentationProvider {
 }
 /** One batched verdict per one-pass difference, from its original/modified crop pair. */
 export interface DifferenceReview { index: number; ok: boolean; description: string; type: string; notes: string }
+/** Capability 2: Spark's hints + difficulty rating for one measured difference. */
+export interface DifferenceHints { index: number; difficulty: number; hints: string[] }
 export interface VisionReasoningProvider {
   readonly name: string; readonly isMock: boolean;
   moderate(imageRef: string): Promise<{ ok: boolean; reason: string }>;
@@ -44,6 +53,10 @@ export interface VisionReasoningProvider {
   verify(imageRef: string, modifiedRef: string, change: PlannedChange, measured: BBox): Promise<{ ok: boolean; notes: string }>;
   /** ONE call reviewing N crop pairs (before/after interleaved in `pairs` order). Used by one-pass mode. */
   reviewDifferences?(pairs: { index: number; before: string; after: string; bbox: BBox }[]): Promise<DifferenceReview[]>;
+  /** Capability 2: ONE call per level, AFTER differences are measured. For each difference
+   *  (identified by index) Spark returns exactly 3 progressive hints and a difficulty
+   *  rating 1 (easiest) – 5 (hardest). Optional: levels still generate without it. */
+  generateHints?(differences: { index: number; description: string; type: string; bbox_normalized: BBox }[]): Promise<DifferenceHints[]>;
 }
 /** A generated scene (VF_THEME_GENERATION): the image plus the prompt Muse Image
  *  actually used, which the API echoes back as data[].revised_prompt. */

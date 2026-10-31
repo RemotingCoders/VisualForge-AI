@@ -27,6 +27,12 @@ describe('click + scoring', () => {
     expect(clickHits({ x: 90, y: 110 }, bb, 14)).toBe(true); expect(clickHits({ x: 10, y: 10 }, bb, 14)).toBe(false);
   });
   it('score rewards finds, punishes mistakes/hints', () => { expect(scoreGame(7, 7, 0, 0, 0)).toBeGreaterThan(scoreGame(7, 7, 3, 1, 60)); expect(scoreGame(0, 7, 99, 0, 0)).toBe(0); });
+  it('score is difficulty-weighted when ratings are known (capability 2)', () => {
+    expect(scoreGame(1, 5, 0, 0, 0, [5])).toBe(1000); // a difficulty-5 needle pays 5x
+    expect(scoreGame(1, 5, 0, 0, 0, [1])).toBe(200);
+    expect(scoreGame(2, 5, 0, 0, 0, [5, 1])).toBeGreaterThan(scoreGame(2, 5, 0, 0, 0, [1, 1]));
+    expect(scoreGame(0, 5, 99, 0, 0, [])).toBe(0); // empty ratings -> legacy flat path, never negative
+  });
   it('spacing drops overlapping changes', () => { expect(enforceSpacing([{ bbox: { x: 0, y: 0, width: 50, height: 50 } }, { bbox: { x: 10, y: 10, width: 50, height: 50 } }, { bbox: { x: 200, y: 200, width: 20, height: 20 } }])).toHaveLength(2); });
 });
 describe('pipeline with MOCK provider (tests only)', () => {

@@ -78,13 +78,17 @@ export async function persistImageLevel(levelId: string, args: PersistLevelArgs)
       e3 = (await sb.from('visualforge_levels').insert(levelRow)).error;
     if (e3) throw e3;
     if (args.differences.length) {
-      const rows = args.differences.map(d => ({
+      const baseRows = args.differences.map(d => ({
         id: randomUUID(), level_id: levelId, type: d.type, description: d.description,
         bbox: d.bbox, bbox_normalized: d.bbox_normalized, mask_url: d.mask_url,
         severity: d.severity, verification_status: d.verification_status, verifier_notes: d.verifier_notes,
         centroid: d.centroid ?? null,
       }));
-      const { error: e4 } = await sb.from('visualforge_differences').insert(rows);
+      // hints/difficulty need migration 0004: on a pre-0004 database the insert errors
+      // and we retry with the base rows (same pattern as theme columns on levels).
+      const hintedRows = baseRows.map((r, i) => ({ ...r, hints: args.differences[i].hints ?? null, difficulty: args.differences[i].difficulty ?? null }));
+      let e4 = (await sb.from('visualforge_differences').insert(hintedRows)).error;
+      if (e4) e4 = (await sb.from('visualforge_differences').insert(baseRows)).error;
       if (e4) throw e4;
     }
     console.info(`[db] level ${levelId} persisted (${args.differences.length} differences)`);
@@ -99,6 +103,9 @@ const rowToDifference = (r: Record<string, unknown>): Difference => ({
   severity: (r.severity as Difference['severity']) ?? 'medium',
   verification_status: (r.verification_status as Difference['verification_status']) ?? 'needs_review',
   verifier_notes: String(r.verifier_notes ?? ''),
+  // Capability 2 (migration 0004): absent on pre-0004 rows.
+  hints: Array.isArray(r.hints) ? (r.hints as string[]) : undefined,
+  difficulty: typeof r.difficulty === 'number' ? r.difficulty : undefined,
 });
 
 export async function loadDifferences(levelId: string): Promise<Difference[] | null> {

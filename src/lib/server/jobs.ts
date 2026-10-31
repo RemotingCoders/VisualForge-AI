@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { enforceSpacing, maskToBBox, maskCentroid, maskToPolygon, normalizeBBox, overlaps } from '../engine/geometry';
 import { maskRasterToFrame } from '../engine/meta';
 import type { Providers, Mode, Difficulty, Difference, Region, PlannedChange } from '../engine/types';
-import { normalizeImage, cropDataUrl, expandBox, expandMask, diffMask, providerImage, clampBox, recolorCrop, squareContextBox, compositeMaskedEdit, estimateAlignment, alignEditedCrop, ALIGNMENT_MAX_RESIDUAL, cropColorStats, colorDeltaE, targetHueFromColor, cropDominantHue, transformObjectInPaste, duplicateObjectInPaste, extractOnePassComponents, compositeOnePassComponents, type OnePassComponent, type LocalTransformKind } from './imageOps';
+import { normalizeImage, imageInfo, cropDataUrl, expandBox, expandMask, diffMask, providerImage, clampBox, recolorCrop, squareContextBox, compositeMaskedEdit, estimateAlignment, alignEditedCrop, ALIGNMENT_MAX_RESIDUAL, cropColorStats, colorDeltaE, targetHueFromColor, cropDominantHue, transformObjectInPaste, duplicateObjectInPaste, extractOnePassComponents, compositeOnePassComponents, type OnePassComponent, type LocalTransformKind } from './imageOps';
 import { saveImageLevel } from '../serverStore';
 import { ThemeRejectedError } from '../engine/providers';
 import { persistJob, loadJob } from './db';
@@ -75,6 +75,8 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       if (!themeMod.ok) throw new ThemeRejectedError(themeMod.reason);
       setStage('generating scene');
       const scene = await providers.imageEdit.generateScene(theme); calls.muse++;
+      const sceneInfo = await imageInfo(scene.image).catch(() => null);
+      console.info(`[generate ${job.id}] scene generated: resolution ${sceneInfo ? `${sceneInfo.width}x${sceneInfo.height}` : 'unknown'} · revised_prompt="${scene.revisedPrompt ?? ''}"`);
       job.previewImage = scene.image;
       revisedPrompt = scene.revisedPrompt;
       sourceImage = scene.image;
@@ -246,11 +248,29 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
         }
         return true;
       });
+      // Visibility floor BY JOB DIFFICULTY: easy/medium may only ship differences a
+      // player can actually spot — minimum measured area (fraction of the image) and
+      // minimum mean per-pixel amplitude. Hard imposes no extra floor (subtle is the
+      // point). Components arrive sorted by score; the filter keeps that order.
+      const VISIBILITY_FLOOR: Record<Difficulty, { minAreaFraction: number; minAmp: number }> = {
+        easy: { minAreaFraction: 0.004, minAmp: 45 },
+        medium: { minAreaFraction: 0.0025, minAmp: 40 },
+        hard: { minAreaFraction: 0, minAmp: 0 },
+      };
+      const floor = VISIBILITY_FLOOR[difficulty];
+      const visible = local.filter(c => {
+        const areaFraction = c.area / (width * height);
+        if (areaFraction < floor.minAreaFraction || c.meanAmp < floor.minAmp) {
+          console.info(`[generate ${job.id}] onepass ${label} discarded component: ${c.area}px amp ${c.meanAmp.toFixed(1)} bbox (${c.bbox.x},${c.bbox.y}) ${c.bbox.width}x${c.bbox.height} — below ${difficulty} visibility floor (area ${(areaFraction * 100).toFixed(2)}% < ${(floor.minAreaFraction * 100).toFixed(2)}% or amp ${c.meanAmp.toFixed(1)} < ${floor.minAmp})`);
+          return false;
+        }
+        return true;
+      });
       // Review up to 2 EXTRA candidates in the same single batched Spark call, so a
       // rejection or a duplicate can be replaced from this very call — kept is capped
       // at `want` below and the surplus never reaches the composed image.
-      const chosen = local.slice(0, want + 2);
-      console.info(`[generate ${job.id}] onepass ${label}: chose ${chosen.length}/${components.length} components (${local.length} local, not overlapping existing differences)`);
+      const chosen = visible.slice(0, want + 2);
+      console.info(`[generate ${job.id}] onepass ${label}: chose ${chosen.length}/${components.length} components (${visible.length} above the ${difficulty} visibility floor, ${local.length} local, not overlapping existing differences)`);
       if (!chosen.length) return null;
       let composed = await compositeOnePassComponents(passBase, aligned, chosen);
       let kept = await reviewMeasured(composed, await measureComposed(composed, chosen));
@@ -480,6 +500,26 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       }
     }
     if (!differences.length) throw new Error('no change survived measurement/verification');
+
+    // Capability 2: ONE Spark call per level, AFTER every difference is measured, writes
+    // 3 progressive hints + a 1-5 difficulty per difference. Best-effort: a failed hint
+    // call never sinks a level — /api/hint falls back to positional hints.
+    if (providers.vision.generateHints) {
+      try {
+        setStage('writing hints');
+        const hintItems = await providers.vision.generateHints(differences.map((d, i) => ({ index: i, description: d.description, type: d.type, bbox_normalized: d.bbox_normalized }))); calls.spark++;
+        for (const item of hintItems) {
+          const d = differences[item.index]; if (!d) continue;
+          const hints = (item.hints ?? []).map(h => String(h).trim()).filter(Boolean).slice(0, 3);
+          const rating = Math.min(5, Math.max(1, Math.round(Number(item.difficulty) || 3)));
+          if (hints.length) d.hints = hints;
+          d.difficulty = rating;
+          console.info(`[generate ${job.id}] hints #${item.index}: difficulty ${rating}/5 · "${hints[0] ?? ''}"`);
+        }
+      } catch (e) {
+        console.info(`[generate ${job.id}] hints call failed (${e instanceof Error ? e.message : String(e)}) — level ships without Spark hints`);
+      }
+    }
     logSummary(differences);
 
     job.levelId = saveImageLevel({ differences, original: img.dataUrl, modified: current, width, height, isMock: providers.segmentation.isMock, mode: job.mode, jobId: job.id, theme, revisedPrompt });
