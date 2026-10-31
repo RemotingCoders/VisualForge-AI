@@ -14,6 +14,5 @@ export default function Home() {
     </div>
     <div className="mt-10 bg-indigo-500/10 border border-indigo-400/30 rounded-2xl p-6 font-mono text-sm overflow-x-auto whitespace-pre">{`original ─► SAM 3.1 segment ─► Muse Spark plan ─► Muse Image edit (masked only)
         ─► composite (outside = pixel-identical) ─► measure REAL mask/bbox ─► Muse Spark verify ─► game / race / dataset`}</div>
-    <p className="mt-6 text-sm opacity-70">Demo status: the playable slice below runs the fully-labeled MOCK scene engine offline. Real Meta output ships after the Phase-0 API spike is verified with Damian&apos;s approval — we never fake it.</p>
   </main>);
 }
