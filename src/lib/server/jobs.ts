@@ -197,11 +197,23 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       }));
       const reviews = await providers.vision.reviewDifferences(pairs); calls.spark++;
       const kept: (Measured & { comp: OnePassComponent; description: string; type: string; notes: string })[] = [];
+      const seenChanges = new Map<string, number>();
       for (const m of measured) {
         const i = measured.indexOf(m);
         const r = reviews.find(x => x.index === i);
         console.info(`[generate ${job.id}] onepass review #${i}: ok=${r?.ok ?? 'missing'} type=${r?.type ?? ''} description="${r?.description ?? ''}" notes="${r?.notes ?? ''}"`);
-        if (r?.ok) kept.push({ ...m, description: r.description, type: r.type || 'other', notes: r.notes });
+        if (!r?.ok) continue;
+        // Dedupe: two components describing the SAME change (type + description) are ONE
+        // difference. The weaker one is a phantom — a re-render component Spark described
+        // by copying the real change (field case: flip-flops counted twice, the phantom's
+        // bbox on untouched sand, unfindable). Keep the first (score order = strongest);
+        // the freed slot is refilled from the extra reviewed candidates or the crop top-up,
+        // so the level still delivers the requested count.
+        const key = `${(r.type || 'other').toLowerCase()}|${r.description.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim()}`;
+        const dupOf = seenChanges.get(key);
+        if (dupOf !== undefined) { console.info(`[generate ${job.id}] onepass review #${i} discarded: duplicate of #${dupOf} ("${r.description}") — same change counted twice`); continue; }
+        seenChanges.set(key, i);
+        kept.push({ ...m, description: r.description, type: r.type || 'other', notes: r.notes });
       }
       return kept;
     };
@@ -234,11 +246,15 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
         }
         return true;
       });
-      const chosen = local.slice(0, want);
+      // Review up to 2 EXTRA candidates in the same single batched Spark call, so a
+      // rejection or a duplicate can be replaced from this very call — kept is capped
+      // at `want` below and the surplus never reaches the composed image.
+      const chosen = local.slice(0, want + 2);
       console.info(`[generate ${job.id}] onepass ${label}: chose ${chosen.length}/${components.length} components (${local.length} local, not overlapping existing differences)`);
       if (!chosen.length) return null;
       let composed = await compositeOnePassComponents(passBase, aligned, chosen);
       let kept = await reviewMeasured(composed, await measureComposed(composed, chosen));
+      if (kept.length > want) kept = kept.slice(0, want);
       if (!kept.length) return null;
       if (kept.length < chosen.length) { // recompose without the Spark-rejected components, re-measure only (no second review)
         const keptComps = kept.map(k => k.comp);

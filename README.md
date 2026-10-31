@@ -24,19 +24,28 @@ npm run dev                            # http://localhost:3000
 ```
 Supabase: apply [supabase/migrations/0001_init.sql](supabase/migrations/0001_init.sql) (14 tables, RLS: clients can't read `differences` of unfinished levels, `round_finds` race constraint, 24h upload expiry). Python worker: `worker/composite.py` (Pillow/NumPy — Vercel Python Function if it fits limits, else we stop and propose Modal).
 
+## Configuration (server-side, `.env.local`)
+The Play page is intentionally user-facing — none of this appears in the UI. Real Meta generation is opt-in and credit-protected:
+- `AI_PROVIDER=meta` + `META_REAL_CALLS_ENABLED=true` + `MODEL_API_KEY`: enables real generation. Without them, `/play` returns a clearly labeled demo level (offline MOCK provider) — never a silent fake "AI" result.
+- `VF_THEME_GENERATION=true`: enables theme→scene generation on `/play`. Flow: Muse Spark **text-only moderation first** (a rejected theme never reaches a paid call and fails as `theme_rejected`), then one Muse Image generation (`POST /v1/images/generations`, docs-verified shape: aspect-only `size`, no `moderation` field — that enum is Spark-only; flat $0.01/image, logged per call in `visualforge_ai_calls`), then the standard pipeline. The theme and the model's `revised_prompt` are stored on the level (migration `0003_level_theme.sql`; pre-0003 databases simply persist without them).
+- `VF_SCENE_REASONING` (`low|medium|high`, default `high`): reasoning effort for the scene-generation call only.
+- `VF_SAM_MASKS=true`: use real SAM masks (official `@meta-sam/parser`) for local recolor/compositing, with per-change fallback to bbox behavior.
+- Credit guards: `MAX_CHANGES_PER_JOB`, `MAX_JOBS_PER_DAY`, `ESTIMATED_COST_PER_LEVEL_USD` (see [src/lib/limits.ts](src/lib/limits.ts)).
+- Supabase persistence is best-effort and additive: jobs/levels/differences/images/ai-calls are mirrored to `visualforge_*` tables when `NEXT_PUBLIC_SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` are set; the game also works fully in-memory without them.
+
 ## Tests
 ```bash
 npm test            # Vitest: pipeline, composite invariant, mask→bbox, click tolerance, scoring, race, COCO/YOLO, provider, limits
 .venv/bin/python -m pytest tests/test_composite.py   # Python env lives in .venv (git-ignored)
 npm run test:e2e    # Playwright: single-player flow on MOCK
 ```
-**Status (2026-10-30):** Vitest 46/46 (incl. the async generation loop with fake providers, the one-pass path, and sharp composite/measurement invariants); pytest 2/2 and Playwright 1/1 last verified 2026-10-29.
+**Status (2026-10-30):** Vitest 63/63 (incl. the async generation loop with fake providers, the one-pass path, duplicate-difference dedupe, theme generation, and sharp composite/measurement invariants) and Playwright 1/1 verified 2026-10-30; pytest 2/2 last verified 2026-10-29.
 
 ## Feature status
 | Feature | Status |
 |---|---|
 | Engine pipeline + providers + credit limits | ✅ real Meta spike-validated + wired as async jobs |
-| Play Your Photo (upload → generate → server-validated play) | ✅ playable · ⏳ theme→scene generation (Muse Image generation shape unverified) |
+| Play Your Photo (upload or theme → generate → server-validated play, click either image) | ✅ playable · theme→scene ✅ (VF_THEME_GENERATION) |
 | Diferia Online (room/race/best-of-3 UI + DB race guard) | 🟡 local simulation · ⏳ Supabase Realtime wiring |
 | QC Trainer + COCO/YOLO export | ✅ playable slice · ⏳ batch dataset review flow |
 | Landing "one engine, three uses" | ✅ |
@@ -48,6 +57,6 @@ Everything in this repository: Next.js app, engine, providers, Supabase schema, 
 This project was built with **Muse** (Anthropic's CLI) as the development partner.
 
 ## Known limitations
-Real Meta generation runs only when deliberately enabled server-side (`AI_PROVIDER=meta` + kill switch on, per-run approval); Supabase Realtime multiplayer and storage uploads need project credentials; jobs/levels currently live in server memory (Supabase persistence is the next wiring step); Muse Image *generation* (theme→scene) is still unverified, so scenes come from uploads or the labeled MOCK demo.
+Real Meta generation runs only when deliberately enabled server-side (`AI_PROVIDER=meta` + kill switch on, per-flag opt-ins — see Configuration); Supabase Realtime multiplayer needs project credentials; jobs/levels live in server memory with best-effort Supabase mirroring.
 
 MIT License — see [LICENSE](LICENSE).

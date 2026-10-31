@@ -527,4 +527,38 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
     const { data } = await rawPixels(payload.modified);
     expect([data[0], data[1], data[2]]).toEqual([120, 120, 120]);
   });
+
+  it('one-pass dedupes the same change described twice — phantom never counts toward N', async () => {
+    // Field bug: the flip-flops change was accepted TWICE (a re-render component got the
+    // same review description), so the level claimed 5 differences with only 4 findable.
+    // Fake Muse paints TWO red squares; Spark describes both identically.
+    const editFull = async (imageRef: string) => {
+      const { data, width, height } = await rawPixels(imageRef);
+      const out = Buffer.from(data);
+      for (const [sx, sy] of [[60, 50], [10, 10]] as const)
+        for (let y = sy; y < sy + 12; y++) for (let x = sx; x < sx + 14; x++) { const o = (y * width + x) * 3; out[o] = 230; out[o + 1] = 30; out[o + 2] = 30; }
+      return bufferToDataUrl(await sharp(out, { raw: { width, height, channels: 3 } }).png().toBuffer());
+    };
+    const fake: Providers = {
+      segmentation: { name: 'fake', isMock: true, segment: async () => [] },
+      vision: {
+        name: 'fake', isMock: true,
+        moderate: async () => ({ ok: true, reason: 'ok' }),
+        plan: async () => [], verify: async () => ({ ok: true, notes: 'ok' }),
+        reviewDifferences: async (pairs: { index: number }[]) => pairs.map(p => ({ index: p.index, ok: true, description: 'A red square appeared', type: 'add object', notes: 'fake review ok' })),
+      },
+      imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async () => { throw new Error('not used'); }, editFullImage: editFull, generateScene: async () => ({ image: '' }) },
+    };
+    const job = createJob('game', true);
+    await runGeneration(job, { imageDataUrl: await solidPng(100, 80, [120, 120, 120]) }, 1, fake);
+    expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
+    const diffs = getDifferences(job.levelId!)!;
+    expect(diffs).toHaveLength(1); // not 2: the duplicate was discarded, not counted
+    // ...and the phantom square is not even composited into the modified image:
+    const payload = getLevelPayload(job.levelId!)!;
+    const { data, width } = await rawPixels(payload.modified);
+    const pxAt = (x: number, y: number) => { const o = (y * width + x) * 3; return [data[o], data[o + 1], data[o + 2]]; };
+    const changed = [[67, 56], [17, 16]].filter(([x, y]) => pxAt(x, y)[0] > 200 && pxAt(x, y)[1] < 80);
+    expect(changed).toHaveLength(1); // exactly one square survived
+  });
 });
