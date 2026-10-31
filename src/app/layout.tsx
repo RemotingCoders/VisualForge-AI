@@ -18,6 +18,6 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     </header>
     {isMock && <div className="bg-amber-400 text-black text-center text-xs font-bold px-3 py-1">Offline demo runs the labeled MOCK provider — not real Meta output. The real Meta pipeline is implemented and spike-validated (Phase 0, 2026-10-29); enable it server-side with AI_PROVIDER=meta + META_REAL_CALLS_ENABLED=true (see AI_INTEGRATION.md).</div>}
     {children}
-    <footer className="text-center text-xs opacity-60 py-8">By Damian Sinay · Built during the Meta Global AI Developer Hackathon 2026 · Powered by Muse Spark, Muse Image & SAM 3.1 · Developed with Muse Code · MIT</footer>
+    <footer className="text-center text-xs opacity-60 py-8">By Damian Sinay · Built during the Meta Global AI Developer Hackathon 2026 · Powered by Muse Spark, Muse Image & SAM 3.1 · Developed with Muse Code · MIT · <a href="https://visualforge-ai.taplinko.store" className="underline hover:opacity-100">visualforge-ai.taplinko.store</a></footer>
   </body></html>);
 }
