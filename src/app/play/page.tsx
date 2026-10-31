@@ -119,7 +119,7 @@ export default function Play() {
     if (res.error) { setMsg(`❌ ${res.error}`); return; }
     setHintUsed(u => ({ ...u, [res.differenceId]: (u[res.differenceId] ?? 0) + 1 }));
     setHints(h => h + 1);
-    setMsg(`💡 Hint ${res.hintNumber}/${res.totalHints}: ${res.hint}`);
+    setMsg(`💡 ${res.provisional ? 'Quick hint' : 'Hint'} ${res.hintNumber}/${res.totalHints}: ${res.hint}`);
   };
 
   const done = total > 0 && found.length >= total; const elapsed = Math.round((Date.now() - start) / 1000);

@@ -5,7 +5,7 @@ import type { Providers, Mode, Difficulty, Difference, Region, PlannedChange } f
 import { normalizeImage, imageInfo, cropDataUrl, expandBox, expandMask, diffMask, providerImage, clampBox, recolorCrop, squareContextBox, compositeMaskedEdit, estimateAlignment, alignEditedCrop, ALIGNMENT_MAX_RESIDUAL, cropColorStats, colorDeltaE, targetHueFromColor, cropDominantHue, transformObjectInPaste, duplicateObjectInPaste, extractOnePassComponents, compositeOnePassComponents, type OnePassComponent, type LocalTransformKind } from './imageOps';
 import { saveImageLevel } from '../serverStore';
 import { ThemeRejectedError } from '../engine/providers';
-import { persistJob, loadJob } from './db';
+import { persistJob, loadJob, persistDifferenceHints } from './db';
 
 export type JobStatus = 'queued' | 'running' | 'done' | 'failed';
 /** Size criteria are AREA-based, not side-based: a SAM box is a WHOLE object if it occupies
@@ -76,7 +76,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       setStage('generating scene');
       const scene = await providers.imageEdit.generateScene(theme); calls.muse++;
       const sceneInfo = await imageInfo(scene.image).catch(() => null);
-      console.info(`[generate ${job.id}] scene generated: resolution ${sceneInfo ? `${sceneInfo.width}x${sceneInfo.height}` : 'unknown'} · revised_prompt="${scene.revisedPrompt ?? ''}"`);
+      console.info(`[generate ${job.id}] scene generated: resolution ${sceneInfo ? `${sceneInfo.width}x${sceneInfo.height}` : 'unknown'} · revised_prompt="${scene.revisedPrompt ?? ''}"${scene.revisedPrompt ? '' : ' (empty — using the user theme as-is)'}`);
       job.previewImage = scene.image;
       revisedPrompt = scene.revisedPrompt;
       sourceImage = scene.image;
@@ -145,10 +145,10 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       if (!regions.length) throw new Error('segmentation found no usable regions');
 
       setStage('planning');
-      // Ask for MORE candidates than needed (count + 3, priority-ordered, with the variety
+      // Ask for MORE candidates than needed (count + 5, priority-ordered, with the variety
       // quota in the planner prompt): the executor walks the list and stops at `count`
       // achieved — discarded candidates no longer sink the whole level.
-      const planned = await providers.vision.plan(aiImg, regions, job.mode, count + 3, difficulty); calls.spark++;
+      const planned = await providers.vision.plan(aiImg, regions, job.mode, count + 5, difficulty); calls.spark++;
       if (!planned.length) throw new Error('planner returned no changes');
       // Hard rule (GAME mode only): remove/replace/geometric transforms on a FRAGMENT make
       // objects look broken, so downgrade those to a color change. "add object" stays: it puts
@@ -186,6 +186,9 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       }
       return out;
     };
+    // Dedupe memory across ALL one-pass passes of this job: a change kept in pass 1
+    // must not be re-kept as a phantom by the completion pass below (same text key).
+    const seenChanges = new Map<string, number>();
     const reviewMeasured = async (composed: string, measured: (Measured & { comp: OnePassComponent })[]): Promise<(Measured & { comp: OnePassComponent; description: string; type: string; notes: string })[]> => {
       if (!measured.length) return [];
       if (!providers.vision.reviewDifferences) {
@@ -199,7 +202,6 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       }));
       const reviews = await providers.vision.reviewDifferences(pairs); calls.spark++;
       const kept: (Measured & { comp: OnePassComponent; description: string; type: string; notes: string })[] = [];
-      const seenChanges = new Map<string, number>();
       for (const m of measured) {
         const i = measured.indexOf(m);
         const r = reviews.find(x => x.index === i);
@@ -213,7 +215,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
         // so the level still delivers the requested count.
         const key = `${(r.type || 'other').toLowerCase()}|${r.description.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim()}`;
         const dupOf = seenChanges.get(key);
-        if (dupOf !== undefined) { console.info(`[generate ${job.id}] onepass review #${i} discarded: duplicate of #${dupOf} ("${r.description}") — same change counted twice`); continue; }
+        if (dupOf !== undefined) { console.info(`[generate ${job.id}] onepass review #${i} discarded: duplicate of an already-kept change (first kept at review #${dupOf}) ("${r.description}") — same change counted twice`); continue; }
         seenChanges.set(key, i);
         kept.push({ ...m, description: r.description, type: r.type || 'other', notes: r.notes });
       }
@@ -248,29 +250,35 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
         }
         return true;
       });
-      // Visibility floor BY JOB DIFFICULTY: easy/medium may only ship differences a
-      // player can actually spot — minimum measured area (fraction of the image) and
-      // minimum mean per-pixel amplitude. Hard imposes no extra floor (subtle is the
-      // point). Components arrive sorted by score; the filter keeps that order.
+      // Visibility floor BY JOB DIFFICULTY — a PRIORITY, not a gate. Components above
+      // the floor (minimum measured area as a fraction of the image + minimum mean
+      // per-pixel amplitude) go first, in score order; if they alone don't reach the
+      // requested count, below-floor components fill the remaining slots, also in
+      // score order and logged as such. A level short by one barely-sub-threshold
+      // difference (field case: amp 39.9 against a gate of 40) is worse than a
+      // slightly subtle one. Hard imposes no floor (subtle is the point).
       const VISIBILITY_FLOOR: Record<Difficulty, { minAreaFraction: number; minAmp: number }> = {
-        easy: { minAreaFraction: 0.004, minAmp: 45 },
-        medium: { minAreaFraction: 0.0025, minAmp: 40 },
+        easy: { minAreaFraction: 0.0025, minAmp: 40 },
+        medium: { minAreaFraction: 0.0012, minAmp: 35 },
         hard: { minAreaFraction: 0, minAmp: 0 },
       };
       const floor = VISIBILITY_FLOOR[difficulty];
-      const visible = local.filter(c => {
+      const aboveFloor: OnePassComponent[] = []; const belowFloor: OnePassComponent[] = [];
+      for (const c of local) {
         const areaFraction = c.area / (width * height);
-        if (areaFraction < floor.minAreaFraction || c.meanAmp < floor.minAmp) {
-          console.info(`[generate ${job.id}] onepass ${label} discarded component: ${c.area}px amp ${c.meanAmp.toFixed(1)} bbox (${c.bbox.x},${c.bbox.y}) ${c.bbox.width}x${c.bbox.height} — below ${difficulty} visibility floor (area ${(areaFraction * 100).toFixed(2)}% < ${(floor.minAreaFraction * 100).toFixed(2)}% or amp ${c.meanAmp.toFixed(1)} < ${floor.minAmp})`);
-          return false;
-        }
-        return true;
-      });
+        (areaFraction >= floor.minAreaFraction && c.meanAmp >= floor.minAmp ? aboveFloor : belowFloor).push(c);
+      }
       // Review up to 2 EXTRA candidates in the same single batched Spark call, so a
       // rejection or a duplicate can be replaced from this very call — kept is capped
       // at `want` below and the surplus never reaches the composed image.
-      const chosen = visible.slice(0, want + 2);
-      console.info(`[generate ${job.id}] onepass ${label}: chose ${chosen.length}/${components.length} components (${visible.length} above the ${difficulty} visibility floor, ${local.length} local, not overlapping existing differences)`);
+      const chosen = [...aboveFloor, ...belowFloor].slice(0, want + 2);
+      const belowSet = new Set(belowFloor);
+      const belowChosen = chosen.filter(c => belowSet.has(c));
+      for (const c of belowChosen) {
+        const areaFraction = c.area / (width * height);
+        console.info(`[generate ${job.id}] onepass ${label} component accepted BELOW the ${difficulty} visibility floor to complete the count: ${c.area}px amp ${c.meanAmp.toFixed(1)} bbox (${c.bbox.x},${c.bbox.y}) ${c.bbox.width}x${c.bbox.height} (area ${(areaFraction * 100).toFixed(2)}% vs ${(floor.minAreaFraction * 100).toFixed(2)}% · amp ${c.meanAmp.toFixed(1)} vs ${floor.minAmp})`);
+      }
+      console.info(`[generate ${job.id}] onepass ${label}: chose ${chosen.length}/${components.length} components (${aboveFloor.length} above the ${difficulty} visibility floor, ${belowChosen.length} below-floor fillers, ${local.length} local, not overlapping existing differences)`);
       if (!chosen.length) return null;
       let composed = await compositeOnePassComponents(passBase, aligned, chosen);
       let kept = await reviewMeasured(composed, await measureComposed(composed, chosen));
@@ -300,8 +308,9 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
         setStage('one-pass: editing full image (Muse)');
         const afterPass1 = await runOnePassPass(img.dataUrl, count, 'pass1');
         if (afterPass1) { current = afterPass1; modeUsed = 'one-pass'; }
-        // No second one-pass pass: if pass 1 delivered less than N, the crop pipeline
-        // (already segmented + planned in parallel, below) tops up directly.
+        // If pass 1 delivered less than N, the crop pipeline (already segmented +
+        // planned in parallel, below) tops up first; only if the level is STILL
+        // short does the completion block further down spend a second one-pass call.
       } catch (e) {
         console.info(`[generate ${job.id}] one-pass failed (${e instanceof Error ? e.message : String(e)}) — falling back to crop pipeline`);
       }
@@ -431,14 +440,13 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       return { next, mask, bbox, local: true, notes: `local deterministic ${detail}: ${changedPixels}px changed (no Spark call)` };
     };
 
-    let idx = 0;
-    for (const ch of plan) {
-      if (differences.length >= count) break; // candidates are a priority list: stop at count
-      idx++;
+    // Executes ONE planned candidate end-to-end (edit -> measure -> verify -> accept).
+    // Used by the initial plan AND by the replacement plan below.
+    const executeCandidate = async (ch: (typeof plan)[number], position: number, total: number): Promise<void> => {
       const region = regions.find(r => r.id === ch.regionId);
-      if (!region) { console.info(`[generate ${job.id}] change ${ch.id} discarded: unknown regionId ${ch.regionId}`); continue; }
-      if (differences.some(d => overlaps(d.bbox, region.bbox, 4))) { console.info(`[generate ${job.id}] change ${ch.id} discarded: region overlaps an already-accepted difference`); continue; }
-      setStage(`editing ${idx}/${plan.length} · ${differences.length}/${count} done`);
+      if (!region) { console.info(`[generate ${job.id}] change ${ch.id} discarded: unknown regionId ${ch.regionId}`); return; }
+      if (differences.some(d => overlaps(d.bbox, region.bbox, 4))) { console.info(`[generate ${job.id}] change ${ch.id} discarded: region overlaps an already-accepted difference`); return; }
+      setStage(`editing ${position}/${total} · ${differences.length}/${count} done`);
       const budget: MuseBudget = { calls: 0 };
       const isColor = /colou?r/i.test(ch.type);
       const localKind = job.mode === 'game' ? LOCAL_KIND(ch.type) : null;
@@ -448,11 +456,11 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       // Muse is reserved for remove / replace / add / QC defects, plus color changes the
       // deterministic recolor could not do. Local geometric transforms get no Muse fallback.
       if (!candidate && !localKind) candidate = await applyMuse(current, ch, region, ch.editPrompt, budget);
-      if (!candidate) { console.info(`[generate ${job.id}] change ${ch.id} discarded: no aligned, measurable edit (next candidate)`); continue; }
+      if (!candidate) { console.info(`[generate ${job.id}] change ${ch.id} discarded: no aligned, measurable edit (next candidate)`); return; }
 
       let notes = candidate.notes;
       if (!candidate.local) {
-        setStage(`verifying ${idx}/${plan.length} · ${differences.length}/${count} done`);
+        setStage(`verifying ${position}/${total} · ${differences.length}/${count} done`);
         // Verify the change IN ISOLATION: the image as it was JUST BEFORE this change
         // (current) vs the candidate, BOTH cropped to the context box. Comparing the
         // original against the accumulated image made the verifier reject changes for
@@ -474,7 +482,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
             verdict = await verifyChange(retry);
             if (verdict.ok) candidate = retry;
           }
-          if (!verdict.ok) { console.info(`[generate ${job.id}] change ${ch.id} discarded after re-edit: ${verdict.notes}`); continue; }
+          if (!verdict.ok) { console.info(`[generate ${job.id}] change ${ch.id} discarded after re-edit: ${verdict.notes}`); return; }
         }
         notes = verdict.notes;
       }
@@ -487,8 +495,60 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
         verification_status: 'verified', verifier_notes: notes,
       });
       current = candidate.next;
+    };
+    // A candidate whose edit throws must not abort the whole list — discard it and
+    // move on (candidates are a priority list; the count guarantee decides at the end).
+    const tryCandidate = async (ch: (typeof plan)[number], position: number, total: number): Promise<void> => {
+      try { await executeCandidate(ch, position, total); }
+      catch (e) { console.info(`[generate ${job.id}] change ${ch.id} discarded: edit failed (${e instanceof Error ? e.message : String(e)}) — next candidate`); }
+    };
+    const runList = async (list: PlannedChange[]): Promise<void> => {
+      let position = 0;
+      for (const ch of list) {
+        if (differences.length >= count) break; // candidates are a priority list: stop at count
+        position++;
+        await tryCandidate(ch, position, list.length);
+      }
+    };
+
+    await runList(plan);
+    if (differences.length < count) {
+      // ============ REPLACEMENT PLAN ============
+      // The initial candidates ran out below the requested count (field case: half
+      // of them pointed at objects the one-pass pass had already changed). ONE extra
+      // Spark call asks for exactly the missing count + 2, over ONLY the regions
+      // that do not overlap any accepted difference — the planner finally sees which
+      // parts of the image are still free. If no free region remains, the top-up
+      // ends here and the reason is logged (the completion block downstream decides
+      // whether the level can still be completed another way or must fail).
+      const freeRegions = regions.filter(r => !differences.some(d => overlaps(d.bbox, r.bbox, 4)));
+      if (!freeRegions.length) {
+        console.info(`[generate ${job.id}] replacement plan skipped: no free regions left (every region overlaps an accepted difference) — crop top-up ends at ${differences.length}/${count}`);
+      } else {
+        const missing = count - differences.length;
+        console.info(`[generate ${job.id}] crop candidates exhausted at ${differences.length}/${count} — replacement plan: 1 Spark call for ${missing + 2} candidates over ${freeRegions.length} free region(s)`);
+        try {
+          const extra = await providers.vision.plan(aiImg, freeRegions, job.mode, missing + 2, difficulty); calls.spark++;
+          const freeIds = new Set(freeRegions.map(r => r.id));
+          // Same hard rule as the initial plan: remove/replace/geometric transforms
+          // on a FRAGMENT make objects look broken (game mode) — downgrade to color.
+          const WHOLE_OBJECT_ONLY = /remove|replace|flip|resize|rotate|duplicate/i;
+          const usable = extra.filter(ch => freeIds.has(ch.regionId)).map(ch => { // trust, but verify the planner stayed on free regions
+            const r = regions.find(x => x.id === ch.regionId);
+            return job.mode === 'game' && r && r.wholeObject === false && WHOLE_OBJECT_ONLY.test(ch.type) ? { ...ch, type: 'change color' } : ch;
+          });
+          console.info(`[generate ${job.id}] replacement plan returned ${extra.length} candidates (${usable.length} on free regions)`);
+          for (const ch of usable) {
+            const r = regions.find(x => x.id === ch.regionId);
+            console.info(`[generate ${job.id}] planned ${ch.id}: type=${ch.type} region=${ch.regionId} label="${r?.label ?? ''}" wholeObject=${r?.wholeObject ?? '?'} targetColor=${ch.targetColor ?? ''}`);
+          }
+          await runList(usable);
+        } catch (e) {
+          console.info(`[generate ${job.id}] replacement plan failed (${e instanceof Error ? e.message : String(e)}) — crop top-up ends at ${differences.length}/${count}`);
+        }
+      }
+      if (differences.length < count) console.info(`[generate ${job.id}] crop top-up ends at ${differences.length}/${count} requested changes`);
     }
-    if (differences.length < count) console.info(`[generate ${job.id}] crop candidates exhausted: at ${differences.length}/${count} requested changes`);
     }; // end cropTopUp
 
     if (differences.length < count) {
@@ -496,34 +556,71 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       try { await cropTopUp(); }
       catch (e) {
         if (!differences.length) throw e;
-        console.info(`[generate ${job.id}] crop top-up failed (${e instanceof Error ? e.message : String(e)}) — keeping the ${differences.length} one-pass difference(s)`);
+        console.info(`[generate ${job.id}] crop top-up failed (${e instanceof Error ? e.message : String(e)}) — keeping the ${differences.length} difference(s) accepted so far`);
       }
+    }
+
+    // ============ COMPLETION GUARANTEE (game mode) ============
+    // A level NEVER ships with fewer differences than requested (field case: asked
+    // for 5, the playable level had 4 and silently closed as "Found 4/4"). The crop
+    // executor above already ran its replacement plan; while STILL short, spend ONE
+    // more full-image Muse call asking only for the MISSING differences, in places
+    // that do not already contain one (components overlapping an accepted difference
+    // are filtered inside runOnePassPass, and the shared dedupe memory blocks
+    // re-keeping an already-accepted change). Still short after that -> the job
+    // FAILS with a clear message instead of delivering a short level.
+    if (job.mode === 'game' && differences.length < count) {
+      try {
+        setStage('one-pass: adding the missing differences');
+        const before = differences.length;
+        const afterCompletion = await runOnePassPass(current, count - differences.length, 'pass2');
+        if (afterCompletion) current = afterCompletion;
+        if (differences.length > before) console.info(`[generate ${job.id}] completion one-pass added ${differences.length - before} difference(s) — now ${differences.length}/${count}`);
+      } catch (e) {
+        console.info(`[generate ${job.id}] completion one-pass failed (${e instanceof Error ? e.message : String(e)})`);
+      }
+    }
+    if (job.mode === 'game' && differences.length) {
+      const hasCrop = differences.some(d => !d.id.startsWith('onepass-'));
+      const hasOnePass = differences.some(d => d.id.startsWith('onepass-'));
+      modeUsed = hasCrop && hasOnePass ? 'one-pass + crops' : hasOnePass ? 'one-pass' : 'crops';
     }
     if (!differences.length) throw new Error('no change survived measurement/verification');
+    if (job.mode === 'game' && differences.length < count) throw new Error(`We could only create ${differences.length} of the ${count} differences for this image — please try generating again.`);
 
-    // Capability 2: ONE Spark call per level, AFTER every difference is measured, writes
-    // 3 progressive hints + a 1-5 difficulty per difference. Best-effort: a failed hint
-    // call never sinks a level — /api/hint falls back to positional hints.
-    if (providers.vision.generateHints) {
-      try {
-        setStage('writing hints');
-        const hintItems = await providers.vision.generateHints(differences.map((d, i) => ({ index: i, description: d.description, type: d.type, bbox_normalized: d.bbox_normalized }))); calls.spark++;
-        for (const item of hintItems) {
-          const d = differences[item.index]; if (!d) continue;
-          const hints = (item.hints ?? []).map(h => String(h).trim()).filter(Boolean).slice(0, 3);
-          const rating = Math.min(5, Math.max(1, Math.round(Number(item.difficulty) || 3)));
-          if (hints.length) d.hints = hints;
-          d.difficulty = rating;
-          console.info(`[generate ${job.id}] hints #${item.index}: difficulty ${rating}/5 · "${hints[0] ?? ''}"`);
-        }
-      } catch (e) {
-        console.info(`[generate ${job.id}] hints call failed (${e instanceof Error ? e.message : String(e)}) — level ships without Spark hints`);
-      }
-    }
     logSummary(differences);
 
-    job.levelId = saveImageLevel({ differences, original: img.dataUrl, modified: current, width, height, isMock: providers.segmentation.isMock, mode: job.mode, jobId: job.id, theme, revisedPrompt });
+    const levelId = saveImageLevel({ differences, original: img.dataUrl, modified: current, width, height, isMock: providers.segmentation.isMock, mode: job.mode, jobId: job.id, theme, revisedPrompt });
+    job.levelId = levelId;
     job.status = 'done'; setStage('done');
+
+    // Capability 2 — hints WITHOUT blocking publication: the level is playable the
+    // moment its differences are measured, so the ONE Spark hints call runs in the
+    // BACKGROUND. It mutates the stored difference objects in place (the in-memory
+    // store holds the same references, so /api/hint sees the hints land) and then
+    // persists them to the DB. Until they land, /api/hint serves provisional
+    // positional hints derived from the bbox (marked provisional). Best-effort: a
+    // failed background call never affects the published level.
+    if (providers.vision.generateHints) {
+      const generateHints = providers.vision.generateHints;
+      void (async () => {
+        try {
+          const hintItems = await generateHints(differences.map((d, i) => ({ index: i, description: d.description, type: d.type, bbox_normalized: d.bbox_normalized })));
+          for (const item of hintItems) {
+            const d = differences[item.index]; if (!d) continue;
+            const hints = (item.hints ?? []).map(h => String(h).trim()).filter(Boolean).slice(0, 3);
+            const rating = Math.min(5, Math.max(1, Math.round(Number(item.difficulty) || 3)));
+            if (hints.length) d.hints = hints;
+            d.difficulty = rating;
+            console.info(`[generate ${job.id}] hints #${item.index}: difficulty ${rating}/5 · "${hints[0] ?? ''}"`);
+          }
+          await persistDifferenceHints(levelId, differences);
+          console.info(`[generate ${job.id}] hints ready for level ${levelId} (${differences.length} differences, 1 Spark call, written in background)`);
+        } catch (e) {
+          console.info(`[generate ${job.id}] background hints failed (${e instanceof Error ? e.message : String(e)}) — /api/hint keeps serving provisional positional hints`);
+        }
+      })();
+    }
   } catch (e) {
     job.status = 'failed'; job.error = e instanceof ThemeRejectedError ? 'theme_rejected' : (e instanceof Error ? e.message : String(e)); job.updatedAt = Date.now(); void persistJob(job); // keep job.stage = where it failed
     console.error(`[generate ${job.id}] FAILED at stage "${job.stage}":`, e);

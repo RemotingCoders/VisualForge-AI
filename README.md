@@ -30,7 +30,8 @@ The Play page is intentionally user-facing — none of this appears in the UI. R
 - `VF_THEME_GENERATION=true`: enables theme→scene generation on `/play`. Flow: Muse Spark **text-only moderation first** (a rejected theme never reaches a paid call and fails as `theme_rejected`), then one Muse Image generation (`POST /v1/images/generations`, docs-verified shape: aspect-only `size`, no `moderation` field — that enum is Spark-only; flat $0.01/image, logged per call in `visualforge_ai_calls`), then the standard pipeline. The theme and the model's `revised_prompt` are stored on the level (migration `0003_level_theme.sql`; pre-0003 databases simply persist without them).
 - `VF_SCENE_REASONING` (`low|medium|high`, default `high`): reasoning effort for the scene-generation call only.
 - `VF_SAM_MASKS=true`: use real SAM masks (official `@meta-sam/parser`) for local recolor/compositing, with per-change fallback to bbox behavior.
-- Hints & per-difference difficulty (capability 2, always on with the real provider): after all differences are measured, **one** extra Muse Spark call per level writes 3 progressive hints and a difficulty rating (1–5) per difference (migration `0004_difference_hints.sql`; pre-0004 databases persist without them). `POST /api/hint` serves the next hint of the easiest pending difference; the score weights each find by its difficulty. One-pass component selection also applies a visibility floor by job difficulty (easy: area ≥ 0.4 % of the image and mean amplitude ≥ 45; medium: ≥ 0.25 % / ≥ 40; hard: no extra floor).
+- Hints & per-difference difficulty (capability 2, always on with the real provider): the level **publishes the moment its differences are measured**; afterwards, **one** Muse Spark call per level runs **in the background** and writes 3 progressive hints and a difficulty rating (1–5) per difference (migration `0004_difference_hints.sql`; pre-0004 databases persist without them). `POST /api/hint` serves the next hint of the easiest pending difference — until the Spark hints land it serves a positional hint derived from the bbox, marked `provisional` (Play labels it "Quick hint"); the score weights each find by its difficulty. One-pass component selection applies a visibility floor by job difficulty as a **priority, not a gate** (easy: area ≥ 0.25 % of the image and mean amplitude ≥ 40; medium: ≥ 0.12 % / ≥ 35; hard: no floor): above-floor components go first, below-floor ones only fill the count, logged as such.
+- Count guarantee (game mode): a level **never ships short**. Order of remedies: one-pass → crop candidates → **replacement plan** (one extra Spark call for the missing count + 2, planned over only the regions that don't overlap an accepted difference) → one completion full-image Muse call asking only for the missing differences. Still short, the job fails with a clear message ("We could only create X of the N differences…") instead of delivering a short level.
 - Credit guards: `MAX_CHANGES_PER_JOB`, `MAX_JOBS_PER_DAY`, `ESTIMATED_COST_PER_LEVEL_USD` (see [src/lib/limits.ts](src/lib/limits.ts)).
 - Supabase persistence is best-effort and additive: jobs/levels/differences/images/ai-calls are mirrored to `visualforge_*` tables when `NEXT_PUBLIC_SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` are set; the game also works fully in-memory without them.
 
@@ -40,7 +41,7 @@ npm test            # Vitest: pipeline, composite invariant, mask→bbox, click 
 .venv/bin/python -m pytest tests/test_composite.py   # Python env lives in .venv (git-ignored)
 npm run test:e2e    # Playwright: single-player flow on MOCK
 ```
-**Status (2026-10-30):** Vitest 71/71 (incl. the async generation loop with fake providers, the one-pass path, duplicate-difference dedupe, the difficulty visibility floor, Spark hints + difficulty, theme generation, and sharp composite/measurement invariants) and Playwright 1/1 verified 2026-10-30; pytest 2/2 last verified 2026-10-29.
+**Status (2026-10-31):** Vitest 75/75 (incl. the async generation loop with fake providers, the one-pass path, duplicate-difference dedupe, the visibility floor as priority with below-floor fillers, Spark hints + difficulty written in the background after publication, the count-completion guarantee — replacement plan over free regions, then a completion one-pass call, otherwise the job fails loudly — theme generation, and sharp composite/measurement invariants) and Playwright 1/1 verified 2026-10-30; pytest 2/2 last verified 2026-10-29.
 
 ## Feature status
 | Feature | Status |
@@ -55,7 +56,7 @@ npm run test:e2e    # Playwright: single-player flow on MOCK
 Everything in this repository: Next.js app, engine, providers, Supabase schema, Python worker, tests, docs — written from scratch during the event. No pre-existing code imported, no third-party images (scenes are procedural/MOCK or Muse Image-generated).
 
 ## Built with Muse
-This project was built with **Muse** (Anthropic's CLI) as the development partner.
+This project was built with Meta’s Muse Code as the development partner.
 
 ## Known limitations
 Real Meta generation runs only when deliberately enabled server-side (`AI_PROVIDER=meta` + kill switch on, per-flag opt-ins — see Configuration); Supabase Realtime multiplayer needs project credentials; jobs/levels live in server memory with best-effort Supabase mirroring.

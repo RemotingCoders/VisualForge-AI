@@ -412,7 +412,9 @@ describe('runGeneration with fake providers (offline, no paid calls)', () => {
       imageEdit: { name: 'fake', isMock: true, editMaskedRegion: async (imageRef: string, region: { bbox: { x: number; y: number; width: number; height: number } }) => paintPatternBlue(imageRef, region), generateScene: async () => ({ image: '' }) },
     };
     const job = createJob('game', true);
-    await runGeneration(job, { imageDataUrl: await solidPng(400, 300, [120, 120, 120]) }, 2, fake);
+    // count=1: this test is about spacing (r2 dropped before planning), and a game
+    // level must now deliver exactly the requested count or fail — never ship short.
+    await runGeneration(job, { imageDataUrl: await solidPng(400, 300, [120, 120, 120]) }, 1, fake);
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     expect(getDifferences(job.levelId!)!.map(d => d.id)).toEqual(['c-r1']); // r2 dropped before planning
   });

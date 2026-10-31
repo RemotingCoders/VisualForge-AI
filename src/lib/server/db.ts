@@ -95,6 +95,26 @@ export async function persistImageLevel(levelId: string, args: PersistLevelArgs)
   } catch (e) { console.error('[db] persistImageLevel failed:', e); }
 }
 
+/** Capability 2, background hints: the level is published BEFORE its Spark hints
+ *  exist (they are written in the background so play can start immediately), so the
+ *  hints/difficulty land as a later UPDATE. Difference rows carry fresh UUIDs (see
+ *  persistImageLevel), so rows are matched by level + description + type. Pre-0004
+ *  databases reject the update — logged once, not an error: /api/hint then keeps
+ *  serving provisional positional hints for DB-loaded levels. */
+export async function persistDifferenceHints(levelId: string, differences: Difference[]): Promise<void> {
+  const sb = getServiceClient(); if (!sb) return;
+  try {
+    for (const d of differences) {
+      if (!d.hints?.length && d.difficulty === undefined) continue;
+      const { error } = await sb.from('visualforge_differences')
+        .update({ hints: d.hints ?? null, difficulty: d.difficulty ?? null })
+        .eq('level_id', levelId).eq('description', d.description).eq('type', d.type);
+      if (error) { console.info(`[db] difference hints not persisted for level ${levelId}: ${error.message} (migration 0004 not applied?)`); return; }
+    }
+    console.info(`[db] hints persisted for level ${levelId} (${differences.length} differences)`);
+  } catch (e) { console.error('[db] persistDifferenceHints failed:', e); }
+}
+
 const rowToDifference = (r: Record<string, unknown>): Difference => ({
   id: String(r.id), type: String(r.type), description: String(r.description),
   bbox: r.bbox as Difference['bbox'], bbox_normalized: r.bbox_normalized as Difference['bbox_normalized'],

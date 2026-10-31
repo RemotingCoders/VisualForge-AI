@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import sharp from 'sharp';
 import { createJob, getJob, runGeneration } from '../src/lib/server/jobs';
 import { getDifferences } from '../src/lib/serverStore';
@@ -24,7 +24,7 @@ describe('pickNextHint (capability 2)', () => {
     diff('mid-one', 3, ['m1', 'm2', 'm3']),
   ];
   it('targets the pending difference with the LOWEST difficulty first', () => {
-    expect(pickNextHint(diffs, [], {})).toMatchObject({ differenceId: 'easy-one', hint: 'e1', hintNumber: 1, difficulty: 1 });
+    expect(pickNextHint(diffs, [], {})).toMatchObject({ differenceId: 'easy-one', hint: 'e1', hintNumber: 1, difficulty: 1, provisional: false });
   });
   it('progresses 1→2→3 within that difference, then moves to the next easiest', () => {
     expect(pickNextHint(diffs, [], { 'easy-one': 1 })).toMatchObject({ differenceId: 'easy-one', hint: 'e2', hintNumber: 2 });
@@ -41,7 +41,7 @@ describe('pickNextHint (capability 2)', () => {
     const hints = fallbackHints(bare);
     expect(hints).toHaveLength(3);
     expect(hints[2]).toBe('desc bare'); // last resort names the change
-    expect(pickNextHint([bare], [], {})).toMatchObject({ differenceId: 'bare', hintNumber: 1 });
+    expect(pickNextHint([bare], [], {})).toMatchObject({ differenceId: 'bare', hintNumber: 1, provisional: true }); // no Spark hints yet -> positional, marked provisional
   });
   it('MockProviders writes labeled MOCK hints (offline only)', async () => {
     const m = new MockProviders();
@@ -61,7 +61,7 @@ const rawPixels = async (dataUrl: string) => {
 };
 
 describe('runGeneration: hints call + visibility floor (fake providers)', () => {
-  it('ONE generateHints call after measuring stores hints + difficulty on the difference', async () => {
+  it('level publishes BEFORE the ONE background generateHints call lands hints + difficulty', async () => {
     let hintCalls = 0;
     const fake: Providers = {
       segmentation: { name: 'fake', isMock: true, segment: async () => [{ id: 'r1', bbox: { x: 40, y: 25, width: 10, height: 8 } }] },
@@ -79,16 +79,20 @@ describe('runGeneration: hints call + visibility floor (fake providers)', () => 
       .png().toBuffer();
     const job = createJob('game', true);
     await runGeneration(job, { imageDataUrl: bufferToDataUrl(scene) }, 1, fake);
-    expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
+    expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done'); // published immediately — hints must not block
+    // The background call lands the hints on the stored difference objects.
+    await vi.waitFor(() => {
+      const d = getDifferences(job.levelId!)![0];
+      expect(d.hints).toEqual(['vague', 'narrower', 'precise']);
+      expect(d.difficulty).toBe(4);
+    });
     expect(hintCalls).toBe(1);
-    const diffs = getDifferences(job.levelId!)!;
-    expect(diffs[0].hints).toEqual(['vague', 'narrower', 'precise']);
-    expect(diffs[0].difficulty).toBe(4);
   });
 
-  it('medium visibility floor discards a faint component the strong one survives (amp gate)', async () => {
-    // Fake Muse paints a STRONG red square (amp ~110) and a FAINT gray one (amp ~30,
-    // below the medium floor of 40): only the strong may ship on medium difficulty.
+  it('medium visibility floor is a PRIORITY: the strong component ships first, the faint one may only fill', async () => {
+    // Fake Muse paints a STRONG red square (amp ~110, above the medium floor of 35)
+    // and a FAINT gray one (amp ~30, below it): with count=1 the strong one ships and
+    // the faint one — reviewed only as a filler candidate — is cut by the count cap.
     const editFull = async (imageRef: string) => {
       const { data, width, height } = await rawPixels(imageRef);
       const out = Buffer.from(data);

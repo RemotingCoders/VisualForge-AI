@@ -4,7 +4,10 @@ import type { Difference } from '../engine/types';
  *  PENDING difference with the LOWEST Spark difficulty (ties keep level order) that
  *  still has hints left. When every pending difference has used all its hints, there
  *  is nothing more to give. `used` maps differenceId -> hints already delivered. */
-export interface NextHint { differenceId: string; hint: string; hintNumber: number; totalHints: number; difficulty: number }
+/** `provisional: true` when the hint is a positional fallback derived from the bbox
+ *  because the Spark hints for this difference have not landed yet (they are written
+ *  in the background after publication) or never will (demo / pre-capability levels). */
+export interface NextHint { differenceId: string; hint: string; hintNumber: number; totalHints: number; difficulty: number; provisional: boolean }
 
 const clampDifficulty = (n: number) => Math.min(5, Math.max(1, Math.round(n)));
 
@@ -44,7 +47,7 @@ export function pickNextHint(differences: Difference[], foundIds: string[], used
   for (const { d } of pending) {
     const hints = fallbackHints(d);
     const n = used[d.id] ?? 0;
-    if (n < hints.length) return { differenceId: d.id, hint: hints[n], hintNumber: n + 1, totalHints: hints.length, difficulty: fallbackDifficulty(d) };
+    if (n < hints.length) return { differenceId: d.id, hint: hints[n], hintNumber: n + 1, totalHints: hints.length, difficulty: fallbackDifficulty(d), provisional: !d.hints?.length };
   }
   return null;
 }
