@@ -301,6 +301,6 @@ export default function Play() {
     )}
     <ul className="mt-4 text-sm">{found.map(f => <li key={f.id}>✅ {f.description}</li>)}</ul>
     {mistakes >= 5 && !done && <p className="text-red-300 font-bold mt-3">Out of mistakes — generate or load a new level to try again.</p>}
-    <Gallery onPlay={id => { if (busy) { setMsg('⏳ Please wait for the current level to finish generating…'); return; } void loadById(id); window.scrollTo({ top: 0, behavior: 'smooth' }); }} />
+    <Gallery mode="game" onPlay={id => { if (busy) { setMsg('⏳ Please wait for the current level to finish generating…'); return; } void loadById(id); window.scrollTo({ top: 0, behavior: 'smooth' }); }} />
   </main>);
 }

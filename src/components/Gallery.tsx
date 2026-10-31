@@ -7,15 +7,16 @@ type GalleryLevel = { levelId: string; original: string; total: number; mode: st
 /** Level gallery: the most recent published levels, straight from Supabase.
  *  Playing one loads its stored images — it generates NOTHING and needs no
  *  access code. On the landing the Play buttons link to /play?level=…; inside
- *  /play they load the level in place via onPlay. */
-export default function Gallery({ onPlay }: { onPlay?: (levelId: string) => void }) {
+ *  /play they load the level in place via onPlay. `mode` filters server-side
+ *  (Play/landing show game levels only — QC levels live in the QC gallery). */
+export default function Gallery({ onPlay, mode }: { onPlay?: (levelId: string) => void; mode?: 'game' | 'qc' }) {
   const [levels, setLevels] = useState<GalleryLevel[] | null>(null);
   useEffect(() => {
     (async () => {
-      try { const d = await (await fetch('/api/gallery')).json(); setLevels(Array.isArray(d.levels) ? d.levels : []); }
+      try { const d = await (await fetch(mode ? `/api/gallery?mode=${mode}` : '/api/gallery')).json(); setLevels(Array.isArray(d.levels) ? d.levels : []); }
       catch { setLevels([]); }
     })();
-  }, []);
+  }, [mode]);
   if (!levels?.length) return null;
   return (
     <section className="mt-10">

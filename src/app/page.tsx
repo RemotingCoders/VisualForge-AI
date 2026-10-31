@@ -15,6 +15,6 @@ export default function Home() {
     </div>
     <div className="mt-10 bg-indigo-500/10 border border-indigo-400/30 rounded-2xl p-6 font-mono text-sm overflow-x-auto whitespace-pre">{`original ─► SAM 3.1 segment ─► Muse Spark plan ─► Muse Image edit (masked only)
         ─► composite (outside = pixel-identical) ─► measure REAL mask/bbox ─► Muse Spark verify ─► game / race / dataset`}</div>
-    <Gallery />
+    <Gallery mode="game" />
   </main>);
 }
