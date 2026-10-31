@@ -215,13 +215,16 @@ export interface GalleryLevel {
 
 /** The level gallery: the most recent PUBLISHED levels (newest first), with the
  *  ORIGINAL image as thumbnail. Playing one loads its stored images — it never
- *  generates anything. Empty list when Supabase is not configured. */
-export async function listPublishedLevels(limit = 12): Promise<GalleryLevel[]> {
+ *  generates anything. Empty list when Supabase is not configured. `mode` filters
+ *  server-side so QC examples never fall out of the game levels' top-N window. */
+export async function listPublishedLevels(limit = 12, mode?: Mode): Promise<GalleryLevel[]> {
   const sb = getServiceClient(); if (!sb) return [];
   try {
-    const { data: levels, error } = await sb.from('visualforge_levels')
+    let query = sb.from('visualforge_levels')
       .select('id, mode, is_mock, theme, original_image_id, created_at')
       .eq('published', true).order('created_at', { ascending: false }).limit(limit);
+    if (mode) query = query.eq('mode', mode);
+    const { data: levels, error } = await query;
     if (error || !levels?.length) return [];
     const { data: imgs } = await sb.from('visualforge_images').select('id, storage_path')
       .in('id', levels.map(l => l.original_image_id as string));

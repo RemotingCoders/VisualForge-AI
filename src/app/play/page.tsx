@@ -1,8 +1,6 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
 import confetti from 'canvas-confetti';
-import type { Shape } from '@/lib/demoScene';
-import { renderShapes } from '@/lib/demoScene';
 import { scoreGame } from '@/lib/engine/geometry';
 import { playFound, playMiss, playFanfare } from '@/lib/sounds';
 import Gallery from '@/components/Gallery';
@@ -35,10 +33,9 @@ function stageToStep(stage: string, status: string, withScene = false): number {
 }
 
 export default function Play() {
-  const [levelId, setLevelId] = useState(''); const [orig, setOrig] = useState<Shape[]>([]); const [mod, setMod] = useState<Shape[]>([]);
-  const [img, setImg] = useState<ImgLevel | null>(null);
+  const [levelId, setLevelId] = useState(''); const [img, setImg] = useState<ImgLevel | null>(null);
   const [total, setTotal] = useState(0); const [found, setFound] = useState<Found[]>([]); const [mistakes, setMistakes] = useState(0);
-  const [hints, setHints] = useState(0); const [hintUsed, setHintUsed] = useState<Record<string, number>>({}); const [msg, setMsg] = useState('Loading sample level…'); const [start] = useState(Date.now());
+  const [hints, setHints] = useState(0); const [hintUsed, setHintUsed] = useState<Record<string, number>>({}); const [msg, setMsg] = useState('Create your level above, or pick one from the gallery below.'); const [start] = useState(Date.now());
   const [photo, setPhoto] = useState(''); const [photoName, setPhotoName] = useState(''); const [count, setCount] = useState(5); const [difficulty, setDifficulty] = useState('medium');
   const [busy, setBusy] = useState(false); const [dragOver, setDragOver] = useState(false); const [step, setStep] = useState(0); const [jobElapsed, setJobElapsed] = useState(0);
   const [theme, setTheme] = useState(''); const [themeUsed, setThemeUsed] = useState(false); const [previewImage, setPreviewImage] = useState('');
@@ -50,19 +47,18 @@ export default function Play() {
   const fileRef = useRef<HTMLInputElement>(null);
 
   const resetGame = (t: number) => { setTotal(t); setFound([]); setMistakes(0); setHints(0); setHintUsed({}); };
-  const load = async (seed = Math.floor(Math.random() * 9999)) => { setImg(null); const d = await (await fetch(`/api/demo-level?seed=${seed}`)).json(); setLevelId(d.levelId); setOrig(d.original); setMod(d.modified); resetGame(d.total); setMsg('Find all differences! Click them in either image — original or modified.'); };
   /** Load an EXISTING level (gallery / share link): stored images only, generates nothing. */
   const loadById = async (id: string) => {
     const res = await fetch(`/api/level?id=${encodeURIComponent(id)}`);
-    if (!res.ok) { setMsg('❌ That level could not be loaded — here is the demo level instead.'); void load(7); return; }
+    if (!res.ok) { setMsg('❌ That level could not be loaded — create your own above or pick another from the gallery.'); return; }
     const lv = await res.json();
+    if (lv.demo) { setMsg('❌ That level is no longer available — create your own above or pick one from the gallery.'); return; }
     setLevelId(lv.levelId); resetGame(lv.total);
-    if (lv.demo) { setImg(null); setOrig(lv.original); setMod(lv.modified); setMsg('Find all differences! Click them in either image — original or modified.'); }
-    else { setImg(lv); setMsg('✅ Level loaded — find all differences!'); }
+    setImg(lv); setMsg('✅ Level loaded — find all differences!');
   };
   useEffect(() => {
     const shared = new URLSearchParams(location.search).get('level');
-    if (shared) void loadById(shared); else void load(7);
+    if (shared) void loadById(shared);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -82,14 +78,14 @@ export default function Play() {
     const usingTheme = theme.trim().length > 0;
     const finalStep = STEPS.length + (usingTheme ? 1 : 0) - 1;
     // Clear the previous level immediately so only the processing animation is visible.
-    setImg(null); setOrig([]); setMod([]); setLevelId(''); resetGame(0);
+    setImg(null); setLevelId(''); resetGame(0);
     setBusy(true); setStep(0); setJobElapsed(0);
     setThemeUsed(usingTheme); setPreviewImage('');
     setMsg('Creating your level — this can take a couple of minutes.');
     const finish = () => { setBusy(false); };
     const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(usingTheme ? { theme: theme.trim(), count, mode: 'game', difficulty, accessCode: accessCode || undefined } : { imageDataUrl: photo || undefined, count, mode: 'game', difficulty, accessCode: accessCode || undefined }) });
     const data = await res.json();
-    if (res.status === 401) { finish(); setMsg('Generating new levels needs the access code provided in the hackathon submission. You can still play the demo and the gallery below.'); return; }
+    if (res.status === 401) { finish(); setMsg('Generating new levels needs the access code provided in the hackathon submission. You can still play the levels in the gallery below.'); return; }
     if (!res.ok) { finish(); setMsg(`❌ ${data.error ?? 'generation failed'}`); return; }
     for (let i = 0; i < 600; i++) {
       const s = await (await fetch(`/api/generate?id=${data.jobId}`)).json();
@@ -101,7 +97,7 @@ export default function Play() {
         const lv = s.level;
         setStep(finalStep);
         setLevelId(lv.levelId); resetGame(lv.total); finish();
-        if (lv.demo) { setImg(null); setOrig(lv.original); setMod(lv.modified); setMsg('Sample level ready — find all differences!'); }
+        if (lv.demo) { setMsg('⚠️ Real generation is off right now — please play one of the levels in the gallery below.'); }
         else { setImg(lv); setMsg('✅ Level ready — find all differences!'); }
         return;
       }
@@ -114,14 +110,6 @@ export default function Play() {
   const validate = async (x: number, y: number) => {
     const res = await (await fetch('/api/validate-click', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ levelId, x, y, foundIds: found.map(f => f.id) }) })).json();
     if (res.hit) { setFound(f => [...f, res.difference]); playFound(); setMsg(`✅ ${res.difference.description}`); } else { setMistakes(m => m + 1); playMiss(); setMsg('❌ Not there — mistake!'); }
-  };
-  /** Both panels are clickable: some differences are easier to spot from the original
-   *  side (e.g. a removed object). Coordinates come from the clicked element itself, so
-   *  the same handler serves both images; found circles render on both panels. */
-  const clickSvg = (e: React.MouseEvent<SVGSVGElement>) => {
-    if (found.length >= total || mistakes >= 5) return;
-    const r = e.currentTarget.getBoundingClientRect();
-    void validate(((e.clientX - r.left) / r.width) * 400, ((e.clientY - r.top) / r.height) * 300);
   };
   const clickImg = (e: React.MouseEvent<HTMLImageElement>) => {
     if (!img || found.length >= total || mistakes >= 5) return;
@@ -159,8 +147,6 @@ export default function Play() {
     })();
   }, [done]);
   useEffect(() => { if (!done) celebrated.current = false; }, [done]);
-  const Panel = ({ shapes, marks }: { shapes: Shape[]; marks?: Found[] }) => (
-    <svg onClick={clickSvg} viewBox="0 0 400 300" className="w-full rounded-xl bg-gradient-to-br from-slate-800 to-slate-950 cursor-crosshair" dangerouslySetInnerHTML={{ __html: renderShapes(shapes) + (marks ?? []).map(f => `<circle cx="${f.bbox.x + f.bbox.width / 2}" cy="${f.bbox.y + f.bbox.height / 2}" r="${Math.max(f.bbox.width, f.bbox.height) * 0.58}" fill="none" stroke="#22c55e" stroke-width="3"/>`).join('') }} />);
   const ImgPanel = ({ src, alt }: { src: string; alt: string }) => (
     <div className="relative w-full">
       {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -231,7 +217,6 @@ export default function Play() {
 
     <div className="flex flex-wrap gap-3 my-5 text-sm"><span className="bg-white/10 px-3 py-1 rounded-full">Found {found.length}/{total}</span><span className="bg-white/10 px-3 py-1 rounded-full">Mistakes {mistakes}/5</span>
       <button className="bg-white/10 px-3 py-1 rounded-full" onClick={requestHint}>💡 Hint ({hints})</button>
-      <button className="bg-indigo-500 px-3 py-1 rounded-full font-bold" onClick={() => load()}>↻ New demo level</button>
       {typeof window !== 'undefined' && levelId && <button className="bg-white/10 px-3 py-1 rounded-full" onClick={() => navigator.clipboard?.writeText(`${location.origin}/play?level=${levelId}`)}>🔗 Share link</button>}</div>
     <p aria-live="polite" className="font-semibold">{done ? `🎉 Finished! Score ${scoreGame(found.length, total, mistakes, hints, elapsed, found.map(f => f.difficulty ?? 3))} · ${elapsed}s` : msg}</p>
     {img?.theme && <p className="text-sm opacity-80 mt-1">🎨 Scene: “{img.revisedPrompt || img.theme}”</p>}
@@ -273,8 +258,11 @@ export default function Play() {
       <div className="grid md:grid-cols-2 gap-5 mt-4"><div><h2 className="font-bold mb-2">Original — click differences</h2><ImgPanel src={img.original} alt="Original — click differences" /></div>
         <div><h2 className="font-bold mb-2">Modified — click differences</h2><ImgPanel src={img.modified} alt="Modified — click differences" /></div></div>
     ) : (
-      <div className="grid md:grid-cols-2 gap-5 mt-4"><div><h2 className="font-bold mb-2">Original — click differences</h2><Panel shapes={orig} marks={found} /></div>
-        <div><h2 className="font-bold mb-2">Modified — click differences</h2><Panel shapes={mod} marks={found} /></div></div>
+      <div className="mt-4 rounded-xl border-2 border-dashed border-white/15 bg-white/5 px-6 py-14 text-center">
+        <p className="text-4xl">🖼️</p>
+        <p className="font-bold mt-3">Your level will appear here</p>
+        <p className="text-sm opacity-70 mt-1">Generate one from your photo or a scene above — or pick a ready-made level from the gallery below. No code needed to play those.</p>
+      </div>
     )}
     <ul className="mt-4 text-sm">{found.map(f => <li key={f.id}>✅ {f.description}</li>)}</ul>
     {mistakes >= 5 && !done && <p className="text-red-300 font-bold mt-3">Out of mistakes — generate or load a new level to try again.</p>}

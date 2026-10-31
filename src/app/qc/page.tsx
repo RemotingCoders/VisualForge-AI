@@ -1,17 +1,15 @@
 'use client';
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { generateDemoScene, renderShapes } from '@/lib/demoScene';
-import { clickHits, accuracy } from '@/lib/engine/geometry';
-import { toCOCO, toYOLO } from '@/lib/coco';
+import { useEffect, useRef, useState } from 'react';
+import { accuracy } from '@/lib/engine/geometry';
+import confetti from 'canvas-confetti';
+import { playFound, playMiss, playFanfare } from '@/lib/sounds';
 
-const DEFECTS = ['scratch', 'crack', 'dent', 'missing component', 'corrosion', 'misalignment', 'wrong color', 'foreign object'];
 type RealLevel = { levelId: string; original: string; modified: string; width: number; height: number; total: number; isMock: boolean; notice?: string };
 type FoundDiff = { id: string; description: string; bbox: { x: number; y: number; width: number; height: number }; centroid: { x: number; y: number } | null };
 type RevealDiff = { id: string; type: string; plannedType: string; label: string; severity: number | null; confidence: number | null; needsReview: boolean; bbox: { x: number; y: number; width: number; height: number }; centroid: { x: number; y: number } | null };
 const fmtTime = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 
 export default function QC() {
-  const scene = useMemo(() => generateDemoScene(42), []); const [found, setFound] = useState<string[]>([]); const [falsePos, setFalsePos] = useState(0); const [revealed, setRevealed] = useState(false); const ref = useRef<SVGSVGElement>(null);
   const [photo, setPhoto] = useState(''); const [photoName, setPhotoName] = useState(''); const [count, setCount] = useState(2); const [job, setJob] = useState(''); const [real, setReal] = useState<RealLevel | null>(null);
   const [dragOver, setDragOver] = useState(false); const [fileMsg, setFileMsg] = useState(''); const fileRef = useRef<HTMLInputElement>(null);
   // --- Real-level trainer state (separate from the MOCK scene trainer below) ---
@@ -19,8 +17,23 @@ export default function QC() {
   const [realMisses, setRealMisses] = useState<{ x: number; y: number }[]>([]); const [realRevealed, setRealRevealed] = useState(false);
   const [revealDiffs, setRevealDiffs] = useState<RevealDiff[]>([]); const [startedAt, setStartedAt] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState(0); const [sessionMsg, setSessionMsg] = useState('');
+  /** Frozen inspection time once every defect is found (fanfare moment) — the
+   *  clock stops there even though Reveal may happen later. */
+  const [finishedElapsed, setFinishedElapsed] = useState<number | null>(null);
   const imgRef = useRef<HTMLImageElement>(null); const sessionPosted = useRef(false);
-  const [demoOpen, setDemoOpen] = useState(true);
+  /** Example QC levels from the gallery: already generated, inspectable by anyone
+   *  without the access code (loading generates nothing). */
+  const [qcGallery, setQcGallery] = useState<{ levelId: string; original: string; total: number }[]>([]);
+  useEffect(() => {
+    void fetch('/api/gallery?mode=qc').then(r => r.json()).then(d => setQcGallery((d.levels ?? []).filter((l: { mode?: string }) => l.mode === 'qc'))).catch(() => { /* gallery is optional */ });
+  }, []);
+  const loadQcLevel = async (id: string) => {
+    const res = await fetch(`/api/level?id=${encodeURIComponent(id)}`);
+    if (!res.ok) { alert('That QC level could not be loaded.'); return; }
+    const lv = await res.json();
+    if (lv.demo || lv.mode !== 'qc') { alert('That is not a QC level.'); return; }
+    setReal(lv); window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
   /** Judge access code — same shared field as /play (remembered in localStorage). */
   const [accessCode, setAccessCode] = useState('');
   useEffect(() => { try { setAccessCode(localStorage.getItem('vf-access-code') ?? ''); } catch { /* private window */ } }, []);
@@ -28,27 +41,55 @@ export default function QC() {
   useEffect(() => {
     if (!real) return;
     setRealFound([]); setRealFalsePos(0); setRealMisses([]); setRealRevealed(false); setRevealDiffs([]);
-    setSessionMsg(''); sessionPosted.current = false; setStartedAt(Date.now()); setElapsed(0); setDemoOpen(false);
+    setSessionMsg(''); sessionPosted.current = false; setStartedAt(Date.now()); setElapsed(0); setFinishedElapsed(null);
   }, [real]);
-  // Inspection timer: ticks while a real level is loaded and not yet revealed.
+  // Inspection timer: ticks while a real level is loaded, not yet completed or revealed.
   useEffect(() => {
-    if (!startedAt || realRevealed) return;
+    if (!startedAt || realRevealed || finishedElapsed !== null) return;
     const t = setInterval(() => setElapsed(Math.floor((Date.now() - startedAt) / 1000)), 500);
     return () => clearInterval(t);
-  }, [startedAt, realRevealed]);
-  const click = (e: React.MouseEvent) => { if (!ref.current || revealed) return; const r = ref.current.getBoundingClientRect(); const x = ((e.clientX - r.left) / r.width) * 400, y = ((e.clientY - r.top) / r.height) * 300;
-    const hit = scene.differences.find(d => !found.includes(d.id) && clickHits({ x, y }, d.bbox, 14)); hit ? setFound(f => [...f, hit.id]) : setFalsePos(n => n + 1); };
+  }, [startedAt, realRevealed, finishedElapsed]);
   /** Real trainer: clicks on the defective unit are validated by the server
    *  (/api/validate-click) — the defect annotations never ship to the client. */
   const clickReal = async (e: React.MouseEvent) => {
-    if (!real || realRevealed || !imgRef.current) return;
+    if (!real || realRevealed || !imgRef.current || realFound.length >= real.total) return; // completed: extra clicks stop counting
     const r = imgRef.current.getBoundingClientRect();
     const x = ((e.clientX - r.left) / r.width) * real.width, y = ((e.clientY - r.top) / r.height) * real.height;
     const res = await fetch('/api/validate-click', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ levelId: real.levelId, x, y, foundIds: realFound.map(f => f.id) }) });
     const data = await res.json().catch(() => null);
-    if (data?.hit && data.difference) setRealFound(f => [...f, data.difference]);
-    else { setRealFalsePos(n => n + 1); setRealMisses(m => [...m, { x: (x / real.width) * 100, y: (y / real.height) * 100 }]); }
+    if (data?.hit && data.difference) { playFound(); setRealFound(f => [...f, data.difference]); }
+    else { playMiss(); setRealFalsePos(n => n + 1); setRealMisses(m => [...m, { x: (x / real.width) * 100, y: (y / real.height) * 100 }]); }
   };
+  /** Records the training session exactly once per level (server computes accuracy). */
+  const saveSession = async (correct: number, missed: number, falsePositives: number, durationSec: number) => {
+    if (!real || sessionPosted.current) return;
+    sessionPosted.current = true;
+    const s = await fetch('/api/qc-session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ levelId: real.levelId, correct, missed, falsePositives, durationSec }) }).then(r => r.json()).catch(() => null);
+    setSessionMsg(s?.ok ? `Session saved · accuracy ${Math.round((s.session.accuracy ?? 0) * 100)}% · ${durationSec}s` : 'Session could not be saved.');
+  };
+  /** Every defect found = inspection complete (same celebration as Play): the clock
+   *  freezes, the fanfare + confetti fire, and the session is recorded right there —
+   *  Reveal afterwards only shows the boxes/types, it does not re-time the session. */
+  const realDone = !!real && real.total > 0 && realFound.length >= real.total;
+  const celebrated = useRef(false);
+  useEffect(() => { if (!realDone) celebrated.current = false; }, [realDone]);
+  useEffect(() => {
+    if (!realDone || celebrated.current || !real) return;
+    celebrated.current = true;
+    const durationSec = startedAt ? Math.floor((Date.now() - startedAt) / 1000) : elapsed;
+    setFinishedElapsed(durationSec); setElapsed(durationSec);
+    playFanfare();
+    const colors = ['#6366f1', '#22c55e', '#fbbf24', '#06b6d4', '#f472b6'];
+    confetti({ particleCount: 130, spread: 80, origin: { y: 0.6 }, colors });
+    const end = Date.now() + 1100; // side cannons, ~1s of party
+    (function frame() {
+      confetti({ particleCount: 4, angle: 60, spread: 60, startVelocity: 55, origin: { x: 0, y: 0.7 }, colors });
+      confetti({ particleCount: 4, angle: 120, spread: 60, startVelocity: 55, origin: { x: 1, y: 0.7 }, colors });
+      if (Date.now() < end) requestAnimationFrame(frame);
+    })();
+    void saveSession(realFound.length, 0, realFalsePos, durationSec);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [realDone]);
   /** Reveal & score: fetch every defect box + classified type (QC-only endpoint),
    *  stop the clock and record the training session exactly once. */
   const revealReal = async () => {
@@ -56,17 +97,12 @@ export default function QC() {
     const res = await fetch(`/api/qc-reveal?levelId=${real.levelId}`);
     const data = await res.json().catch(() => null);
     if (!res.ok || !data?.differences) { alert(data?.error ?? 'Could not reveal this level.'); return; }
-    const durationSec = startedAt ? Math.floor((Date.now() - startedAt) / 1000) : elapsed;
+    const durationSec = finishedElapsed ?? (startedAt ? Math.floor((Date.now() - startedAt) / 1000) : elapsed);
     setElapsed(durationSec); setRevealDiffs(data.differences); setRealRevealed(true);
-    if (!sessionPosted.current) {
-      sessionPosted.current = true;
-      const missed = Math.max(0, real.total - realFound.length);
-      const s = await fetch('/api/qc-session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ levelId: real.levelId, correct: realFound.length, missed, falsePositives: realFalsePos, durationSec }) }).then(r => r.json()).catch(() => null);
-      setSessionMsg(s?.ok ? `Session saved · accuracy ${Math.round((s.session.accuracy ?? 0) * 100)}% · ${durationSec}s` : 'Session could not be saved.');
-    }
+    // If the trainee already found everything, the session was saved at the fanfare
+    // with the frozen time; saveSession's once-guard makes this a no-op then.
+    await saveSession(realFound.length, Math.max(0, real.total - realFound.length), realFalsePos, durationSec);
   };
-  const download = (name: string, text: string) => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' })); a.download = name; a.click(); };
-  const coco = () => download('visualforge-dataset.json', JSON.stringify(toCOCO([{ id: 1, file_name: 'product-modified.svg', width: 400, height: 300 }], scene.differences.map((d, i) => ({ imageId: 1, categoryId: (i % DEFECTS.length) + 1, bbox: d.bbox })), DEFECTS.map((n, i) => ({ id: i + 1, name: n }))), null, 2));
   const onFile = (f: File | undefined | null) => {
     if (!f) return;
     if (!f.type.startsWith('image/')) { setFileMsg(`❌ "${f.name}" is not an image — drop a JPG, PNG or WebP photo.`); return; }
@@ -78,9 +114,9 @@ export default function QC() {
     setJob('creating job…');
     const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ imageDataUrl: photo || undefined, count, mode: 'qc', accessCode: accessCode || undefined }) });
     const data = await res.json();
-    if (res.status === 401) { setJob(''); alert('Generating new levels needs the access code provided in the hackathon submission. You can still play the demo and the gallery below.'); return; }
+    if (res.status === 401) { setJob(''); alert('Generating new levels needs the access code provided in the hackathon submission. You can still inspect the example QC levels in the gallery below.'); return; }
     if (!res.ok) { setJob(''); alert(data.error ?? 'generation failed'); return; }
-    if (data.isMock) { setJob(''); setReal(null); alert('Offline MOCK provider: real QC generation is off. The offline MOCK trainer scene at the bottom remains available.'); return; }
+    if (data.isMock) { setJob(''); setReal(null); alert('Real QC generation is off right now — you can still inspect the example QC levels in the gallery below.'); return; }
     for (let i = 0; i < 600; i++) {
       const s = await (await fetch(`/api/generate?id=${data.jobId}`)).json();
       setJob(`job ${s.status}${s.stage ? ` · ${s.stage}` : ''} · ${s.elapsedSec ?? '?'}s elapsed (each AI call takes 3-60s)`);
@@ -92,7 +128,7 @@ export default function QC() {
   };
   const pct = (v: number, total: number) => `${(v / total) * 100}%`;
   return (<main className="max-w-5xl mx-auto px-5 py-8 font-mono">
-    <h1 className="text-3xl font-black">🏭 QC Inspection Trainer</h1><p className="opacity-70 mt-2 text-sm">Industrial mode · synthetic defects — validate before industrial use · generate a real defect level from your own photo, inspect the defective unit, then reveal &amp; score. The offline MOCK scene lives at the bottom.</p>
+    <h1 className="text-3xl font-black">🏭 QC Inspection Trainer</h1><p className="opacity-70 mt-2 text-sm">Industrial mode · synthetic defects — validate before industrial use · generate a real defect level from your own photo, inspect the defective unit, then reveal &amp; score. Or start right away with a ready-made example from the gallery below — no code needed.</p>
     <section className="mt-5 rounded bg-white/5 border border-white/10 p-4 text-sm">
       <h2 className="font-bold">📸 Real QC level from a photo</h2>
       {/* Drag & drop zone — same pattern as /play: also clickable to open the file picker. */}
@@ -157,7 +193,8 @@ export default function QC() {
           <span className="bg-white/10 px-3 py-1 rounded">Correct {realFound.length}</span>
           <span className="bg-white/10 px-3 py-1 rounded">False positives {realFalsePos}</span>
           <span className="bg-white/10 px-3 py-1 rounded">Accuracy {Math.round(accuracy(realFound.length, realFound.length + realFalsePos) * 100)}%</span>
-          <span className="bg-white/10 px-3 py-1 rounded">⏱ {fmtTime(elapsed)}</span>
+          <span className="bg-white/10 px-3 py-1 rounded">⏱ {fmtTime(finishedElapsed ?? elapsed)}</span>
+          {realDone && !realRevealed && <span className="bg-emerald-500/25 border border-emerald-400/40 px-3 py-1 rounded">🎉 All {real.total} defects found in {fmtTime(finishedElapsed ?? elapsed)}!</span>}
           <button className="bg-amber-500 text-black font-bold px-3 py-1 rounded disabled:opacity-50" disabled={realRevealed} onClick={revealReal}>Reveal &amp; score</button>
           {sessionMsg && <span className="opacity-80">{sessionMsg}</span>}
         </div>
@@ -180,17 +217,23 @@ export default function QC() {
         <p className="opacity-70 mt-2 text-xs">Exports include ONLY verified defects, labeled with the classified defect type, with the measured defect bbox (from the pixel-diff mask — not the edit crop). Defects classified with confidence under 60% are exported separately as needs_review. Clicks are validated by the server; the defect boxes stay server-side until you reveal. Synthetic data: validate before industrial use.</p>
       </div>)}
     </section>
-    <details open={demoOpen} onToggle={e => setDemoOpen(e.currentTarget.open)} className="mt-8 rounded bg-white/5 border border-white/10 p-4">
-      <summary className="font-bold cursor-pointer text-sm">🧩 Offline demo (MOCK) — practice scene, no AI generation</summary>
-      <div className="grid md:grid-cols-2 gap-5 mt-4">
-        <div><h2 className="font-bold mb-2">Reference (known-good)</h2><svg viewBox="0 0 400 300" className="w-full rounded bg-slate-900" dangerouslySetInnerHTML={{ __html: renderShapes(scene.original) }} /></div>
-        <div><h2 className="font-bold mb-2">Inspect this unit — click defects</h2><svg ref={ref} onClick={click} viewBox="0 0 400 300" className="w-full rounded bg-slate-900 cursor-crosshair" dangerouslySetInnerHTML={{ __html: renderShapes(scene.modified) + (revealed ? scene.differences.map(d => `<rect x="${d.bbox.x}" y="${d.bbox.y}" width="${d.bbox.width}" height="${d.bbox.height}" fill="none" stroke="#ef4444" stroke-width="3"/>`).join('') : '') }} /></div>
-      </div>
-      <div className="flex flex-wrap gap-3 mt-5 text-sm"><span className="bg-white/10 px-3 py-1 rounded">Correct {found.length}</span><span className="bg-white/10 px-3 py-1 rounded">False positives {falsePos}</span><span className="bg-white/10 px-3 py-1 rounded">Accuracy {Math.round(accuracy(found.length, found.length + falsePos) * 100)}%</span>
-        <button className="bg-amber-500 text-black font-bold px-3 py-1 rounded" onClick={() => setRevealed(true)}>Reveal &amp; score</button>
-        <button className="bg-indigo-500 font-bold px-3 py-1 rounded" onClick={coco}>⬇ MOCK scene — COCO JSON</button>
-        <button className="bg-white/15 px-3 py-1 rounded" onClick={() => download('labels.txt', scene.differences.map((d, i) => toYOLO(d.bbox, 400, 300, i % DEFECTS.length)).join('\n'))}>⬇ MOCK scene — YOLO txt</button></div>
-      {revealed && <p className="mt-4 text-sm">Missed: {scene.differences.length - found.length} · Only verified/human-approved samples enter production exports; unverified are separated and labeled synthetic.</p>}
-    </details>
+    {qcGallery.length > 0 && (
+      <section className="mt-8 rounded bg-white/5 border border-white/10 p-4 text-sm">
+        <h2 className="font-bold">🖼️ Example QC levels — no code needed</h2>
+        <p className="opacity-70 text-xs mt-1">Already generated and stored. Inspect one right away: find the defects, reveal &amp; score, export the dataset. Loading an example generates nothing.</p>
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mt-4">
+          {qcGallery.map(l => (
+            <div key={l.levelId} className="rounded bg-white/5 border border-white/10 overflow-hidden">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={l.original} alt="QC example part" className="w-full h-28 object-cover bg-slate-900" />
+              <div className="p-3">
+                <p className="text-xs opacity-80">{l.total} verified defects</p>
+                <button className="bg-indigo-500 font-bold px-3 py-1 rounded mt-2 w-full" onClick={() => void loadQcLevel(l.levelId)}>🔍 Inspect this unit</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+    )}
   </main>);
 }
