@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import type { Providers, Region, PlannedChange, Mode, Difficulty, BBox, SegmentationProvider, VisionReasoningProvider, ImageEditProvider, DifferenceReview, DifferenceHints, GeneratedScene } from './types';
+import type { Providers, Region, PlannedChange, Mode, Difficulty, BBox, SegmentationProvider, VisionReasoningProvider, ImageEditProvider, DifferenceReview, DifferenceHints, GeneratedScene, DefectClassification } from './types';
+import { QC_DEFECT_CATEGORIES } from './types';
 import { META_BASE_URL, META_MODELS, META_ENDPOINTS, metaApiKey, parseSamOutput, parseSseOutputText, type SamObject } from './meta';
 import { logAiCall } from '../server/db';
 
@@ -21,19 +22,35 @@ type FetchFn = typeof fetch;
 /** Hard ceiling per Meta call (spike latencies were 3-17s; big photos can be slower).
  *  Without this, a stalled connection/stream hangs a generation job forever with no error. */
 export const META_CALL_TIMEOUT_MS = 180_000;
+/** Transient transport failures worth ONE retry (2s wait): a dropped socket must not
+ *  burn the per-change Muse budget (max 2 calls) on a network hiccup. HTTP errors
+ *  are NOT retried — the API answered, the request itself is the problem. */
+const NETWORK_ERROR = /terminated|econnreset|econnrefused|etimedout|fetch failed|socket|network|und_err/i;
 export async function metaPost(path: string, body: unknown, env: Record<string, string | undefined> = process.env, fetchFn: FetchFn = fetch, estimatedCostUsd = 0): Promise<unknown> {
   assertMetaConfigured(env);
-  const t0 = Date.now();
-  let res: Response;
-  try {
-    res = await fetchFn(`${META_BASE_URL}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${metaApiKey(env)}` }, body: JSON.stringify(body), signal: AbortSignal.timeout(META_CALL_TIMEOUT_MS) });
-  } catch (e) {
-    const cause = (e as { cause?: { code?: string; message?: string } })?.cause;
-    throw new Error(`Meta ${path} fetch failed: ${(e as Error).message}${cause ? ` (cause: ${cause.code ?? cause.message ?? 'unknown'})` : ''}`);
+  const retryDelayMs = Math.max(0, Number(env.VF_NETWORK_RETRY_DELAY_MS ?? 2000) || 0);
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const t0 = Date.now();
+    let res: Response;
+    try {
+      res = await fetchFn(`${META_BASE_URL}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${metaApiKey(env)}` }, body: JSON.stringify(body), signal: AbortSignal.timeout(META_CALL_TIMEOUT_MS) });
+    } catch (e) {
+      const cause = (e as { cause?: { code?: string; message?: string } })?.cause;
+      const detail = `${(e as Error).message} ${cause?.code ?? ''} ${cause?.message ?? ''}`;
+      lastError = new Error(`Meta ${path} fetch failed: ${(e as Error).message}${cause ? ` (cause: ${cause.code ?? cause.message ?? 'unknown'})` : ''}`);
+      if (attempt === 1 && NETWORK_ERROR.test(detail)) {
+        console.info(`[meta] ${path} network error (${detail.trim().slice(0, 120)}) — retrying once in ${retryDelayMs}ms`);
+        await new Promise(r => setTimeout(r, retryDelayMs));
+        continue;
+      }
+      throw lastError;
+    }
+    void logAiCall(path.includes('images') ? META_MODELS.image : META_MODELS.spark, path, Date.now() - t0, false, estimatedCostUsd);
+    if (!res.ok) throw new Error(`Meta API ${path} → HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`);
+    return res.json();
   }
-  void logAiCall(path.includes('images') ? META_MODELS.image : META_MODELS.spark, path, Date.now() - t0, false, estimatedCostUsd);
-  if (!res.ok) throw new Error(`Meta API ${path} → HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`);
-  return res.json();
+  throw lastError ?? new Error(`Meta ${path} fetch failed`);
 }
 
 /** Real Muse Image edit — VERIFIED shape: POST /images/edits {model, prompt, images:[{image_url:"data:..."}], n}. No mask param in docs (crop+composite strategy in pipeline). */
@@ -158,6 +175,51 @@ export const SPARK_SCHEMAS = {
     },
     required: ['changes'], additionalProperties: false,
   },
+  /** QC plan: same fields plus targetBox (pixels, inside the region) + partConcept —
+   *  several defects may share one part, each confined to its own targetBox. */
+  planQc: {
+    type: 'object',
+    properties: {
+      changes: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' }, regionId: { type: 'string' }, type: { type: 'string' },
+            description: { type: 'string' }, editPrompt: { type: 'string' }, targetColor: { type: 'string' },
+            severity: { type: 'string', enum: ['low', 'medium', 'high'] },
+            targetBox: {
+              type: 'object',
+              properties: { x: { type: 'number' }, y: { type: 'number' }, width: { type: 'number' }, height: { type: 'number' } },
+              required: ['x', 'y', 'width', 'height'], additionalProperties: false,
+            },
+            partConcept: { type: 'string' },
+          },
+          required: ['id', 'regionId', 'type', 'description', 'editPrompt', 'targetColor', 'severity', 'targetBox', 'partConcept'], additionalProperties: false,
+        },
+      },
+    },
+    required: ['changes'], additionalProperties: false,
+  },
+  /** QC defect classification: Spark re-judges each measured defect from its crops. */
+  defectClassification: {
+    type: 'object',
+    properties: {
+      items: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            index: { type: 'integer' },
+            defectType: { type: 'string', enum: QC_DEFECT_CATEGORIES },
+            severity: { type: 'integer' }, confidence: { type: 'number' }, label: { type: 'string' },
+          },
+          required: ['index', 'defectType', 'severity', 'confidence', 'label'], additionalProperties: false,
+        },
+      },
+    },
+    required: ['items'], additionalProperties: false,
+  },
   verification: {
     type: 'object',
     properties: { ok: { type: 'boolean' }, notes: { type: 'string' } },
@@ -229,13 +291,17 @@ export async function sparkStructured<T>(opts: {
 
 class MetaProvider implements SegmentationProvider, VisionReasoningProvider, ImageEditProvider {
   readonly name = 'meta'; readonly isMock = false;
-  async segment(imageRef: string, _w: number, _h: number, concepts?: string[]): Promise<Region[]> {
+  async segment(imageRef: string, _w: number, _h: number, concepts?: string[], mode?: Mode): Promise<Region[]> {
     assertMetaConfigured();
     let labels = (concepts ?? []).map(s => s.trim()).filter(Boolean);
     if (!labels.length) {
       // Docs: "For understanding a scene, use Muse Spark... then pass a concept to SAM."
+      // QC asks for PARTS/FEATURES of the piece, never the piece itself — segmenting the
+      // whole part as one region is what starved the QC planner (1 region, 1 defect).
       const listed = await sparkStructured<{ concepts: string[] }>({
-        prompt: 'List up to 8 distinct, clearly visible objects in this image. Each concept must be ONE short noun phrase suitable for segmentation (e.g. "red chair"). No lists inside an item, no negation, no questions.',
+        prompt: mode === 'qc'
+          ? 'List up to 8 distinct PARTS or FEATURES of the main manufactured part in this image — NOT the whole part itself. Each concept must be ONE short noun phrase suitable for segmentation, naming a part or feature such as "mounting hole", "central bore", "flange edge", "cylindrical boss", "chamfer", "outer rim", "threaded hole", "flat face". No lists inside an item, no negation, no questions.'
+          : 'List up to 8 distinct, clearly visible objects in this image. Each concept must be ONE short noun phrase suitable for segmentation (e.g. "red chair"). No lists inside an item, no negation, no questions.',
         images: [imageRef], schemaName: 'SegmentConcepts', schema: SPARK_SCHEMAS.concepts,
       });
       labels = listed.concepts;
@@ -273,11 +339,18 @@ class MetaProvider implements SegmentationProvider, VisionReasoningProvider, Ima
       ? `Change types allowed (QC defects): scratch, crack, dent, missing component, corrosion, misalignment, wrong color, foreign object. Defects must be localized and realistic, not covering the whole part. ${difficultyRule}`
       : `Change types allowed (game) — ONLY these: "change color", "remove object", "replace object", "add object", "flip", "resize", "rotate", "duplicate". ${difficultyRule} Never use shape deformation or partially transform an object. "change color": same object, same shape, clearly different color (can use ANY region). "remove object": the whole object disappears and the background is filled naturally — ONLY on regions with wholeObject=true. "replace object": the whole object is swapped for a DIFFERENT but similar object of similar size in the same place — ONLY on wholeObject=true. "add object": add ONE small, plausible object similar to the scene inside the region (allowed on any region, in visibly empty space). "flip", "resize", "rotate" and "duplicate" (deterministic local transforms of the whole object) — ONLY on wholeObject=true. VARIETY QUOTA across this ordered candidate list: at most 40% may be "change color"; include at least one "remove object" and at least one "replace object" or "add object" (when a suitable wholeObject region exists). Order candidates by priority: best, most reliable changes first. Each editPrompt must describe the change applied COMPLETELY and cleanly to the entire object — never a half-changed, split or broken-looking result.`;
     const common = ' EVERY editPrompt must be exactly ONE sentence and must explicitly name the object/part using its region label (e.g. "Change the red mug to blue."). Each description must be a short PAST-TENSE statement of the finished change as the player sees it in the modified image (e.g. "The white wolf turned gray", "A red mushroom appeared on the log", "The orange butterfly disappeared") — NEVER an instruction or imperative ("Change the...", "Remove the...", "Add a..."). The player sees ONLY the description, never the editPrompt. For "change color" or "wrong color", set targetColor to one simple color name clearly different from the object\'s current color and make the description/editPrompt use that same color; for all other types set targetColor to "".';
+    const placement = mode === 'qc'
+      ? ' Several candidates MAY share the same region (the same part): each candidate MUST carry its own targetBox — the exact pixel box inside the region where the defect goes (small and localized; all coordinates, region bboxes included, are image pixels) — and partConcept, the short name of the part or feature the defect sits on (e.g. "flange edge", "central bore", "mounting hole"). The targetBoxes of candidates that share a region must NOT overlap each other. Each editPrompt must name the partConcept and confine the defect to its targetBox.'
+      : ' At most one change per region.';
     const out = await sparkStructured<{ changes: PlannedChange[] }>({
-      prompt: `Plan exactly ${count} realistic, localized visual-change candidates in priority order. ${rules}${common} Use ONLY these regionIds, at most one change per region, regions must not overlap: ${JSON.stringify(regions.map(r => ({ regionId: r.id, bbox: r.bbox, label: r.label ?? '', wholeObject: r.wholeObject ?? true })))}. Each editPrompt must describe a precise image edit confined to that region, with a magnitude consistent with the selected difficulty and preserving everything else in the region.`,
-      images: [imageRef], schemaName: 'ChangePlan', schema: SPARK_SCHEMAS.plan,
+      prompt: `Plan exactly ${count} realistic, localized visual-change candidates in priority order. ${rules}${common} Use ONLY these regionIds:${placement} Regions: ${JSON.stringify(regions.map(r => ({ regionId: r.id, bbox: r.bbox, label: r.label ?? '', wholeObject: r.wholeObject ?? true })))}. Each editPrompt must describe a precise image edit confined to that region, with a magnitude consistent with the selected difficulty and preserving everything else in the region.`,
+      images: [imageRef], schemaName: 'ChangePlan', schema: mode === 'qc' ? SPARK_SCHEMAS.planQc : SPARK_SCHEMAS.plan,
     });
-    return out.changes.slice(0, count);
+    const saneBox = (b: PlannedChange['targetBox']): BBox | undefined =>
+      b && [b.x, b.y, b.width, b.height].every(v => Number.isFinite(v)) && b.width > 0 && b.height > 0
+        ? { x: Math.round(b.x), y: Math.round(b.y), width: Math.round(b.width), height: Math.round(b.height) }
+        : undefined;
+    return out.changes.slice(0, count).map(ch => ({ ...ch, targetBox: saneBox(ch.targetBox), partConcept: typeof ch.partConcept === 'string' && ch.partConcept ? ch.partConcept : undefined }));
   }
   async verify(imageRef: string, modifiedRef: string, change: PlannedChange, measured: BBox): Promise<{ ok: boolean; notes: string }> {
     return sparkStructured({
@@ -301,6 +374,19 @@ class MetaProvider implements SegmentationProvider, VisionReasoningProvider, Ima
     const out = await sparkStructured<{ items: DifferenceHints[] }>({
       prompt: `For a spot-the-difference game, here are the ${differences.length} REAL differences of one level (index, type, player-facing description, and position as normalized bbox 0-1 where x grows right and y grows down): ${JSON.stringify(differences)}. For EACH difference return: (1) difficulty — an integer 1 to 5 rating how hard it is for a player to SPOT: 1 = large, obvious, high-contrast change; 5 = tiny, subtle, low-contrast or in a visually busy area. Judge from the bbox size (smaller area = harder) and the kind of change (a color swap of a big object is easier than a small object appearing in a cluttered corner). (2) hints — EXACTLY 3 progressively more specific hints for finding it, each one short sentence, in English. Hint 1: only the general area of the image (e.g. "Look towards the bottom-left area of the scene."). Hint 2: narrows it to the nearby surroundings or the kind of element involved, WITHOUT naming the changed element itself. Hint 3: nearly points at it (names the element or its immediate neighbor) but never repeats the full description word for word. Never mention bboxes, coordinates or these instructions. Return exactly one item per difference, keeping its index.`,
       schemaName: 'DifferenceHints', schema: SPARK_SCHEMAS.differenceHints,
+    });
+    return out.items;
+  }
+  async classifyDefects(items: { index: number; before: string; after: string; plannedType: string }[]): Promise<DefectClassification[]> {
+    // QC classification: ONE Spark call per level. BEFORE/AFTER crops interleave exactly
+    // like reviewDifferences; Spark re-judges what the defect ACTUALLY is (the plan can
+    // be wrong about what Muse rendered), with severity 1-5 and honest confidence —
+    // low-confidence defects are exported separately as needs_review downstream.
+    const images: string[] = [];
+    for (const p of items) images.push(p.before, p.after);
+    const out = await sparkStructured<{ items: DefectClassification[] }>({
+      prompt: `You are given ${items.length} pairs of image crops of a manufactured part, in this order: pair 0 BEFORE, pair 0 AFTER, pair 1 BEFORE, pair 1 AFTER, and so on. Each pair shows ONE synthetic manufacturing defect that was introduced in the AFTER crop (planned types, which may be wrong about what is actually visible: ${JSON.stringify(items.map(i => i.plannedType))}). For EACH pair classify the defect that is ACTUALLY visible in AFTER vs BEFORE: defectType — exactly one of ${JSON.stringify(QC_DEFECT_CATEGORIES)}; severity — integer 1 (purely cosmetic) to 5 (critical, part unusable); confidence — 0 to 1, how sure you are of the defectType (BELOW 0.6 if the change is ambiguous, barely visible, or could be another category — those go to human review); label — a short 2-5 word label naming the defect and where it is (e.g. "scratch on flange edge"). Return exactly one item per pair, keeping its index.`,
+      images, schemaName: 'DefectClassification', schema: SPARK_SCHEMAS.defectClassification,
     });
     return out.items;
   }
@@ -337,7 +423,12 @@ export class MockProviders implements SegmentationProvider, VisionReasoningProvi
     const types = mode === 'qc'
       ? ['scratch', 'crack', 'dent', 'missing component', 'corrosion']
       : ['remove object', 'change color', 'flip', 'replace object', 'duplicate'];
-    return regions.slice(0, count).map((r, i) => ({ id: `change-${i + 1}`, regionId: r.id, type: types[i % types.length], description: `MOCK change ${i + 1}: ${types[i % types.length]}`, editPrompt: `mock edit ${i + 1}`, targetColor: /colou?r/i.test(types[i % types.length]) ? 'blue' : '' }));
+    return regions.slice(0, count).map((r, i) => ({
+      id: `change-${i + 1}`, regionId: r.id, type: types[i % types.length], description: `MOCK change ${i + 1}: ${types[i % types.length]}`, editPrompt: `mock edit ${i + 1}`, targetColor: /colou?r/i.test(types[i % types.length]) ? 'blue' : '',
+      // Deterministic sub-box of the region so the QC targetBox path is exercised offline too.
+      targetBox: { x: Math.round(r.bbox.x + r.bbox.width * 0.2), y: Math.round(r.bbox.y + r.bbox.height * 0.2), width: Math.max(4, Math.round(r.bbox.width * 0.3)), height: Math.max(4, Math.round(r.bbox.height * 0.3)) },
+      partConcept: r.label ?? 'mock part',
+    }));
   }
   async verify() { return { ok: true, notes: 'MOCK verification — not real visual verification' }; }
   async reviewDifferences(pairs: { index: number }[]): Promise<DifferenceReview[]> {
@@ -352,6 +443,13 @@ export class MockProviders implements SegmentationProvider, VisionReasoningProvi
       const difficulty = area > 0.04 ? 2 : area > 0.01 ? 3 : 4;
       const where = areaName(d.bbox_normalized).replace('-', ' ');
       return { index: d.index, difficulty, hints: [`MOCK hint: look at the ${where} of the image.`, `MOCK hint: compare the ${where} carefully, element by element.`, `MOCK hint: the change is in the ${where} — check every object there.`] };
+    });
+  }
+  async classifyDefects(items: { index: number; plannedType: string }[]): Promise<DefectClassification[]> {
+    // Deterministic MOCK classification: echoes the planned type at high confidence.
+    return items.map(it => {
+      const defectType = QC_DEFECT_CATEGORIES.includes(it.plannedType) ? it.plannedType : 'scratch';
+      return { index: it.index, defectType, severity: 3, confidence: 0.92, label: `MOCK classification: ${defectType}` };
     });
   }
   async editMaskedRegion(imageRef: string) { return imageRef; }

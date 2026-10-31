@@ -8,6 +8,15 @@ import type { Difference, Mode } from '../engine/types';
  *  Tables: visualforge_* (prefixed for the shared database). RLS is deny-by-default;
  *  this server client uses the service role. */
 
+/** A missing column (migration not applied yet) is an operator heads-up, not a
+ *  per-level event: log it ONCE per process instead of once per generated level. */
+const warnedOnce = new Set<string>();
+export function warnOnce(key: string, message: string): void {
+  if (warnedOnce.has(key)) return;
+  warnedOnce.add(key);
+  console.info(message);
+}
+
 export interface JobSnapshot {
   id: string; status: string; stage: string; mode: Mode; isMock: boolean;
   error?: string; requestedChanges?: number; createdAt: number; updatedAt: number;
@@ -84,11 +93,21 @@ export async function persistImageLevel(levelId: string, args: PersistLevelArgs)
         severity: d.severity, verification_status: d.verification_status, verifier_notes: d.verifier_notes,
         centroid: d.centroid ?? null,
       }));
-      // hints/difficulty need migration 0004: on a pre-0004 database the insert errors
-      // and we retry with the base rows (same pattern as theme columns on levels).
+      // hints/difficulty need migration 0004 and the QC classification columns need
+      // 0005: on an older database the wider insert errors and we retry narrower
+      // (same pattern as theme columns on levels). Missing-column fallbacks are
+      // logged once per process (warnOnce), not once per level.
       const hintedRows = baseRows.map((r, i) => ({ ...r, hints: args.differences[i].hints ?? null, difficulty: args.differences[i].difficulty ?? null }));
-      let e4 = (await sb.from('visualforge_differences').insert(hintedRows)).error;
-      if (e4) e4 = (await sb.from('visualforge_differences').insert(baseRows)).error;
+      const fullRows = hintedRows.map((r, i) => ({
+        ...r,
+        classified_type: args.differences[i].classifiedType ?? null,
+        classified_severity: args.differences[i].classifiedSeverity ?? null,
+        classification_confidence: args.differences[i].classificationConfidence ?? null,
+        classification_label: args.differences[i].classificationLabel ?? null,
+      }));
+      let e4 = (await sb.from('visualforge_differences').insert(fullRows)).error;
+      if (e4) { warnOnce('diff-classification-columns', `[db] difference classification columns not persisted (migration 0005 not applied?) — retrying without them`); e4 = (await sb.from('visualforge_differences').insert(hintedRows)).error; }
+      if (e4) { warnOnce('diff-hint-columns', `[db] difference hints/difficulty not persisted (migration 0004 not applied?) — retrying with base rows`); e4 = (await sb.from('visualforge_differences').insert(baseRows)).error; }
       if (e4) throw e4;
     }
     console.info(`[db] level ${levelId} persisted (${args.differences.length} differences)`);
@@ -109,10 +128,23 @@ export async function persistDifferenceHints(levelId: string, differences: Diffe
       const { error } = await sb.from('visualforge_differences')
         .update({ hints: d.hints ?? null, difficulty: d.difficulty ?? null })
         .eq('level_id', levelId).eq('description', d.description).eq('type', d.type);
-      if (error) { console.info(`[db] difference hints not persisted for level ${levelId}: ${error.message} (migration 0004 not applied?)`); return; }
+      if (error) { warnOnce('diff-hints-update', `[db] difference hints not persisted for level ${levelId}: ${error.message} (migration 0004 not applied?)`); return; }
     }
     console.info(`[db] hints persisted for level ${levelId} (${differences.length} differences)`);
   } catch (e) { console.error('[db] persistDifferenceHints failed:', e); }
+}
+
+/** QC trainer session (recorded at Reveal & score): mirrors the in-memory record. */
+export async function persistQcSession(levelId: string, s: { correct: number; missed: number; falsePositives: number; accuracy: number; durationSec: number }): Promise<void> {
+  const sb = getServiceClient(); if (!sb) return;
+  try {
+    const { error } = await sb.from('visualforge_qc_sessions').insert({
+      level_id: levelId, correct: s.correct, missed: s.missed,
+      false_positives: s.falsePositives, accuracy: s.accuracy, duration_sec: s.durationSec,
+    });
+    if (error) { warnOnce('qc-session-insert', `[db] QC session not persisted: ${error.message}`); return; }
+    console.info(`[db] QC session saved for level ${levelId}: correct=${s.correct} missed=${s.missed} falsePositives=${s.falsePositives} accuracy=${s.accuracy.toFixed(2)} duration=${s.durationSec}s`);
+  } catch (e) { console.error('[db] persistQcSession failed:', e); }
 }
 
 const rowToDifference = (r: Record<string, unknown>): Difference => ({
@@ -126,6 +158,11 @@ const rowToDifference = (r: Record<string, unknown>): Difference => ({
   // Capability 2 (migration 0004): absent on pre-0004 rows.
   hints: Array.isArray(r.hints) ? (r.hints as string[]) : undefined,
   difficulty: typeof r.difficulty === 'number' ? r.difficulty : undefined,
+  // QC classification (migration 0005): absent on pre-0005 rows.
+  classifiedType: typeof r.classified_type === 'string' ? r.classified_type : undefined,
+  classifiedSeverity: typeof r.classified_severity === 'number' ? r.classified_severity : undefined,
+  classificationConfidence: typeof r.classification_confidence === 'number' ? r.classification_confidence : undefined,
+  classificationLabel: typeof r.classification_label === 'string' ? r.classification_label : undefined,
 });
 
 export async function loadDifferences(levelId: string): Promise<Difference[] | null> {

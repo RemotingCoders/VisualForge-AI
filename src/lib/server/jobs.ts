@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { enforceSpacing, maskToBBox, maskCentroid, maskToPolygon, normalizeBBox, overlaps } from '../engine/geometry';
 import { maskRasterToFrame } from '../engine/meta';
-import type { Providers, Mode, Difficulty, Difference, Region, PlannedChange } from '../engine/types';
+import type { Providers, Mode, Difficulty, Difference, Region, PlannedChange, BBox } from '../engine/types';
 import { normalizeImage, imageInfo, cropDataUrl, expandBox, expandMask, diffMask, providerImage, clampBox, recolorCrop, squareContextBox, compositeMaskedEdit, estimateAlignment, alignEditedCrop, ALIGNMENT_MAX_RESIDUAL, cropColorStats, colorDeltaE, targetHueFromColor, cropDominantHue, transformObjectInPaste, duplicateObjectInPaste, extractOnePassComponents, compositeOnePassComponents, type OnePassComponent, type LocalTransformKind } from './imageOps';
 import { saveImageLevel } from '../serverStore';
 import { ThemeRejectedError } from '../engine/providers';
@@ -123,7 +123,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     // plan is used only if one-pass delivers less than N (game top-up/fallback) or in QC.
     const prepareCropPlan = async (): Promise<{ regions: Region[]; plan: PlannedChange[] }> => {
       setStage('segmenting');
-      const rawRegions = await providers.segmentation.segment(aiImg, width, height); calls.sam++;
+      const rawRegions = await providers.segmentation.segment(aiImg, width, height, undefined, job.mode); calls.sam++;
       // wholeObject is decided by SAM's box AREA: <= 8% of the image = whole object. Only
       // above that do we center-crop (aspect preserved, scaled to the area cap) and mark it
       // fragment (wholeObject=false: color/add only in game mode — removing, replacing or
@@ -223,7 +223,9 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     };
     const runOnePassPass = async (passBase: string, want: number, label: string): Promise<string | null> => {
       if (!providers.imageEdit.editFullImage || want <= 0) return null;
-      const prompt = label === 'pass1'
+      const prompt = job.mode === 'qc'
+        ? `Add exactly ${want} realistic manufacturing defects to this part (scratch, dent, crack, corrosion spot, missing screw or component, misalignment). Each defect small and localized, physically plausible for this material. Keep everything else pixel-identical.`
+        : label === 'pass1'
         ? `Make exactly ${want} minimal, realistic differences for a spot-the-difference game (for example: remove a small part of an object, add a small detail to an object, add a small object in an empty area). To get variety, vary the kind of change: add a small detail, remove a small part, add a small object, change one color, swap one element. Keep everything else pixel-identical: same framing, scale, colors and lighting.`
         : `Make exactly ${want} additional minimal, realistic differences for a spot-the-difference game, in places that do not already contain a difference. To get variety, vary the kind of change: add a small detail, remove a small part, add a small object, change one color, swap one element. Keep everything else pixel-identical: same framing, scale, colors and lighting.`;
       const edited = await providers.imageEdit.editFullImage(await providerImage(passBase), prompt); calls.muse++;
@@ -303,13 +305,16 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       return composed;
     };
 
-    if (job.mode === 'game') {
+    // One-pass runs FIRST in both modes (game's main path; QC's defect painter with its
+    // own manufacturing-defects prompt). Same alignment compensation, extraction and
+    // batched review; the crop pipeline below tops up whatever it misses.
+    {
       try {
-        setStage('one-pass: editing full image (Muse)');
+        setStage(job.mode === 'qc' ? 'one-pass: adding defects to the full image (Muse)' : 'one-pass: editing full image (Muse)');
         const afterPass1 = await runOnePassPass(img.dataUrl, count, 'pass1');
-        if (afterPass1) { current = afterPass1; modeUsed = 'one-pass'; }
+        if (afterPass1) { current = afterPass1; if (job.mode === 'game') modeUsed = 'one-pass'; }
         // If pass 1 delivered less than N, the crop pipeline (already segmented +
-        // planned in parallel, below) tops up first; only if the level is STILL
+        // planned in parallel, below) tops up first; only if a GAME level is STILL
         // short does the completion block further down spend a second one-pass call.
       } catch (e) {
         console.info(`[generate ${job.id}] one-pass failed (${e instanceof Error ? e.message : String(e)}) — falling back to crop pipeline`);
@@ -332,12 +337,14 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     // Max 2 Muse calls per change (initial edit + one verifier-driven re-edit); when the
     // budget is exhausted the executor moves on to the next candidate.
     type MuseBudget = { calls: number };
-    const applyMuse = async (base: string, ch: (typeof plan)[number], region: Region, prompt: string, budget: MuseBudget): Promise<Candidate | null> => {
+    const applyMuse = async (base: string, ch: (typeof plan)[number], region: Region, prompt: string, budget: MuseBudget, anchor: BBox): Promise<Candidate | null> => {
       if (budget.calls >= 2) { console.info(`[generate ${job.id}] change ${ch.id} discarded: Muse call budget exhausted (max 2 per change)`); return null; }
       budget.calls++; calls.muse++;
       // A: square CONTEXT box to Muse; separate smaller PASTE box (object + small margin).
-      const contextBox = squareContextBox(region.bbox, width, height);
-      const pasteBox = expandBox(region.bbox, 0.15, width, height);
+      // QC: both derive from the candidate's targetBox (where the defect goes), never
+      // from the whole region — the region may be the entire part.
+      const contextBox = squareContextBox(anchor, width, height);
+      const pasteBox = expandBox(anchor, 0.15, width, height);
       const relPaste = { x: pasteBox.x - contextBox.x, y: pasteBox.y - contextBox.y, width: pasteBox.width, height: pasteBox.height };
       const { cropDataUrl: contextCrop } = await cropDataUrl(base, contextBox);
       // ONE Muse call per attempt: a "keep the framing" re-prompt does not change Muse's
@@ -364,9 +371,11 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       return { next, mask, bbox, local: false, notes: '' };
     };
 
-    const applyLocalRecolor = async (base: string, ch: (typeof plan)[number], region: Region): Promise<Candidate | null> => {
+    const applyLocalRecolor = async (base: string, ch: (typeof plan)[number], region: Region, anchor: BBox): Promise<Candidate | null> => {
       // D: recolor ONLY the object's own bbox pixels (never the expanded context), in OKLCH.
-      const { cropDataUrl: objCrop, cropBox } = await cropDataUrl(base, region.bbox);
+      // QC: the anchor is the candidate's targetBox, so a "wrong color" defect recolors
+      // just the defect area instead of the whole part.
+      const { cropDataUrl: objCrop, cropBox } = await cropDataUrl(base, anchor);
       const stats = await cropColorStats(objCrop);
       const targetHue = targetHueFromColor(ch.targetColor);
       if (ch.targetColor && targetHue === null) { console.info(`[generate ${job.id}] change ${ch.id}: local recolor skipped — target color "${ch.targetColor}" has no hue (achromatic/unknown), Muse fallback`); return null; }
@@ -398,7 +407,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       if (targetHue !== null && resultHue !== null && hueDist(resultHue, targetHue) > 35) { console.info(`[generate ${job.id}] change ${ch.id}: local recolor rejected — result hue ${Math.round(resultHue)}° does not match target ${Math.round(targetHue)}°, Muse fallback`); return null; }
       if (delta.changedPixels < 30 || delta.meanDeltaE < 0.12) { console.info(`[generate ${job.id}] change ${ch.id}: local recolor skipped — ΔE ${delta.meanDeltaE.toFixed(3)} / ${delta.changedPixels}px below minimum (ΔE 0.12, 30px), Muse fallback`); return null; }
       const best = { recolored, meanDeltaE: delta.meanDeltaE, changedPixels: delta.changedPixels, hue: chosenHue };
-      const next = await compositeMaskedEdit(base, best.recolored, region.bbox, region.bbox);
+      const next = await compositeMaskedEdit(base, best.recolored, anchor, anchor);
       const mask = await diffMask(base, next, width, height);
       const bbox = maskToBBox(mask, width, height);
       if (!bbox) { console.info(`[generate ${job.id}] change ${ch.id} discarded: recolor produced no measurable diff`); return null; }
@@ -445,56 +454,72 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     const executeCandidate = async (ch: (typeof plan)[number], position: number, total: number): Promise<void> => {
       const region = regions.find(r => r.id === ch.regionId);
       if (!region) { console.info(`[generate ${job.id}] change ${ch.id} discarded: unknown regionId ${ch.regionId}`); return; }
-      if (differences.some(d => overlaps(d.bbox, region.bbox, 4))) { console.info(`[generate ${job.id}] change ${ch.id} discarded: region overlaps an already-accepted difference`); return; }
+      // QC: the anchor is the candidate's targetBox inside the part (context/paste derive
+      // from it). GAME: the anchor is the whole region, as before.
+      const anchorBox: BBox = job.mode === 'qc' && ch.targetBox ? clampBox(ch.targetBox, width, height) : region.bbox;
+      if (job.mode === 'qc') {
+        // Several defects on the SAME part are valid; what is forbidden is stepping on an
+        // already-accepted defect. Overlap is judged against the accepted defects'
+        // MEASURED bboxes (8px margin) — never against the region box: when SAM returns
+        // the whole piece as one region, a region-box check discards every defect after
+        // the first (field case: 1 of 3 delivered).
+        if (differences.some(d => overlaps(d.bbox, anchorBox, 8))) { console.info(`[generate ${job.id}] change ${ch.id} discarded: target overlaps an already-accepted defect (measured boxes, 8px margin)`); return; }
+      } else if (differences.some(d => overlaps(d.bbox, region.bbox, 4))) { console.info(`[generate ${job.id}] change ${ch.id} discarded: region overlaps an already-accepted difference`); return; }
       setStage(`editing ${position}/${total} · ${differences.length}/${count} done`);
       const budget: MuseBudget = { calls: 0 };
       const isColor = /colou?r/i.test(ch.type);
       const localKind = job.mode === 'game' ? LOCAL_KIND(ch.type) : null;
       let candidate: Candidate | null = null;
-      if (isColor) candidate = await applyLocalRecolor(current, ch, region);
+      if (isColor) candidate = await applyLocalRecolor(current, ch, region, anchorBox);
       else if (localKind) candidate = await applyLocalTransform(current, ch, region, localKind);
       // Muse is reserved for remove / replace / add / QC defects, plus color changes the
       // deterministic recolor could not do. Local geometric transforms get no Muse fallback.
-      if (!candidate && !localKind) candidate = await applyMuse(current, ch, region, ch.editPrompt, budget);
+      if (!candidate && !localKind) candidate = await applyMuse(current, ch, region, ch.editPrompt, budget, anchorBox);
       if (!candidate) { console.info(`[generate ${job.id}] change ${ch.id} discarded: no aligned, measurable edit (next candidate)`); return; }
+      // Typed alias for the accepted candidate (TS loses the null narrowing on the
+      // `let` across awaits); the verifier re-edit below may still swap it once.
+      let finalCandidate: Candidate = candidate;
+      // Post-measure guard (QC): the defect Muse actually painted must not step on an
+      // accepted one either — same measured-box rule, 8px margin.
+      if (job.mode === 'qc' && differences.some(d => overlaps(d.bbox, finalCandidate.bbox, 8))) { console.info(`[generate ${job.id}] change ${ch.id} discarded: measured defect overlaps an already-accepted defect (8px margin)`); return; }
 
-      let notes = candidate.notes;
-      if (!candidate.local) {
+      let notes = finalCandidate.notes;
+      if (!finalCandidate.local) {
         setStage(`verifying ${position}/${total} · ${differences.length}/${count} done`);
         // Verify the change IN ISOLATION: the image as it was JUST BEFORE this change
         // (current) vs the candidate, BOTH cropped to the context box. Comparing the
         // original against the accumulated image made the verifier reject changes for
         // "differences outside the region" that were earlier, already-accepted changes.
         const verifyChange = async (cand: Candidate): Promise<{ ok: boolean; notes: string }> => {
-          const contextBox = squareContextBox(region.bbox, width, height);
+          const contextBox = squareContextBox(anchorBox, width, height);
           const rel = { x: cand.bbox.x - contextBox.x, y: cand.bbox.y - contextBox.y, width: cand.bbox.width, height: cand.bbox.height };
           const { cropDataUrl: beforeCrop } = await cropDataUrl(current, contextBox);
           const { cropDataUrl: afterCrop } = await cropDataUrl(cand.next, contextBox);
           const verdict = await providers.vision.verify(await providerImage(beforeCrop), await providerImage(afterCrop), ch, rel); calls.spark++;
           return verdict;
         };
-        let verdict = await verifyChange(candidate);
+        let verdict = await verifyChange(finalCandidate);
         if (!verdict.ok) {
           // E: re-edit ONCE within the same Muse budget (never re-ask the verifier the
           // same question), then discard and move to the next candidate.
-          const retry = await applyMuse(current, ch, region, `${ch.editPrompt} The previous attempt failed verification (${verdict.notes}); apply the change more clearly and realistically, confined to the same object.`, budget);
+          const retry = await applyMuse(current, ch, region, `${ch.editPrompt} The previous attempt failed verification (${verdict.notes}); apply the change more clearly and realistically, confined to the same object.`, budget, anchorBox);
           if (retry) {
             verdict = await verifyChange(retry);
-            if (verdict.ok) candidate = retry;
+            if (verdict.ok) finalCandidate = retry;
           }
           if (!verdict.ok) { console.info(`[generate ${job.id}] change ${ch.id} discarded after re-edit: ${verdict.notes}`); return; }
         }
         notes = verdict.notes;
       }
       differences.push({
-        id: ch.id, type: ch.type, description: ch.description, bbox: candidate.bbox, bbox_normalized: normalizeBBox(candidate.bbox, width, height),
-        segmentation: maskToPolygon(candidate.mask, width, height) ?? undefined,
-        area_px: candidate.mask.reduce((a, v) => a + (v ? 1 : 0), 0),
-        centroid: maskCentroid(candidate.mask, width, height) ?? { x: candidate.bbox.x + candidate.bbox.width / 2, y: candidate.bbox.y + candidate.bbox.height / 2 },
+        id: ch.id, type: ch.type, description: ch.description, bbox: finalCandidate.bbox, bbox_normalized: normalizeBBox(finalCandidate.bbox, width, height),
+        segmentation: maskToPolygon(finalCandidate.mask, width, height) ?? undefined,
+        area_px: finalCandidate.mask.reduce((a, v) => a + (v ? 1 : 0), 0),
+        centroid: maskCentroid(finalCandidate.mask, width, height) ?? { x: finalCandidate.bbox.x + finalCandidate.bbox.width / 2, y: finalCandidate.bbox.y + finalCandidate.bbox.height / 2 },
         mask_url: null, severity: ch.severity ?? 'medium',
         verification_status: 'verified', verifier_notes: notes,
       });
-      current = candidate.next;
+      current = finalCandidate.next;
     };
     // A candidate whose edit throws must not abort the whole list — discard it and
     // move on (candidates are a priority list; the count guarantee decides at the end).
@@ -521,7 +546,11 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       // parts of the image are still free. If no free region remains, the top-up
       // ends here and the reason is logged (the completion block downstream decides
       // whether the level can still be completed another way or must fail).
-      const freeRegions = regions.filter(r => !differences.some(d => overlaps(d.bbox, r.bbox, 4)));
+      // QC: "free zones" are free TARGET AREAS, not regions — every region stays
+      // plannable and new defects are placed by targetBox away from the accepted ones
+      // (the executor's measured-box overlap checks enforce the separation). GAME:
+      // only regions untouched by an accepted difference are offered.
+      const freeRegions = job.mode === 'qc' ? regions : regions.filter(r => !differences.some(d => overlaps(d.bbox, r.bbox, 4)));
       if (!freeRegions.length) {
         console.info(`[generate ${job.id}] replacement plan skipped: no free regions left (every region overlaps an accepted difference) — crop top-up ends at ${differences.length}/${count}`);
       } else {
@@ -553,11 +582,14 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
 
     if (differences.length < count) {
       if (job.mode === 'game' && differences.length > 0) modeUsed = 'one-pass + crops';
+      const beforeCrops = differences.length;
       try { await cropTopUp(); }
       catch (e) {
         if (!differences.length) throw e;
         console.info(`[generate ${job.id}] crop top-up failed (${e instanceof Error ? e.message : String(e)}) — keeping the ${differences.length} difference(s) accepted so far`);
       }
+      // Per-path delivery accounting (one-pass vs crops), logged for both modes.
+      console.info(`[generate ${job.id}] delivery by path: one-pass ${beforeCrops}, crops +${differences.length - beforeCrops} — total ${differences.length}/${count}`);
     }
 
     // ============ COMPLETION GUARANTEE (game mode) ============
@@ -585,12 +617,52 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       const hasOnePass = differences.some(d => d.id.startsWith('onepass-'));
       modeUsed = hasCrop && hasOnePass ? 'one-pass + crops' : hasOnePass ? 'one-pass' : 'crops';
     }
+    if (job.mode === 'qc' && differences.length) {
+      const hasCrop = differences.some(d => !d.id.startsWith('onepass-'));
+      const hasOnePass = differences.some(d => d.id.startsWith('onepass-'));
+      modeUsed = hasCrop && hasOnePass ? 'one-pass + crops (qc)' : hasOnePass ? 'one-pass (qc)' : 'crops (qc)';
+    }
     if (!differences.length) throw new Error('no change survived measurement/verification');
     if (job.mode === 'game' && differences.length < count) throw new Error(`We could only create ${differences.length} of the ${count} differences for this image — please try generating again.`);
 
+    // ============ QC DEFECT CLASSIFICATION (one Spark call per level) ============
+    // After measurement, Spark re-classifies each defect from its before/after crops:
+    // what Muse actually rendered can differ from the planned type. Non-fatal — on
+    // failure the defects keep their planned type and exports fall back to it.
+    if (job.mode === 'qc' && providers.vision.classifyDefects) {
+      const classifyDefects = providers.vision.classifyDefects;
+      try {
+        setStage('classifying defects');
+        const items = await Promise.all(differences.map(async (d, i) => {
+          const box = squareContextBox(d.bbox, width, height, 192);
+          const before = await cropDataUrl(img.dataUrl, box);
+          const after = await cropDataUrl(current, box);
+          return { index: i, before: await providerImage(before.cropDataUrl), after: await providerImage(after.cropDataUrl), plannedType: d.type };
+        }));
+        const results = await classifyDefects(items); calls.spark++;
+        for (const r of results) {
+          const d = differences[r.index]; if (!d) continue;
+          d.classifiedType = r.defectType;
+          d.classifiedSeverity = Math.min(5, Math.max(1, Math.round(Number(r.severity) || 3)));
+          d.classificationConfidence = Math.min(1, Math.max(0, Number(r.confidence) || 0));
+          d.classificationLabel = String(r.label ?? '').slice(0, 80);
+          console.info(`[generate ${job.id}] defect ${d.id}: planned="${d.type}" classified="${d.classifiedType}" severity=${d.classifiedSeverity}/5 confidence=${d.classificationConfidence.toFixed(2)} label="${d.classificationLabel}"${d.classificationConfidence < 0.6 ? ' → needs_review' : ''}`);
+        }
+        console.info(`[generate ${job.id}] defect classification: ${results.length}/${differences.length} defects classified (1 Spark call)`);
+      } catch (e) {
+        console.info(`[generate ${job.id}] defect classification failed (${e instanceof Error ? e.message : String(e)}) — keeping planned types`);
+      }
+    }
+
+    // QC count policy differs from the game's: a short QC level still publishes (the
+    // trainer works with what was verified) and carries an explicit notice instead of
+    // failing the job. Only zero defects at all is a hard failure (handled above).
+    const notice = job.mode === 'qc' && differences.length < count ? `Generated ${differences.length} of ${count} defects` : undefined;
+    if (notice) console.info(`[generate ${job.id}] ${notice} — publishing the partial QC level with this notice instead of failing`);
+
     logSummary(differences);
 
-    const levelId = saveImageLevel({ differences, original: img.dataUrl, modified: current, width, height, isMock: providers.segmentation.isMock, mode: job.mode, jobId: job.id, theme, revisedPrompt });
+    const levelId = saveImageLevel({ differences, original: img.dataUrl, modified: current, width, height, isMock: providers.segmentation.isMock, mode: job.mode, jobId: job.id, theme, revisedPrompt, notice });
     job.levelId = levelId;
     job.status = 'done'; setStage('done');
 
