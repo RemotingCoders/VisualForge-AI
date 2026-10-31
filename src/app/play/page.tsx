@@ -5,6 +5,7 @@ import type { Shape } from '@/lib/demoScene';
 import { renderShapes } from '@/lib/demoScene';
 import { scoreGame } from '@/lib/engine/geometry';
 import { playFound, playMiss, playFanfare } from '@/lib/sounds';
+import Gallery from '@/components/Gallery';
 
 type Found = { id: string; description: string; bbox: { x: number; y: number; width: number; height: number }; centroid?: { x: number; y: number } | null; difficulty?: number };
 type ImgLevel = { levelId: string; original: string; modified: string; width: number; height: number; total: number; isMock: boolean; theme?: string; revisedPrompt?: string };
@@ -41,11 +42,29 @@ export default function Play() {
   const [photo, setPhoto] = useState(''); const [photoName, setPhotoName] = useState(''); const [count, setCount] = useState(5); const [difficulty, setDifficulty] = useState('medium');
   const [busy, setBusy] = useState(false); const [dragOver, setDragOver] = useState(false); const [step, setStep] = useState(0); const [jobElapsed, setJobElapsed] = useState(0);
   const [theme, setTheme] = useState(''); const [themeUsed, setThemeUsed] = useState(false); const [previewImage, setPreviewImage] = useState('');
+  /** Judge access code (public-demo credit protection): remembered locally so it
+   *  isn't asked per level. Only GENERATING needs it — demo, gallery, clicks and
+   *  hints always work without it. */
+  const [accessCode, setAccessCode] = useState('');
+  useEffect(() => { try { setAccessCode(localStorage.getItem('vf-access-code') ?? ''); } catch { /* private window */ } }, []);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const resetGame = (t: number) => { setTotal(t); setFound([]); setMistakes(0); setHints(0); setHintUsed({}); };
   const load = async (seed = Math.floor(Math.random() * 9999)) => { setImg(null); const d = await (await fetch(`/api/demo-level?seed=${seed}`)).json(); setLevelId(d.levelId); setOrig(d.original); setMod(d.modified); resetGame(d.total); setMsg('Find all differences! Click them in either image — original or modified.'); };
-  useEffect(() => { load(7); }, []);
+  /** Load an EXISTING level (gallery / share link): stored images only, generates nothing. */
+  const loadById = async (id: string) => {
+    const res = await fetch(`/api/level?id=${encodeURIComponent(id)}`);
+    if (!res.ok) { setMsg('❌ That level could not be loaded — here is the demo level instead.'); void load(7); return; }
+    const lv = await res.json();
+    setLevelId(lv.levelId); resetGame(lv.total);
+    if (lv.demo) { setImg(null); setOrig(lv.original); setMod(lv.modified); setMsg('Find all differences! Click them in either image — original or modified.'); }
+    else { setImg(lv); setMsg('✅ Level loaded — find all differences!'); }
+  };
+  useEffect(() => {
+    const shared = new URLSearchParams(location.search).get('level');
+    if (shared) void loadById(shared); else void load(7);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const onFile = (f: File | undefined | null) => {
     if (!f) return;
@@ -68,8 +87,9 @@ export default function Play() {
     setThemeUsed(usingTheme); setPreviewImage('');
     setMsg('Creating your level — this can take a couple of minutes.');
     const finish = () => { setBusy(false); };
-    const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(usingTheme ? { theme: theme.trim(), count, mode: 'game', difficulty } : { imageDataUrl: photo || undefined, count, mode: 'game', difficulty }) });
+    const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(usingTheme ? { theme: theme.trim(), count, mode: 'game', difficulty, accessCode: accessCode || undefined } : { imageDataUrl: photo || undefined, count, mode: 'game', difficulty, accessCode: accessCode || undefined }) });
     const data = await res.json();
+    if (res.status === 401) { finish(); setMsg('Generating new levels needs the access code provided in the hackathon submission. You can still play the demo and the gallery below.'); return; }
     if (!res.ok) { finish(); setMsg(`❌ ${data.error ?? 'generation failed'}`); return; }
     for (let i = 0; i < 600; i++) {
       const s = await (await fetch(`/api/generate?id=${data.jobId}`)).json();
@@ -204,6 +224,7 @@ export default function Play() {
         <label>Differences <select aria-label="Number of differences" value={count} onChange={e => setCount(Number(e.target.value))} className="bg-white/10 px-2 py-2 rounded-lg text-white"><option value={3}>3</option><option value={5}>5</option><option value={7}>7</option></select></label>
         <label>Difficulty <select aria-label="Difficulty" value={difficulty} onChange={e => setDifficulty(e.target.value)} className="bg-white/10 px-2 py-2 rounded-lg text-white"><option value="easy">Easy</option><option value="medium">Medium</option><option value="hard">Hard</option></select></label>
         <button className="bg-indigo-500 px-4 py-2 rounded-lg font-bold disabled:opacity-50" disabled={busy} onClick={generate}>{busy ? '⏳ Generating…' : '✨ Generate level'}</button>
+        <label>Judge access code <input type="password" aria-label="Judge access code" value={accessCode} onChange={e => { setAccessCode(e.target.value); try { localStorage.setItem('vf-access-code', e.target.value); } catch { /* private window */ } }} placeholder="for judges" className="bg-white/10 px-2 py-2 rounded-lg text-white w-36" /></label>
         {busy && <span className="opacity-80">{steps[step]?.icon} {steps[step]?.label} · {jobElapsed}s</span>}
       </div>
     </section>
@@ -257,5 +278,6 @@ export default function Play() {
     )}
     <ul className="mt-4 text-sm">{found.map(f => <li key={f.id}>✅ {f.description}</li>)}</ul>
     {mistakes >= 5 && !done && <p className="text-red-300 font-bold mt-3">Out of mistakes — generate or load a new level to try again.</p>}
+    <Gallery onPlay={id => { if (busy) { setMsg('⏳ Please wait for the current level to finish generating…'); return; } void loadById(id); window.scrollTo({ top: 0, behavior: 'smooth' }); }} />
   </main>);
 }

@@ -2,7 +2,7 @@
 
 **One verified visual-difference engine, three experiences.** Given any image, VisualForge produces a modified version with realistic, localized, *verified* changes — plus the exact bounding box and mask of each change.
 
-Built by **Damian Sinay** (indie developer) for the **Meta Global AI Developer Hackathon 2026**, Indie Developer track, theme *"Build for Your World"*. **Deadline: Wed Nov 4, 9:00 PM ET.** Live demo URL: *(placeholder — after Vercel deploy approval)*
+Built by **Damian Sinay** (indie developer) for the **Meta Global AI Developer Hackathon 2026**, Indie Developer track, theme *"Build for Your World"*. **Deadline: Wed Nov 4, 9:00 PM ET.** Live demo URL and judge access code are provided in the hackathon submission form.
 
 ## The three experiences
 1. **🔎 Diferia: Play Your Photo** — upload your photo or describe a theme → the engine forges N differences → play in the browser (timer, limited mistakes, hints, score, shareable link; clicks validated server-side, annotations never leak early).
@@ -33,6 +33,8 @@ The Play page is intentionally user-facing — none of this appears in the UI. R
 - Hints & per-difference difficulty (capability 2, always on with the real provider): the level **publishes the moment its differences are measured**; afterwards, **one** Muse Spark call per level runs **in the background** and writes 3 progressive hints and a difficulty rating (1–5) per difference (migration `0004_difference_hints.sql`; pre-0004 databases persist without them). `POST /api/hint` serves the next hint of the easiest pending difference — until the Spark hints land it serves a positional hint derived from the bbox, marked `provisional` (Play labels it "Quick hint"); the score weights each find by its difficulty. One-pass component selection applies a visibility floor by job difficulty as a **priority, not a gate** (easy: area ≥ 0.25 % of the image and mean amplitude ≥ 40; medium: ≥ 0.12 % / ≥ 35; hard: no floor): above-floor components go first, below-floor ones only fill the count, logged as such.
 - Count guarantee (game mode): a level **never ships short**. Order of remedies: one-pass → crop candidates → **replacement plan** (one extra Spark call for the missing count + 2, planned over only the regions that don't overlap an accepted difference) → one completion full-image Muse call asking only for the missing differences. Still short, the job fails with a clear message ("We could only create X of the N differences…") instead of delivering a short level.
 - Credit guards: `MAX_CHANGES_PER_JOB`, `MAX_JOBS_PER_DAY`, `ESTIMATED_COST_PER_LEVEL_USD` (see [src/lib/limits.ts](src/lib/limits.ts)).
+- Public-demo protection for paid generation, all checked before any provider work: `VF_ACCESS_CODE` — when set, `POST /api/generate` requires the judge access code (constant-time comparison, 401 `{ error: "access code required" }` without it; unset = open for local dev). `/play` and `/qc` show a "Judge access code" field next to Generate and remember it in `localStorage`; a 401 tells the visitor they can still play the demo and the gallery. Plus, active in the same public-demo mode, a per-IP limit of 5 generations/hour (in-memory sliding window, 429), and the always-on daily cap now counted from today's `visualforge_generation_jobs` rows (in-memory count as fallback without Supabase). The demo level, the gallery, `/api/validate-click` and `/api/hint` never need the code.
+- Level gallery: the landing and `/play` list the 12 most recent published levels from Supabase (`GET /api/gallery`, original-image thumbnails); playing one loads its stored images via `GET /api/level` — it generates nothing (this also makes Play share links work).
 - Supabase persistence is best-effort and additive: jobs/levels/differences/images/ai-calls are mirrored to `visualforge_*` tables when `NEXT_PUBLIC_SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` are set; the game also works fully in-memory without them.
 
 ## Tests
@@ -41,7 +43,7 @@ npm test            # Vitest: pipeline, composite invariant, mask→bbox, click 
 .venv/bin/python -m pytest tests/test_composite.py   # Python env lives in .venv (git-ignored)
 npm run test:e2e    # Playwright: single-player flow on MOCK
 ```
-**Status (2026-10-31):** Vitest 75/75 (incl. the async generation loop with fake providers, the one-pass path, duplicate-difference dedupe, the visibility floor as priority with below-floor fillers, Spark hints + difficulty written in the background after publication, the count-completion guarantee — replacement plan over free regions, then a completion one-pass call, otherwise the job fails loudly — theme generation, and sharp composite/measurement invariants) and Playwright 1/1 verified 2026-10-30; pytest 2/2 last verified 2026-10-29.
+**Status (2026-10-31):** Vitest 77/78 (incl. the async generation loop with fake providers, the one-pass path, duplicate-difference dedupe, the visibility floor as priority with below-floor fillers, Spark hints + difficulty written in the background after publication, the count-completion guarantee — replacement plan over free regions, then a completion one-pass call, otherwise the job fails loudly — theme generation, the VF_ACCESS_CODE 401/429/pass-through guards on /api/generate, and sharp composite/measurement invariants) and Playwright 1/1 verified 2026-10-30; pytest 2/2 last verified 2026-10-29. Known stale fixture: `tests/onepass-calibration.test.ts` was calibrated against the previous `test.jpeg` (replaced in c9b84ea) and currently finds 0 of its 3 saved edits — it needs re-calibration against the new photo, engine code unchanged.
 
 ## Feature status
 | Feature | Status |
@@ -50,6 +52,7 @@ npm run test:e2e    # Playwright: single-player flow on MOCK
 | Play Your Photo (upload or theme → generate → server-validated play, click either image) | ✅ playable · theme→scene ✅ (VF_THEME_GENERATION) · hints + difficulty ✅ (capability 2) |
 | Diferia Online (room/race/best-of-3 UI + DB race guard) | 🟡 local simulation · ⏳ Supabase Realtime wiring |
 | QC Trainer + COCO/YOLO export | ✅ playable slice · ⏳ batch dataset review flow |
+| Public-demo protection (VF_ACCESS_CODE, 5/hour/IP, DB daily cap) + level gallery | ✅ |
 | Landing "one engine, three uses" | ✅ |
 
 ## Built during the hackathon

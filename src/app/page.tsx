@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import Gallery from '@/components/Gallery';
 const Card = ({ href, emoji, title, text }: { href: string; emoji: string; title: string; text: string }) => (
   <Link href={href} className="block bg-white/5 hover:bg-white/10 transition rounded-2xl p-6 border border-white/10">
     <div className="text-4xl">{emoji}</div><h2 className="font-bold text-xl mt-3">{title}</h2><p className="opacity-75 text-sm mt-2">{text}</p>
@@ -14,5 +15,6 @@ export default function Home() {
     </div>
     <div className="mt-10 bg-indigo-500/10 border border-indigo-400/30 rounded-2xl p-6 font-mono text-sm overflow-x-auto whitespace-pre">{`original ─► SAM 3.1 segment ─► Muse Spark plan ─► Muse Image edit (masked only)
         ─► composite (outside = pixel-identical) ─► measure REAL mask/bbox ─► Muse Spark verify ─► game / race / dataset`}</div>
+    <Gallery />
   </main>);
 }

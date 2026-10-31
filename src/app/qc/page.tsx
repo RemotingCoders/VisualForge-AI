@@ -1,5 +1,5 @@
 'use client';
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { generateDemoScene, renderShapes } from '@/lib/demoScene';
 import { clickHits, accuracy } from '@/lib/engine/geometry';
 import { toCOCO, toYOLO } from '@/lib/coco';
@@ -9,6 +9,9 @@ type RealLevel = { levelId: string; original: string; modified: string; width: n
 export default function QC() {
   const scene = useMemo(() => generateDemoScene(42), []); const [found, setFound] = useState<string[]>([]); const [falsePos, setFalsePos] = useState(0); const [revealed, setRevealed] = useState(false); const ref = useRef<SVGSVGElement>(null);
   const [photo, setPhoto] = useState(''); const [count, setCount] = useState(3); const [job, setJob] = useState(''); const [real, setReal] = useState<RealLevel | null>(null);
+  /** Judge access code — same shared field as /play (remembered in localStorage). */
+  const [accessCode, setAccessCode] = useState('');
+  useEffect(() => { try { setAccessCode(localStorage.getItem('vf-access-code') ?? ''); } catch { /* private window */ } }, []);
   const click = (e: React.MouseEvent) => { if (!ref.current || revealed) return; const r = ref.current.getBoundingClientRect(); const x = ((e.clientX - r.left) / r.width) * 400, y = ((e.clientY - r.top) / r.height) * 300;
     const hit = scene.differences.find(d => !found.includes(d.id) && clickHits({ x, y }, d.bbox, 14)); hit ? setFound(f => [...f, hit.id]) : setFalsePos(n => n + 1); };
   const download = (name: string, text: string) => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' })); a.download = name; a.click(); };
@@ -17,8 +20,9 @@ export default function QC() {
   /** Real QC path: photo -> async generation job (mode 'qc') -> level -> COCO/YOLO export of that level. */
   const generateReal = async () => {
     setJob('creating job…');
-    const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ imageDataUrl: photo || undefined, count, mode: 'qc' }) });
+    const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ imageDataUrl: photo || undefined, count, mode: 'qc', accessCode: accessCode || undefined }) });
     const data = await res.json();
+    if (res.status === 401) { setJob(''); alert('Generating new levels needs the access code provided in the hackathon submission. You can still play the demo and the gallery below.'); return; }
     if (!res.ok) { setJob(''); alert(data.error ?? 'generation failed'); return; }
     if (data.isMock) { setJob(''); setReal(null); alert('Offline MOCK provider: real QC generation is off (needs AI_PROVIDER=meta + kill switch). The MOCK trainer scene below remains available.'); return; }
     for (let i = 0; i < 600; i++) {
@@ -38,6 +42,7 @@ export default function QC() {
         <input type="file" accept="image/*" aria-label="Upload a product photo" onChange={e => onFile(e.target.files?.[0])} className="bg-white/10 px-3 py-2 rounded" />
         <label>Defects <select aria-label="Number of defects" value={count} onChange={e => setCount(Number(e.target.value))} className="bg-white/10 px-2 py-2 rounded text-white"><option value={3}>3</option><option value={5}>5</option><option value={7}>7</option></select></label>
         <button className="bg-indigo-500 font-bold px-4 py-2 rounded disabled:opacity-50" disabled={!!job || !photo} onClick={generateReal}>{job ? '⏳ Generating…' : '⚙️ Generate QC level'}</button>
+        <label>Judge access code <input type="password" aria-label="Judge access code" value={accessCode} onChange={e => { setAccessCode(e.target.value); try { localStorage.setItem('vf-access-code', e.target.value); } catch { /* private window */ } }} placeholder="for judges" className="bg-white/10 px-2 py-2 rounded text-white w-36" /></label>
         {job && <span className="opacity-80">{job}</span>}
       </div>
       {real && (<div className="mt-4">

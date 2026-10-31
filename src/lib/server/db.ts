@@ -157,6 +157,52 @@ export async function loadLevelPayload(levelId: string) {
   } catch (e) { console.error('[db] loadLevelPayload failed:', e); return null; }
 }
 
+/** Global daily credit guard source: number of generation jobs created TODAY,
+ *  counted from visualforge_generation_jobs (durable across server instances —
+ *  the in-memory count resets on every restart/redeploy). Returns null when
+ *  Supabase is unavailable so the caller can fall back to the in-memory count. */
+export async function countJobsToday(): Promise<number | null> {
+  const sb = getServiceClient(); if (!sb) return null;
+  try {
+    const start = new Date(); start.setHours(0, 0, 0, 0);
+    const { count, error } = await sb.from('visualforge_generation_jobs')
+      .select('id', { count: 'exact', head: true }).gte('created_at', start.toISOString());
+    if (error) return null;
+    return count ?? 0;
+  } catch (e) { console.error('[db] countJobsToday failed:', e); return null; }
+}
+
+export interface GalleryLevel {
+  levelId: string; original: string; total: number; mode: Mode; isMock: boolean; theme?: string;
+}
+
+/** The level gallery: the most recent PUBLISHED levels (newest first), with the
+ *  ORIGINAL image as thumbnail. Playing one loads its stored images — it never
+ *  generates anything. Empty list when Supabase is not configured. */
+export async function listPublishedLevels(limit = 12): Promise<GalleryLevel[]> {
+  const sb = getServiceClient(); if (!sb) return [];
+  try {
+    const { data: levels, error } = await sb.from('visualforge_levels')
+      .select('id, mode, is_mock, theme, original_image_id, created_at')
+      .eq('published', true).order('created_at', { ascending: false }).limit(limit);
+    if (error || !levels?.length) return [];
+    const { data: imgs } = await sb.from('visualforge_images').select('id, storage_path')
+      .in('id', levels.map(l => l.original_image_id as string));
+    const out: GalleryLevel[] = [];
+    for (const l of levels) {
+      const orig = imgs?.find(i => i.id === l.original_image_id);
+      if (!orig) continue;
+      const { count } = await sb.from('visualforge_differences').select('id', { count: 'exact', head: true }).eq('level_id', l.id as string);
+      out.push({
+        levelId: l.id as string, original: publicStorageUrl(orig.storage_path as string),
+        total: count ?? 0, mode: l.mode as Mode, isMock: Boolean(l.is_mock),
+        theme: (l as { theme?: string | null }).theme ?? undefined,
+      });
+    }
+    return out;
+  } catch (e) { console.error('[db] listPublishedLevels failed:', e); return []; }
+}
+
 /** Every real Meta call lands in visualforge_ai_calls. estimatedCostUsd: the API returns
  *  no cost; only image generation has a known flat price ($0.01/image) — edits/vision stay 0. */
 export async function logAiCall(model: string, operation: string, latencyMs: number, isMock = false, estimatedCostUsd = 0): Promise<void> {
