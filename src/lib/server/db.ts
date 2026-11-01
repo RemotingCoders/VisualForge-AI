@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { getServiceClient, publicStorageUrl } from './supabase';
 import { recordSpend } from './spend';
 import { dataUrlToBuffer } from './imageOps';
-import type { Difference, Mode } from '../engine/types';
+import type { Difference, Difficulty, Mode } from '../engine/types';
 
 /** Supabase persistence for jobs / levels / differences / images / ai_calls.
  *  All writes are best-effort: a DB failure must never break generation (logged, swallowed).
@@ -54,6 +54,8 @@ export interface PersistLevelArgs {
   width: number; height: number; isMock: boolean; mode: Mode; jobId?: string;
   /** VF_THEME_GENERATION: the user's theme and the prompt Muse Image actually used (needs migration 0003). */
   theme?: string; revisedPrompt?: string;
+  /** The job's difficulty (QC: the inspector level). Needs migration 0007. */
+  difficulty?: Difficulty;
 }
 
 /** Upload both images to Storage, insert image/level/difference rows. Returns nothing —
@@ -79,12 +81,16 @@ export async function persistImageLevel(levelId: string, args: PersistLevelArgs)
       id: levelId, job_id: args.jobId ?? null, original_image_id: origRow.id, modified_image_id: modRow.id,
       mode: args.mode, is_mock: args.isMock, published: true,
     };
-    // The generated Database types predate migration 0003 (theme/revised_prompt):
-    // assert the pre-0003 row shape — the extra properties still travel at runtime,
-    // and a pre-0003 database errors the insert so we retry without them below.
-    const themedRow = { ...levelRow, theme: args.theme, revised_prompt: args.revisedPrompt ?? null } as typeof levelRow;
-    let e3 = (await sb.from('visualforge_levels').insert(args.theme ? themedRow : levelRow)).error;
+    // The generated Database types predate migration 0003 (theme/revised_prompt)
+    // and 0007 (difficulty): assert the pre-0003 row shape — the extra properties
+    // still travel at runtime, and an older database errors the insert so we retry
+    // narrower below (widest first: theme + difficulty, then difficulty, then base).
+    const diffRow = { ...levelRow, difficulty: args.difficulty ?? null } as typeof levelRow;
+    const themedRow = { ...diffRow, theme: args.theme, revised_prompt: args.revisedPrompt ?? null } as typeof levelRow;
+    let e3 = (await sb.from('visualforge_levels').insert(args.theme ? themedRow : diffRow)).error;
     if (e3 && args.theme) // pre-0003 database without theme columns — persist without them
+      e3 = (await sb.from('visualforge_levels').insert(diffRow)).error;
+    if (e3) // pre-0007 database without the difficulty column — persist without it
       e3 = (await sb.from('visualforge_levels').insert(levelRow)).error;
     if (e3) throw e3;
     if (args.differences.length) {
@@ -211,10 +217,13 @@ export async function loadLevelPayload(levelId: string) {
     const mod = imgs?.find(i => i.id === level.modified_image_id);
     if (!orig || !mod) return null;
     const { count } = await sb.from('visualforge_differences').select('id', { count: 'exact', head: true }).eq('level_id', levelId);
+    const rawDifficulty = (level as { difficulty?: string | null }).difficulty;
     return {
       levelId, original: publicStorageUrl(orig.storage_path), modified: publicStorageUrl(mod.storage_path),
       width: orig.width, height: orig.height, total: count ?? 0, isMock: level.is_mock, mode: level.mode as Mode,
       theme: (level as { theme?: string | null }).theme ?? undefined, revisedPrompt: (level as { revised_prompt?: string | null }).revised_prompt ?? undefined,
+      // Level difficulty (migration 0007): absent on pre-0007 rows.
+      difficulty: rawDifficulty === 'easy' || rawDifficulty === 'medium' || rawDifficulty === 'hard' ? rawDifficulty : undefined,
     };
   } catch (e) { console.error('[db] loadLevelPayload failed:', e); return null; }
 }
@@ -235,7 +244,7 @@ export async function countJobsToday(): Promise<number | null> {
 }
 
 export interface GalleryLevel {
-  levelId: string; original: string; total: number; mode: Mode; isMock: boolean; theme?: string;
+  levelId: string; original: string; total: number; mode: Mode; isMock: boolean; theme?: string; difficulty?: Difficulty;
 }
 
 /** The level gallery: the most recent PUBLISHED levels (newest first), with the
@@ -246,10 +255,19 @@ export async function listPublishedLevels(limit = 12, mode?: Mode): Promise<Gall
   const sb = getServiceClient(); if (!sb) return [];
   try {
     let query = sb.from('visualforge_levels')
-      .select('id, mode, is_mock, theme, original_image_id, created_at')
+      .select('id, mode, is_mock, theme, difficulty, original_image_id, created_at')
       .eq('published', true).order('created_at', { ascending: false }).limit(limit);
     if (mode) query = query.eq('mode', mode);
-    const { data: levels, error } = await query;
+    let { data: levels, error } = await query;
+    if (error) { // pre-0007 database without the difficulty column — retry without it
+      let retry = sb.from('visualforge_levels')
+        .select('id, mode, is_mock, theme, original_image_id, created_at')
+        .eq('published', true).order('created_at', { ascending: false }).limit(limit);
+      if (mode) retry = retry.eq('mode', mode);
+      const retried = await retry;
+      error = retried.error;
+      levels = retried.data as typeof levels; // narrower rows: no difficulty column yet
+    }
     if (error || !levels?.length) return [];
     const { data: imgs } = await sb.from('visualforge_images').select('id, storage_path')
       .in('id', levels.map(l => l.original_image_id as string));
@@ -262,6 +280,7 @@ export async function listPublishedLevels(limit = 12, mode?: Mode): Promise<Gall
         levelId: l.id as string, original: publicStorageUrl(orig.storage_path as string),
         total: count ?? 0, mode: l.mode as Mode, isMock: Boolean(l.is_mock),
         theme: (l as { theme?: string | null }).theme ?? undefined,
+        difficulty: (l as { difficulty?: Difficulty | null }).difficulty ?? undefined,
       });
     }
     return out;

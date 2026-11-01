@@ -1,11 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { generateDemoScene } from './demoScene';
 import { persistImageLevel } from './server/db';
-import type { Difference, Mode } from './engine/types';
+import type { Difference, Difficulty, Mode } from './engine/types';
 /** Server-only store: difference annotations live here, NEVER in the client payload. */
 const g = globalThis as unknown as {
   __vfLevels?: Map<string, Difference[]>;
-  __vfImageLevels?: Map<string, { original: string; modified: string; width: number; height: number; isMock: boolean; mode: Mode; theme?: string; revisedPrompt?: string; notice?: string }>;
+  __vfImageLevels?: Map<string, { original: string; modified: string; width: number; height: number; isMock: boolean; mode: Mode; theme?: string; revisedPrompt?: string; notice?: string; difficulty?: Difficulty }>;
   __vfDemoScenes?: Map<string, { original: unknown; modified: unknown }>;
   __vfQcSessions?: QcSessionRecord[];
 };
@@ -26,10 +26,10 @@ export function getDemoPayload(levelId: string) {
   if (!scene || !diffs) return null;
   return { levelId, demo: true as const, original: scene.original, modified: scene.modified, total: diffs.length, isMock: true };
 }
-export function saveImageLevel(level: { differences: Difference[]; original: string; modified: string; width: number; height: number; isMock: boolean; mode?: Mode; jobId?: string; theme?: string; revisedPrompt?: string; notice?: string }): string {
+export function saveImageLevel(level: { differences: Difference[]; original: string; modified: string; width: number; height: number; isMock: boolean; mode?: Mode; jobId?: string; theme?: string; revisedPrompt?: string; notice?: string; difficulty?: Difficulty }): string {
   const id = randomUUID();
   g.__vfLevels!.set(id, level.differences);
-  g.__vfImageLevels!.set(id, { original: level.original, modified: level.modified, width: level.width, height: level.height, isMock: level.isMock, mode: level.mode ?? 'game', theme: level.theme, revisedPrompt: level.revisedPrompt, notice: level.notice });
+  g.__vfImageLevels!.set(id, { original: level.original, modified: level.modified, width: level.width, height: level.height, isMock: level.isMock, mode: level.mode ?? 'game', theme: level.theme, revisedPrompt: level.revisedPrompt, notice: level.notice, difficulty: level.difficulty });
   void persistImageLevel(id, { ...level, mode: level.mode ?? 'game' }); // durable copy in Supabase (no-op if not configured)
   return id;
 }
@@ -39,7 +39,7 @@ export function getLevelPayload(levelId: string) {
   const img = g.__vfImageLevels!.get(levelId);
   const diffs = g.__vfLevels!.get(levelId);
   if (!img || !diffs) return null;
-  return { levelId, original: img.original, modified: img.modified, width: img.width, height: img.height, total: diffs.length, isMock: img.isMock, mode: img.mode, theme: img.theme, revisedPrompt: img.revisedPrompt, notice: img.notice };
+  return { levelId, original: img.original, modified: img.modified, width: img.width, height: img.height, total: diffs.length, isMock: img.isMock, mode: img.mode, theme: img.theme, revisedPrompt: img.revisedPrompt, notice: img.notice, difficulty: img.difficulty };
 }
 
 /** QC trainer session, recorded when the trainee reveals a real QC level

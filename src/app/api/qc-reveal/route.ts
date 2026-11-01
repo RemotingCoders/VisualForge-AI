@@ -18,6 +18,8 @@ export async function GET(req: Request) {
   if (!diffs) return NextResponse.json({ error: 'no differences stored for this level' }, { status: 404 });
   return NextResponse.json({
     levelId,
+    // The level's difficulty is its inspector level ("Inspector level: Easy").
+    difficulty: payload.difficulty ?? null,
     differences: diffs.map(d => ({
       id: d.id,
       type: d.classifiedType ?? d.type,

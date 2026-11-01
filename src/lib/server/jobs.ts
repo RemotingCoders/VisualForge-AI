@@ -16,6 +16,12 @@ export type JobStatus = 'queued' | 'running' | 'done' | 'failed';
  *  expansion² ≈ 8% x 1.69 ≈ 13.5%, rounded up) or max-size changes die by construction. */
 export const MAX_REGION_AREA_FRACTION = 0.08;
 export const MAX_MEASURED_AREA_FRACTION = 0.15;
+/** QC inspector-level visibility floor: the minimum MEASURED defect area as a
+ *  fraction of the image, by job difficulty. Easy/medium defects below the floor
+ *  are discarded and replaced by the next candidate; hard has no floor
+ *  (component-scale defects are the point). The game keeps its own one-pass
+ *  floors (VISIBILITY_FLOOR / ABSOLUTE_FLOOR in runOnePassPass). */
+export const QC_AREA_FLOOR: Record<Difficulty, number> = { easy: 0.0025, medium: 0.0012, hard: 0 };
 export interface Job {
   id: string; status: JobStatus; stage: string; mode: Mode; isMock: boolean;
   error?: string; levelId?: string; requestedChanges?: number; difficulty?: Difficulty; createdAt: number; updatedAt: number;
@@ -120,6 +126,10 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     // final minimum-separation merge below can union masks across paths too.
     const acceptedMasks = new Map<string, boolean[]>();
     const difficulty = job.difficulty ?? 'medium';
+    // QC only: defects measured smaller than this fraction of the image are
+    // discarded and replaced by the next candidate (0 = no floor: hard, and
+    // game mode, which applies its own floors in the one-pass selection).
+    const qcAreaFloor = job.mode === 'qc' ? QC_AREA_FLOOR[difficulty] : 0;
 
     // VF_SAM_MASKS: real SAM masks via the official parser. The object's mask as a
     // full-frame boolean[], or null with the reason logged — callers fall back to the
@@ -372,6 +382,16 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
           console.info(`[generate ${job.id}] onepass ${label} component rejected BELOW the ABSOLUTE ${difficulty} floor: ${c.area}px amp ${c.meanAmp.toFixed(1)} bbox (${c.bbox.x},${c.bbox.y}) ${c.bbox.width}x${c.bbox.height} (area ${(areaFraction * 100).toFixed(3)}% vs ${(absFloor.minAreaFraction * 100).toFixed(2)}% · amp ${c.meanAmp.toFixed(1)} vs ${absFloor.minAmp})`);
           continue;
         }
+        if (job.mode === 'qc') {
+          // QC inspector floor (AREA only): a below-floor defect is DISCARDED, not
+          // held as a last-resort filler as in the game — the crop path's next
+          // candidate replaces it. Hard has no floor, so nothing is discarded here.
+          if (areaFraction < qcAreaFloor) {
+            console.info(`[generate ${job.id}] onepass ${label} component discarded BELOW the QC ${difficulty} floor: ${c.area}px bbox (${c.bbox.x},${c.bbox.y}) ${c.bbox.width}x${c.bbox.height} (area ${(areaFraction * 100).toFixed(3)}% vs ${(qcAreaFloor * 100).toFixed(2)}% of the image) — replaced by the next candidate`);
+            continue;
+          }
+          aboveFloor.push(c); continue;
+        }
         (areaFraction >= floor.minAreaFraction && c.meanAmp >= floor.minAmp ? aboveFloor : belowFloor).push(c);
       }
       // Held, not chosen (deduped against the pool — a later pass re-extracts the
@@ -470,6 +490,16 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     // verified locally with ΔE + mask, never via Spark.)
     type Candidate = { next: string; mask: boolean[]; bbox: NonNullable<ReturnType<typeof maskToBBox>>; local: boolean; notes: string };
     const measuredOk = (bbox: Candidate['bbox']) => bbox.width * bbox.height <= width * height * MAX_MEASURED_AREA_FRACTION;
+    // QC inspector-level floor: a defect whose MEASURED mask area is below the
+    // difficulty floor (easy 0.25% / medium 0.12% of the image; hard: none) is
+    // discarded — runList simply moves on to the next candidate.
+    const belowQcFloor = (changeId: string, cand: Candidate): boolean => {
+      if (qcAreaFloor <= 0) return false;
+      const areaPx = cand.mask.reduce((a, v) => a + (v ? 1 : 0), 0);
+      if (areaPx >= qcAreaFloor * width * height) return false;
+      console.info(`[generate ${job.id}] change ${changeId} discarded: measured defect ${areaPx}px (area ${(areaPx / (width * height) * 100).toFixed(3)}% of the image) is below the QC ${difficulty} floor (${(qcAreaFloor * 100).toFixed(2)}%) — replaced by the next candidate`);
+      return true;
+    };
 
     // Max 2 Muse calls per change (initial edit + one verifier-driven re-edit); when the
     // budget is exhausted the executor moves on to the next candidate.
@@ -619,6 +649,9 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       // Post-measure guard (QC): the defect Muse actually painted must not step on an
       // accepted one either — same measured-box rule, 8px margin.
       if (job.mode === 'qc' && differences.some(d => overlaps(d.bbox, finalCandidate.bbox, 8))) { console.info(`[generate ${job.id}] change ${ch.id} discarded: measured defect overlaps an already-accepted defect (8px margin)`); return; }
+      // QC inspector-level floor on the MEASURED defect, before spending a Spark
+      // verify call: below-floor defects are replaced by the next candidate.
+      if (job.mode === 'qc' && belowQcFloor(ch.id, finalCandidate)) return;
 
       let notes = finalCandidate.notes;
       if (!finalCandidate.local) {
@@ -646,6 +679,8 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
           }
           if (!verdict.ok) { console.info(`[generate ${job.id}] change ${ch.id} discarded after re-edit: ${verdict.notes}`); return; }
         }
+        // A verifier-driven re-edit may have shrunk the defect under the QC floor.
+        if (job.mode === 'qc' && belowQcFloor(ch.id, finalCandidate)) return;
         notes = verdict.notes;
       }
       differences.push({
@@ -843,7 +878,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
 
     logSummary(differences);
 
-    const levelId = saveImageLevel({ differences, original: img.dataUrl, modified: current, width, height, isMock: providers.segmentation.isMock, mode: job.mode, jobId: job.id, theme, revisedPrompt, notice });
+    const levelId = saveImageLevel({ differences, original: img.dataUrl, modified: current, width, height, isMock: providers.segmentation.isMock, mode: job.mode, jobId: job.id, theme, revisedPrompt, notice, difficulty });
     job.levelId = levelId;
     job.status = 'done'; setStage('done');
 

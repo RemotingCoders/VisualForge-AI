@@ -2,7 +2,7 @@
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 
-type GalleryLevel = { levelId: string; original: string; total: number; mode: string; isMock: boolean; theme?: string };
+type GalleryLevel = { levelId: string; original: string; total: number; mode: string; isMock: boolean; theme?: string; difficulty?: string };
 
 /** Level gallery: the most recent published levels, straight from Supabase.
  *  Playing one loads its stored images — it generates NOTHING and needs no
@@ -39,7 +39,7 @@ export default function Gallery({ onPlay, mode }: { onPlay?: (levelId: string) =
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img src={l.original} alt={l.theme ? `Generated scene: ${l.theme}` : 'Generated level'} className="w-full aspect-[4/3] object-cover" loading="lazy" />
             <figcaption className="p-3 flex items-center justify-between gap-2">
-              <span className="text-xs opacity-75 truncate" title={l.theme}>{l.total} differences{l.theme ? ` · “${l.theme}”` : ''}</span>
+              <span className="text-xs opacity-75 truncate" title={l.theme}>{l.total} differences{l.difficulty ? ` · ${l.difficulty.charAt(0).toUpperCase() + l.difficulty.slice(1)}` : ''}{l.theme ? ` · “${l.theme}”` : ''}</span>
               {onPlay
                 ? <button className="bg-indigo-500 px-3 py-1 rounded-full text-xs font-bold shrink-0" onClick={() => onPlay(l.levelId)}>▶ Play</button>
                 : <Link className="bg-indigo-500 px-3 py-1 rounded-full text-xs font-bold shrink-0" href={`/play?level=${l.levelId}`}>▶ Play</Link>}

@@ -41,6 +41,13 @@ const fmtTime = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(
 
 export default function QC() {
   const [photo, setPhoto] = useState(''); const [photoName, setPhotoName] = useState(''); const [count, setCount] = useState(2); const [job, setJob] = useState(''); const [real, setReal] = useState<RealLevel | null>(null);
+  /** Inspector level: sent as `difficulty` in POST /api/generate (same selector
+   *  as /play). Easy/medium enforce a minimum measured defect area (0.25% /
+   *  0.12% of the image) and the planner targets the largest surfaces; hard
+   *  hides component-scale defects with no minimum. */
+  const [difficulty, setDifficulty] = useState<'easy' | 'medium' | 'hard'>('medium');
+  /** The level's own difficulty, from the QC reveal ("Inspector level: Easy"). */
+  const [inspectorLevel, setInspectorLevel] = useState('');
   const [dragOver, setDragOver] = useState(false); const [fileMsg, setFileMsg] = useState(''); const fileRef = useRef<HTMLInputElement>(null);
   const [step, setStep] = useState(0); const [jobElapsed, setJobElapsed] = useState(0);
   /** Describe-a-part (same theme path as Play, QC prompt): no photo needed — the
@@ -66,7 +73,7 @@ export default function QC() {
   const [humanFinal, setHumanFinal] = useState<{ foundIds: string[]; falsePositives: number; timeSec: number } | null>(null);
   const startChallenge = async () => {
     if (!real || aiBusy) return;
-    setRealFound([]); setRealFalsePos(0); setRealMisses([]); setRealRevealed(false); setRevealDiffs([]);
+    setRealFound([]); setRealFalsePos(0); setRealMisses([]); setRealRevealed(false); setRevealDiffs([]); setInspectorLevel('');
     setSessionMsg(''); setFinishedElapsed(null); setStartedAt(Date.now()); setElapsed(0);
     setChallengeActive(true); setHumanFinal(null); setAiResult(null); setAiBusy(true);
     setAiMsg('🤖 The AI inspector is looking at the defective unit… your clock is running — find them first!');
@@ -78,7 +85,7 @@ export default function QC() {
   };
   /** Example QC levels from the gallery: already generated, inspectable by anyone
    *  without the access code (loading generates nothing). */
-  const [qcGallery, setQcGallery] = useState<{ levelId: string; original: string; total: number }[]>([]);
+  const [qcGallery, setQcGallery] = useState<{ levelId: string; original: string; total: number; difficulty?: string }[]>([]);
   const [qcGalleryLoading, setQcGalleryLoading] = useState(true);
   useEffect(() => {
     void fetch('/api/gallery?mode=qc').then(r => r.json()).then(d => setQcGallery((d.levels ?? []).filter((l: { mode?: string }) => l.mode === 'qc'))).catch(() => { /* gallery is optional */ }).finally(() => setQcGalleryLoading(false));
@@ -112,7 +119,7 @@ export default function QC() {
   // A fresh real level resets the trainer, starts the clock and folds the MOCK demo away.
   useEffect(() => {
     if (!real) return;
-    setRealFound([]); setRealFalsePos(0); setRealMisses([]); setRealRevealed(false); setRevealDiffs([]);
+    setRealFound([]); setRealFalsePos(0); setRealMisses([]); setRealRevealed(false); setRevealDiffs([]); setInspectorLevel('');
     setSessionMsg(''); sessionPosted.current = false; setStartedAt(Date.now()); setElapsed(0); setFinishedElapsed(null);
     setAiResult(null); setAiBusy(false); setAiMsg(''); setChallengeActive(false); setHumanFinal(null);
   }, [real]);
@@ -178,6 +185,7 @@ export default function QC() {
     if (!res.ok || !data?.differences) { alert(data?.error ?? 'Could not reveal this level.'); return; }
     const durationSec = finishedElapsed ?? (startedAt ? Math.floor((Date.now() - startedAt) / 1000) : elapsed);
     setElapsed(durationSec); setRevealDiffs(data.differences); setRealRevealed(true);
+    setInspectorLevel(typeof data.difficulty === 'string' ? data.difficulty : '');
     if (challengeActive) setHumanFinal(h => h ?? { foundIds: realFound.map(f => f.id), falsePositives: realFalsePos, timeSec: durationSec });
     // If the trainee already found everything, the session was saved at the fanfare
     // with the frozen time; saveSession's once-guard makes this a no-op then.
@@ -194,7 +202,7 @@ export default function QC() {
     // A part description replaces the photo entirely: the part photo gets generated first.
     const usingPart = partText.trim().length > 0;
     setJob('creating job…'); setStep(0); setJobElapsed(0); setPartUsed(usingPart); setPreviewImage('');
-    const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(usingPart ? { theme: partText.trim(), themeTicket: partTicketRef.current ?? undefined, count, mode: 'qc', accessCode: accessCode || undefined } : { imageDataUrl: photo || undefined, count, mode: 'qc', accessCode: accessCode || undefined }) });
+    const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(usingPart ? { theme: partText.trim(), themeTicket: partTicketRef.current ?? undefined, count, mode: 'qc', difficulty, accessCode: accessCode || undefined } : { imageDataUrl: photo || undefined, count, mode: 'qc', difficulty, accessCode: accessCode || undefined }) });
     const data = await res.json();
     if (res.status === 401) { setJob(''); alert('Generating new levels needs the access code provided in the hackathon submission. You can still inspect the example QC levels in the gallery below.'); return; }
     if (!res.ok) { setJob(''); alert(data.error ?? 'generation failed'); return; }
@@ -272,10 +280,12 @@ export default function QC() {
       </div>
       <div className="flex flex-wrap items-center gap-3 mt-3">
         <label>Defects <select aria-label="Number of defects" value={count} onChange={e => setCount(Number(e.target.value))} className="bg-white/10 px-2 py-2 rounded text-white">{[1, 2, 3, 4, 5].map(n => <option key={n} value={n}>{n}</option>)}</select></label>
+        <label>Difficulty <select aria-label="Difficulty" value={difficulty} onChange={e => setDifficulty(e.target.value as 'easy' | 'medium' | 'hard')} className="bg-white/10 px-2 py-2 rounded text-white"><option value="easy">Easy</option><option value="medium">Medium</option><option value="hard">Hard</option></select></label>
         <button className="bg-indigo-500 font-bold px-4 py-2 rounded disabled:opacity-50" disabled={!!job || (!photo && !partText.trim())} onClick={generateReal}>{job ? '⏳ Generating…' : '⚙️ Generate QC level'}</button>
         <label>Judge access code <input type="password" aria-label="Judge access code" value={accessCode} onChange={e => { setAccessCode(e.target.value); try { localStorage.setItem('vf-access-code', e.target.value); } catch { /* private window */ } }} placeholder="for judges" className="bg-white/10 px-2 py-2 rounded text-white w-36" /></label>
         {job && <span className="opacity-80">{job}</span>}
       </div>
+      <p className="text-xs opacity-60 mt-2">Difficulty = inspector level: easy shows obvious defects on large surfaces, hard hides component-scale defects</p>
       {job ? (
       <section aria-label="Generating QC level" className="mt-4 rounded-xl bg-white/5 border border-indigo-400/30 p-8 text-center overflow-hidden">
         {/* Big processing wheel: two counter-rotating rings + pulsing core (same as /play) */}
@@ -365,6 +375,7 @@ export default function QC() {
           {aiResult && !humanFinal && <p className="mt-1 opacity-80">The AI is done — finish your inspection (find them all, or Reveal &amp; score) to see who won.</p>}
         </div>)}
         {realRevealed && (<div className="mt-3 text-xs">
+          {inspectorLevel && <p className="font-bold text-sm">Inspector level: {inspectorLevel.charAt(0).toUpperCase() + inspectorLevel.slice(1)}</p>}
           <p>Missed: {Math.max(0, real.total - realFound.length)} of {real.total} defects.</p>
           <ul className="mt-2 space-y-1">
             {revealDiffs.map(d => (<li key={d.id} className="bg-white/5 rounded px-2 py-1">
@@ -400,7 +411,7 @@ export default function QC() {
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img src={l.original} alt="QC example part" className="w-full h-28 object-cover bg-slate-900" />
               <div className="p-3">
-                <p className="text-xs opacity-80">{l.total} verified defects</p>
+                <p className="text-xs opacity-80">{l.total} verified defects{l.difficulty ? ` · Inspector level: ${l.difficulty.charAt(0).toUpperCase() + l.difficulty.slice(1)}` : ''}</p>
                 <button className="bg-indigo-500 font-bold px-3 py-1 rounded mt-2 w-full" onClick={() => void loadQcLevel(l.levelId)}>🔍 Inspect this unit</button>
               </div>
             </div>
