@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { getServiceClient, publicStorageUrl } from './supabase';
+import { recordSpend } from './spend';
 import { dataUrlToBuffer } from './imageOps';
 import type { Difference, Mode } from '../engine/types';
 
@@ -267,9 +268,13 @@ export async function listPublishedLevels(limit = 12, mode?: Mode): Promise<Gall
   } catch (e) { console.error('[db] listPublishedLevels failed:', e); return []; }
 }
 
-/** Every real Meta call lands in visualforge_ai_calls. estimatedCostUsd: the API returns
- *  no cost; only image generation has a known flat price ($0.01/image) — edits/vision stay 0. */
+/** Every real Meta call lands in visualforge_ai_calls with its REAL estimated cost
+ *  (src/lib/engine/pricing.ts, verified on dev.meta.ai: Spark per token from the
+ *  response usage, SAM per image, Muse Image per returned image). The row feeds
+ *  the VF_SPEND_CAP_USD budget sum; recordSpend mirrors it into the in-memory
+ *  ledger that stands in when Supabase is not configured. */
 export async function logAiCall(model: string, operation: string, latencyMs: number, isMock = false, estimatedCostUsd = 0): Promise<void> {
+  if (!isMock) recordSpend(estimatedCostUsd);
   const sb = getServiceClient(); if (!sb) return;
   try { await sb.from('visualforge_ai_calls').insert({ model, operation, latency_ms: Math.round(latencyMs), is_mock: isMock, estimated_cost_usd: estimatedCostUsd }); }
   catch (e) { console.error('[db] logAiCall failed:', e); }

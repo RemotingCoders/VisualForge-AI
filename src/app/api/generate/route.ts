@@ -4,7 +4,8 @@ import { checkLimits } from '@/lib/limits';
 import { createJob, resolveJob, jobsToday, runGeneration } from '@/lib/server/jobs';
 import type { Difficulty } from '@/lib/engine/types';
 import { persistJob, loadLevelPayload, countJobsToday } from '@/lib/server/db';
-import { accessCodeOk, accessCodeRequired, clientIp } from '@/lib/server/access';
+import { requireMetaAccess, accessCodeRequired, clientIp } from '@/lib/server/access';
+import { enforceSpendCap } from '@/lib/server/spend';
 import { hitGenerationRateLimit, RATE_LIMIT_MAX } from '@/lib/server/rateLimit';
 import { createDemoLevel, getLevelPayload, getDemoPayload } from '@/lib/serverStore';
 import { issueThemeTicket, consumeThemeTicket } from '@/lib/server/themeTickets';
@@ -13,8 +14,11 @@ export const runtime = 'nodejs';
 const MAX_IMAGE_CHARS = 12_000_000; // ~9 MB base64 — abuse/credit guard
 
 /** POST {imageDataUrl, count, mode} — or {theme, count, mode} with VF_THEME_GENERATION — -> {jobId, isMock, label}. Generation runs async (Meta calls take 3-17s each).
- *  Public-demo credit protection, checked BEFORE any provider work: VF_ACCESS_CODE
- *  (401), per-IP rate limit of 5 generations/hour (429), daily job cap counted from
+ *  Public-demo credit protection, checked BEFORE any provider work: the single
+ *  access rule (requireMetaAccess, shared with /api/ai-inspect and every future
+ *  Meta-calling route — 401 without the judge code when VF_ACCESS_CODE is set),
+ *  the global judging-period budget (VF_SPEND_CAP_USD — 429 when exhausted),
+ *  per-IP rate limit of 5 generations/hour (429), daily job cap counted from
  *  visualforge_generation_jobs (429). Playing existing levels needs none of this.
  *  Voice dictation sends {themeCheck: true} when dictation stops: ONE Spark
  *  moderation call (the same one generation would make) returns ok + cleanTheme
@@ -24,7 +28,15 @@ const MAX_IMAGE_CHARS = 12_000_000; // ~9 MB base64 — abuse/credit guard
 export async function POST(req: Request) {
   let body: { imageDataUrl?: string; count?: number; mode?: 'game' | 'qc'; difficulty?: string; theme?: string; accessCode?: string; themeCheck?: boolean; themeTicket?: string };
   try { body = await req.json(); } catch { return NextResponse.json({ error: 'invalid JSON' }, { status: 400 }); }
-  if (!accessCodeOk(body.accessCode)) return NextResponse.json({ error: 'access code required' }, { status: 401 });
+  // THE access rule: when VF_ACCESS_CODE is set, every Meta-calling route demands
+  // the judge code before any provider work — this one, /api/ai-inspect, and any
+  // future one (tests/spend.test.ts walks src/app/api and fails an ungated route).
+  const denied = requireMetaAccess(body.accessCode);
+  if (denied) return denied;
+  // Second layer, the global budget: also before the dictation pre-check below —
+  // its Spark theme moderation is a paid call like any other.
+  const overBudget = await enforceSpendCap();
+  if (overBudget) return overBudget;
   // VF_THEME_GENERATION: a theme (>= 3 chars after trim, capped at 200) replaces the
   // uploaded photo — the scene itself is generated. Flag-gated; rejected BEFORE any
   // provider work so a disabled feature never reaches a paid call.

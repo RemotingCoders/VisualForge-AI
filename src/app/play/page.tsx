@@ -80,7 +80,7 @@ export default function Play() {
     if (!levelId || raceBusy || busy) return;
     resetGame(total); setRace(null); setRaceHumanTime(null); setRaceStart(Date.now()); setRaceBusy(true);
     setRaceMsg('🤖 Spark is inspecting the modified image… find them first!');
-    const res = await fetch('/api/ai-inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ levelId, mode: raceMode }) }).catch(() => null);
+    const res = await fetch('/api/ai-inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ levelId, mode: raceMode, accessCode: accessCode || undefined }) }).catch(() => null);
     const data = await res?.json().catch(() => null);
     setRaceBusy(false);
     if (!res?.ok || !data?.findings) { setRaceMsg(`❌ ${data?.error ?? 'Spark could not run the race.'}`); return; }

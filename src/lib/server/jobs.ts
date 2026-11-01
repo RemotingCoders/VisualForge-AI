@@ -6,6 +6,7 @@ import { normalizeImage, imageInfo, cropDataUrl, expandBox, expandMask, diffMask
 import { saveImageLevel } from '../serverStore';
 import { ThemeRejectedError } from '../engine/providers';
 import { persistJob, loadJob, persistDifferenceHints } from './db';
+import { spendCapConfig, spendTotalUsd } from './spend';
 
 export type JobStatus = 'queued' | 'running' | 'done' | 'failed';
 /** Size criteria are AREA-based, not side-based: a SAM box is a WHOLE object if it occupies
@@ -54,10 +55,24 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
   const flushStage = () => { stageMs[stageName] = (stageMs[stageName] ?? 0) + (Date.now() - stageStartedAt); stageStartedAt = Date.now(); };
   const setStage = (s: string) => { flushStage(); stageName = s.replace(/\d+/g, 'n'); job.stage = s; job.updatedAt = Date.now(); console.info(`[generate ${job.id}] stage: ${s}`); void persistJob(job); };
   let modeUsed = job.mode === 'qc' ? 'crops (qc)' : 'crops';
+  // Spend accounting against the VF_SPEND_CAP_USD window: snapshot the running
+  // total now; the summary (and the failure path) log this job's estimated spend
+  // (the delta — an estimate if jobs overlap), the accumulated total and what
+  // remains of the budget. Every real call already recorded its price via
+  // logAiCall (Spark tokens / SAM image / Muse image — engine/pricing.ts).
+  const spendAtStart = await spendTotalUsd();
+  const logSpend = async () => {
+    try {
+      const cfg = spendCapConfig();
+      const total = await spendTotalUsd();
+      console.info(`[generate ${job.id}] spend: job≈$${Math.max(0, total - spendAtStart).toFixed(4)} · accumulated $${total.toFixed(4)}${cfg ? ` · remaining $${Math.max(0, cfg.capUsd - total).toFixed(2)} of $${cfg.capUsd.toFixed(2)} cap` : ' · no cap set (VF_SPEND_CAP_USD unset)'}`);
+    } catch { /* spend logging must never break a job */ }
+  };
   const logSummary = (differences: Difference[]) => {
     flushStage();
     const stages = Object.entries(stageMs).filter(([k]) => k !== 'init').map(([k, ms]) => `${k}=${(ms / 1000).toFixed(1)}s`).join(' ');
     console.info(`[generate ${job.id}] summary: mode=${modeUsed} · differences ${differences.length}/${count} · calls muse=${calls.muse} spark=${calls.spark} sam=${calls.sam} · stage time: ${stages}`);
+    void logSpend();
   };
   try {
     job.status = 'running';
@@ -768,6 +783,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     }
   } catch (e) {
     job.status = 'failed'; job.error = e instanceof ThemeRejectedError ? 'theme_rejected' : (e instanceof Error ? e.message : String(e)); job.updatedAt = Date.now(); void persistJob(job); // keep job.stage = where it failed
+    void logSpend();
     console.error(`[generate ${job.id}] FAILED at stage "${job.stage}":`, e);
   }
 }

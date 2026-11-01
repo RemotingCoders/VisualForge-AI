@@ -70,7 +70,7 @@ export default function QC() {
     setSessionMsg(''); setFinishedElapsed(null); setStartedAt(Date.now()); setElapsed(0);
     setChallengeActive(true); setHumanFinal(null); setAiResult(null); setAiBusy(true);
     setAiMsg('🤖 The AI inspector is looking at the defective unit… your clock is running — find them first!');
-    const res = await fetch('/api/ai-inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ levelId: real.levelId, mode: aiMode }) }).catch(() => null);
+    const res = await fetch('/api/ai-inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ levelId: real.levelId, mode: aiMode, accessCode: accessCode || undefined }) }).catch(() => null);
     const data = await res?.json().catch(() => null);
     setAiBusy(false);
     if (!res?.ok || !data?.findings) { setAiMsg(`❌ ${data?.error ?? 'The AI inspector could not run.'}`); return; }

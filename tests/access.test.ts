@@ -19,11 +19,11 @@ describe('VF_ACCESS_CODE guard on POST /api/generate', () => {
     vi.stubEnv('VF_ACCESS_CODE', 'judges-2026');
     const missing = await gen('10.1.0.1', { count: 3, mode: 'game' });
     expect(missing.status).toBe(401);
-    expect((await missing.json()).error).toBe('access code required');
+    expect((await missing.json()).error).toBe("This action uses Meta's models and needs the judge access code from the hackathon submission. The gallery is free to play.");
 
     const wrong = await gen('10.1.0.1', { count: 3, mode: 'game', accessCode: 'not-the-code' });
     expect(wrong.status).toBe(401);
-    expect((await wrong.json()).error).toBe('access code required');
+    expect((await wrong.json()).error).toBe("This action uses Meta's models and needs the judge access code from the hackathon submission. The gallery is free to play.");
 
     const ok = await gen('10.1.0.1', { count: 3, mode: 'game', accessCode: 'judges-2026' });
     expect(ok.status).toBe(200);

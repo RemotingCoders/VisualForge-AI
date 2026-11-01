@@ -2,7 +2,8 @@ import { NextResponse } from 'next/server';
 import { selectProviders } from '@/lib/engine/providers';
 import { getLevelPayload, getDifferences } from '@/lib/serverStore';
 import { loadLevelPayload, loadDifferences, persistDetectability } from '@/lib/server/db';
-import { clientIp } from '@/lib/server/access';
+import { clientIp, requireMetaAccess } from '@/lib/server/access';
+import { enforceSpendCap } from '@/lib/server/spend';
 import { hitChallengeRateLimit, CHALLENGE_LIMIT_MAX } from '@/lib/server/rateLimit';
 import { validateAiFindings, applyDetectability, type AiInspectMode } from '@/lib/aiInspect';
 import { providerImage, bufferToDataUrl } from '@/lib/server/imageOps';
@@ -32,12 +33,19 @@ async function toProviderImage(ref: unknown): Promise<string | null> {
  *  (finding box expanded 16 px overlapping an unclaimed real bbox, or the
  *  center of either box inside the other; each difference claimable once,
  *  duplicates count as false positives) and every finding is logged against
- *  its nearest real box for calibration. No access code — instead a per-IP
- *  limit of 10 challenges/hour (one Spark call each). Each challenge also
+ *  its nearest real box for calibration. Gated by the SAME single rule as
+ *  generation (requireMetaAccess: judge code when VF_ACCESS_CODE is set) plus
+ *  the global VF_SPEND_CAP_USD budget — a Spark inspection is a paid call —
+ *  and a per-IP limit of 10 challenges/hour (one Spark call each). Each challenge also
  *  accumulates per-difference Spark detectability (migration 0006). */
 export async function POST(req: Request) {
-  let body: { levelId?: string; mode?: string };
+  let body: { levelId?: string; mode?: string; accessCode?: string };
   try { body = await req.json(); } catch { return NextResponse.json({ error: 'invalid JSON' }, { status: 400 }); }
+  // Before any level lookup or paid work: the single access rule + the budget.
+  const denied = requireMetaAccess(body.accessCode);
+  if (denied) return denied;
+  const overBudget = await enforceSpendCap();
+  if (overBudget) return overBudget;
   const levelId = typeof body.levelId === 'string' ? body.levelId : '';
   if (!levelId) return NextResponse.json({ error: 'levelId required' }, { status: 400 });
   const mode: AiInspectMode = body.mode === 'with-reference' ? 'with-reference' : 'no-reference';

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { Providers, Region, PlannedChange, Mode, Difficulty, BBox, SegmentationProvider, VisionReasoningProvider, ImageEditProvider, DifferenceReview, DifferenceHints, GeneratedScene, DefectClassification, AiFinding } from './types';
 import { QC_DEFECT_CATEGORIES } from './types';
 import { META_BASE_URL, META_MODELS, META_ENDPOINTS, metaApiKey, parseSamOutput, parseSseOutputText, type SamObject } from './meta';
+import { sparkCostUsd, museImageCostUsd, SAM_USD_PER_IMAGE, MUSE_IMAGE_USD_PER_IMAGE, type SparkUsage } from './pricing';
 import { logAiCall } from '../server/db';
 
 export class MetaNotConfiguredError extends Error {
@@ -46,9 +47,37 @@ export async function metaPost(path: string, body: unknown, env: Record<string, 
       }
       throw lastError;
     }
-    void logAiCall(path.includes('images') ? META_MODELS.image : META_MODELS.spark, path, Date.now() - t0, false, estimatedCostUsd);
-    if (!res.ok) throw new Error(`Meta API ${path} → HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`);
-    return res.json();
+    const model = path.includes('images') ? META_MODELS.image : META_MODELS.spark;
+    // Body handling tolerates real Responses AND the plain-object fakes used in
+    // tests (some offer only json(), some only text(), some a text() that yields
+    // '' while the payload lives in json()). Errors prefer text() (the old
+    // behavior — the message may carry e.g. content_policy_violation).
+    let rawText = '';
+    let data: unknown = null;
+    if (!res.ok && typeof res.text === 'function') {
+      try { rawText = await res.text(); } catch { /* the throw below falls back */ }
+      try { data = rawText ? JSON.parse(rawText) : null; } catch { data = null; }
+    } else {
+      if (typeof res.json === 'function') { try { data = await res.json(); } catch { data = null; } }
+      if (data == null && typeof res.text === 'function') {
+        try { rawText = await res.text(); data = rawText ? JSON.parse(rawText) : null; } catch { data = null; }
+      }
+    }
+    // Real prices (pricing.ts, verified on dev.meta.ai): Spark bills per token
+    // from the response usage, Muse Image per returned image — edits included.
+    // Failed calls are not billed, so errors log $0; the caller's flat estimate
+    // is only the fallback for success bodies without usage/data.
+    let cost = 0;
+    if (res.ok) {
+      cost = estimatedCostUsd;
+      if (data && typeof data === 'object') {
+        if (model === META_MODELS.spark) cost = sparkCostUsd((data as { usage?: SparkUsage }).usage);
+        else cost = museImageCostUsd(data) ?? estimatedCostUsd;
+      }
+    }
+    void logAiCall(model, path, Date.now() - t0, false, cost);
+    if (!res.ok) throw new Error(`Meta API ${path} → HTTP ${res.status}: ${(rawText || JSON.stringify(data)).slice(0, 400)}`);
+    return data;
   }
   throw lastError ?? new Error(`Meta ${path} fetch failed`);
 }
@@ -103,7 +132,7 @@ export async function museImageGenerateScene(theme: string, env: Record<string, 
       reasoning_strength: env.VF_SCENE_REASONING || 'high',
       tool_enablement: { web_search: false, use_entertainment_tool: false, use_sports_tool: false },
       user: anonymousUserId(env),
-    }, env, fetchFn, 0.01);
+    }, env, fetchFn, MUSE_IMAGE_USD_PER_IMAGE);
   } catch (e) {
     if ((e as Error).message.includes('content_policy_violation'))
       throw new ThemeRejectedError('Muse Image safety system rejected this theme (content_policy_violation)');
@@ -138,7 +167,7 @@ export async function samSegmentConcept(imageUrl: string, concept: string, env: 
     throw new Error(`Meta SAM fetch failed: ${(e as Error).message}${cause ? ` (cause: ${cause.code ?? cause.message ?? 'unknown'})` : ''}`);
   }
   if (!res.ok) throw new Error(`Meta API SAM → HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`);
-  void logAiCall(META_MODELS.sam, 'sam.segment', Date.now() - t0);
+  void logAiCall(META_MODELS.sam, 'sam.segment', Date.now() - t0, false, SAM_USD_PER_IMAGE); // one image per call: $2.50/1,000
   const raw = await res.text();
   let outputText = parseSseOutputText(raw);
   if (!outputText && raw.trim().startsWith('{')) {
