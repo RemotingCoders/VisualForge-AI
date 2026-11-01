@@ -472,8 +472,8 @@ function boxBlurFloat(src: Float32Array, w: number, h: number, radius: number): 
  */
 export interface OnePassComponent { mask: boolean[]; bbox: BBox; area: number; meanAmp: number; score: number; meanLp: number; meanNewEdge: number; meanTex: number }
 export interface OnePassDiscard { bbox: BBox; area: number; meanAmp: number; reason: string }
-export interface OnePassThresholds { lpRadius: number; lpThreshold: number; strongMeanLp: number; newEdgeMin: number; newEdgeMaxTex: number; minArea: number; maxAreaFraction: number; growAmp: number; coreLp: number }
-export const ONE_PASS_THRESHOLDS: OnePassThresholds = { lpRadius: 3, lpThreshold: 9, strongMeanLp: 25, newEdgeMin: 15, newEdgeMaxTex: 25, minArea: 24, maxAreaFraction: 0.06, growAmp: 14, coreLp: 16 };
+export interface OnePassThresholds { lpRadius: number; lpThreshold: number; strongMeanLp: number; newEdgeMin: number; newEdgeMaxTex: number; minArea: number; maxAreaFraction: number; growAmp: number; coreLp: number; groupDilatePx: number }
+export const ONE_PASS_THRESHOLDS: OnePassThresholds = { lpRadius: 3, lpThreshold: 9, strongMeanLp: 25, newEdgeMin: 15, newEdgeMaxTex: 25, minArea: 24, maxAreaFraction: 0.06, growAmp: 14, coreLp: 16, groupDilatePx: 10 };
 
 export async function extractOnePassComponents(originalDataUrl: string, alignedEditedDataUrl: string, opts: Partial<OnePassThresholds> = {}): Promise<{ components: OnePassComponent[]; discarded: OnePassDiscard[] }> {
   const th = { ...ONE_PASS_THRESHOLDS, ...opts };
@@ -509,9 +509,26 @@ export async function extractOnePassComponents(originalDataUrl: string, alignedE
 
   const candidate = new Array<boolean>(n).fill(false);
   for (let i = 0; i < n; i++) candidate[i] = lp[i] >= th.lpThreshold;
-  const { labels } = connectedComponents(candidate, w, h);
+  // Grouping: a thin connector joins its ends — a flag's cloth, pole and base are
+  // ONE change, but the pole alone is too thin to bridge them, so undilated
+  // labeling splits the flag into three components. Dilating the WHOLE candidate
+  // mask by groupDilatePx would fix that but chains weak re-render islands
+  // across textured areas (calibration: a 48px disc grew to 205x141). So the
+  // dilation applies to the STRONG core only (lp >= coreLp): candidate pixels
+  // covered by a dilated strong component inherit its label; every other
+  // candidate pixel keeps its undilated label (the pre-grouping behavior). The
+  // blob's pixels stay the ORIGINAL undilated candidate pixels, and the measured
+  // mask stored later is built from those — dilation affects grouping only,
+  // never the saved mask.
+  const strongDilated = dilateMask(candidate.map((v, i) => v && lp[i] >= th.coreLp), w, h, th.groupDilatePx);
+  const { labels: strongLabels } = connectedComponents(strongDilated, w, h);
+  const { labels: ownLabels } = connectedComponents(candidate, w, h);
   const byLabel = new Map<number, number[]>();
-  for (let i = 0; i < n; i++) { const g = labels[i]; if (g < 0) continue; const arr = byLabel.get(g) ?? []; arr.push(i); byLabel.set(g, arr); }
+  for (let i = 0; i < n; i++) {
+    if (!candidate[i]) continue;
+    const g = strongLabels[i] >= 0 ? strongLabels[i] * 2 : ownLabels[i] * 2 + 1;
+    const arr = byLabel.get(g) ?? []; arr.push(i); byLabel.set(g, arr);
+  }
 
   const components: OnePassComponent[] = [];
   const discarded: OnePassDiscard[] = [];

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { enforceSpacing, maskToBBox, maskCentroid, maskToPolygon, normalizeBBox, overlaps } from '../engine/geometry';
+import { bboxGap, enforceSpacing, maskToBBox, maskCentroid, maskToPolygon, normalizeBBox, overlaps, unionBBox } from '../engine/geometry';
+import { changeDescriptionKey } from '../engine/descriptions';
 import { maskRasterToFrame } from '../engine/meta';
 import type { Providers, Mode, Difficulty, Difference, Region, PlannedChange, BBox } from '../engine/types';
 import { normalizeImage, imageInfo, cropDataUrl, expandBox, expandMask, diffMask, providerImage, clampBox, recolorCrop, squareContextBox, compositeMaskedEdit, estimateAlignment, alignEditedCrop, ALIGNMENT_MAX_RESIDUAL, cropColorStats, colorDeltaE, targetHueFromColor, cropDominantHue, transformObjectInPaste, duplicateObjectInPaste, extractOnePassComponents, compositeOnePassComponents, type OnePassComponent, type LocalTransformKind } from './imageOps';
@@ -115,6 +116,9 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     if (!mod.ok) throw new Error(`moderation rejected: ${mod.reason}`);
 
     const differences: Difference[] = [];
+    // Measured mask per accepted difference id (one-pass AND crop paths), so the
+    // final minimum-separation merge below can union masks across paths too.
+    const acceptedMasks = new Map<string, boolean[]>();
     const difficulty = job.difficulty ?? 'medium';
 
     // VF_SAM_MASKS: real SAM masks via the official parser. The object's mask as a
@@ -228,43 +232,94 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
         return { index: i, before: await providerImage(before.cropDataUrl), after: await providerImage(after.cropDataUrl), bbox: { x: m.bbox.x - box.x, y: m.bbox.y - box.y, width: m.bbox.width, height: m.bbox.height } };
       }));
       const reviews = await providers.vision.reviewDifferences(pairs); calls.spark++;
-      const kept: (Measured & { comp: OnePassComponent; description: string; type: string; notes: string })[] = [];
+      type Reviewed = Measured & { comp: OnePassComponent; description: string; type: string; notes: string; srcIndex: number };
+      const kept: Reviewed[] = [];
+      const maskArea = (mask: boolean[]) => mask.reduce((a, v) => a + (v ? 1 : 0), 0);
+      // Fuse `src` into `target` — parts of ONE change counted twice: union mask +
+      // union box, description/type of the LARGER-area part. The fused comp keeps
+      // every pixel, so recomposing from the kept comps loses nothing.
+      const fuseInto = (target: Reviewed, src: Reviewed) => {
+        const bigger = maskArea(src.mask) > maskArea(target.mask);
+        const mask = target.mask.map((v, i) => v || src.mask[i]);
+        const bbox = maskToBBox(mask, width, height) ?? unionBBox(target.bbox, src.bbox);
+        const area = maskArea(mask);
+        const wAvg = (a: number, b: number) => (a * target.comp.area + b * src.comp.area) / Math.max(1, target.comp.area + src.comp.area);
+        const meanAmp = wAvg(target.comp.meanAmp, src.comp.meanAmp);
+        target.mask = mask; target.bbox = bbox;
+        target.comp = { mask, bbox, area, meanAmp, score: area * meanAmp, meanLp: wAvg(target.comp.meanLp, src.comp.meanLp), meanNewEdge: wAvg(target.comp.meanNewEdge, src.comp.meanNewEdge), meanTex: wAvg(target.comp.meanTex, src.comp.meanTex) };
+        if (bigger) { target.description = src.description; target.type = src.type; }
+        target.notes = `${target.notes} + ${src.notes}`;
+      };
+      const keptByKey = new Map<string, Reviewed>();
+      const minSeparation = 0.06 * Math.min(width, height);
       for (const m of measured) {
         const i = measured.indexOf(m);
         const r = reviews.find(x => x.index === i);
         console.info(`[generate ${job.id}] onepass review #${i}: ok=${r?.ok ?? 'missing'} type=${r?.type ?? ''} description="${r?.description ?? ''}" notes="${r?.notes ?? ''}"`);
         if (!r?.ok) continue;
-        // Dedupe: two components describing the SAME change (type + description) are ONE
-        // difference. The weaker one is a phantom — a re-render component Spark described
-        // by copying the real change (field case: flip-flops counted twice, the phantom's
-        // bbox on untouched sand, unfindable). Keep the first (score order = strongest);
-        // the freed slot is refilled from the extra reviewed candidates or the crop top-up,
-        // so the level still delivers the requested count.
-        const key = `${(r.type || 'other').toLowerCase()}|${r.description.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim()}`;
+        const entry: Reviewed = { ...m, description: r.description, type: r.type || 'other', notes: r.notes, srcIndex: i };
+        // (a) Semantic dedupe: Spark marked this pair as part of the same single
+        // change as an earlier kept pair (sameChangeAs — flag and pole): fuse.
+        const same = typeof r.sameChangeAs === 'number' ? r.sameChangeAs : -1;
+        const sameTarget = same >= 0 && same !== i ? kept.find(k => k.srcIndex === same) : undefined;
+        if (sameTarget) { console.info(`[generate ${job.id}] onepass review #${i} fused into #${same}: Spark marked it as the same change (sameChangeAs) — parts of one change count once`); fuseInto(sameTarget, entry); continue; }
+        // (b) Description dedupe with location phrases stripped ("appeared at the
+        // lower right" / "next to the rock" / "in front of the large rock" are ONE
+        // flag). Same batch AND close: fuse — the pixels belong to the kept change.
+        // Same batch but FAR: the flip-flops phantom (a re-render component Spark
+        // described by copying the real change, bbox on untouched sand) — discard,
+        // never fuse distant noise into a real difference. An earlier pass:
+        // discard as before — that change is already composed and counted.
+        const key = changeDescriptionKey(entry.type, entry.description);
+        const inBatch = keptByKey.get(key);
+        if (inBatch) {
+          if (bboxGap(inBatch.bbox, entry.bbox) < minSeparation) { console.info(`[generate ${job.id}] onepass review #${i} fused into #${inBatch.srcIndex}: same change described again modulo location ("${r.description}") — parts of one change count once`); fuseInto(inBatch, entry); }
+          else console.info(`[generate ${job.id}] onepass review #${i} discarded: same change described again modulo location ("${r.description}") but far from #${inBatch.srcIndex} — phantom, not counted twice`);
+          continue;
+        }
         const dupOf = seenChanges.get(key);
         if (dupOf !== undefined) { console.info(`[generate ${job.id}] onepass review #${i} discarded: duplicate of an already-kept change (first kept at review #${dupOf}) ("${r.description}") — same change counted twice`); continue; }
-        seenChanges.set(key, i);
-        kept.push({ ...m, description: r.description, type: r.type || 'other', notes: r.notes });
+        seenChanges.set(key, i); keptByKey.set(key, entry);
+        kept.push(entry);
+      }
+      // (c) Minimum separation: kept differences whose boxes sit closer than the
+      // minimum separation are parts of one change — fuse them (union box and
+      // mask, larger-area description) until no close pair remains.
+      let fusedClose = true;
+      while (fusedClose) {
+        fusedClose = false;
+        outer: for (let a = 0; a < kept.length; a++) for (let b = a + 1; b < kept.length; b++) {
+          const ka = kept[a]; const kb = kept[b];
+          if (!ka || !kb) continue;
+          const gap = bboxGap(ka.bbox, kb.bbox);
+          if (gap >= minSeparation) continue;
+          console.info(`[generate ${job.id}] onepass reviews #${ka.srcIndex} + #${kb.srcIndex} fused: boxes ${gap.toFixed(0)}px apart < ${minSeparation.toFixed(0)}px minimum separation (6% of the smaller side) — one change split into parts`);
+          fuseInto(ka, kb); kept.splice(b, 1); fusedClose = true; break outer;
+        }
       }
       return kept;
     };
     type KeptMeasured = Measured & { comp: OnePassComponent; description: string; type: string; notes: string };
     const pushKept = (kept: KeptMeasured[], tagOf: (k: KeptMeasured) => string): void => {
-      for (const k of kept) differences.push({
-        id: `onepass-${differences.length + 1}`, type: k.type, description: k.description, bbox: k.bbox, bbox_normalized: normalizeBBox(k.bbox, width, height),
+      for (const k of kept) {
+        const id = `onepass-${differences.length + 1}`;
+        acceptedMasks.set(id, k.mask);
+        differences.push({
+        id, type: k.type, description: k.description, bbox: k.bbox, bbox_normalized: normalizeBBox(k.bbox, width, height),
         segmentation: maskToPolygon(k.mask, width, height) ?? undefined,
         area_px: k.mask.reduce((a, v) => a + (v ? 1 : 0), 0),
         centroid: maskCentroid(k.mask, width, height) ?? { x: k.bbox.x + k.bbox.width / 2, y: k.bbox.y + k.bbox.height / 2 },
         mask_url: null, severity: 'medium', verification_status: 'verified', verifier_notes: `${tagOf(k)}: ${k.notes}`,
-      });
+        });
+      }
     };
     const runOnePassPass = async (passBase: string, want: number, label: string): Promise<string | null> => {
       if (!providers.imageEdit.editFullImage || want <= 0) return null;
       const prompt = job.mode === 'qc'
         ? `Add exactly ${want} realistic manufacturing defects to this part (scratch, dent, crack, corrosion spot, missing screw or component, misalignment). Each defect small and localized, physically plausible for this material. Keep everything else pixel-identical.`
         : label === 'pass1'
-        ? `Make exactly ${want} minimal, realistic differences for a spot-the-difference game (for example: remove a small part of an object, add a small detail to an object, add a small object in an empty area). To get variety, vary the kind of change: add a small detail, remove a small part, add a small object, change one color, swap one element. Keep everything else pixel-identical: same framing, scale, colors and lighting.`
-        : `Make exactly ${want} additional minimal, realistic differences for a spot-the-difference game, in places that do not already contain a difference. To get variety, vary the kind of change: add a small detail, remove a small part, add a small object, change one color, swap one element. Keep everything else pixel-identical: same framing, scale, colors and lighting.`;
+        ? `Make exactly ${want} minimal, realistic differences for a spot-the-difference game (for example: remove a small part of an object, add a small detail to an object, add a small object in an empty area). To get variety, vary the kind of change: add a small detail, remove a small part, add a small object, change one color, swap one element. Spread the differences across different areas of the image, never two changes close to each other. Keep everything else pixel-identical: same framing, scale, colors and lighting.`
+        : `Make exactly ${want} additional minimal, realistic differences for a spot-the-difference game, in places that do not already contain a difference. To get variety, vary the kind of change: add a small detail, remove a small part, add a small object, change one color, swap one element. Spread the differences across different areas of the image, never two changes close to each other. Keep everything else pixel-identical: same framing, scale, colors and lighting.`;
       const edited = await providers.imageEdit.editFullImage(await providerImage(passBase), prompt); calls.muse++;
       const est = await estimateAlignment(passBase, edited);
       console.info(`[generate ${job.id}] onepass ${label} alignment: shift (${est.shiftX}, ${est.shiftY})px · scale ${est.scale.toFixed(2)} · residual error ${est.error.toFixed(1)}`);
@@ -601,6 +656,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
         mask_url: null, severity: ch.severity ?? 'medium',
         verification_status: 'verified', verifier_notes: notes,
       });
+      acceptedMasks.set(ch.id, finalCandidate.mask);
       current = finalCandidate.next;
     };
     // A candidate whose edit throws must not abort the whole list — discard it and
@@ -712,6 +768,43 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     }
     if (!differences.length) throw new Error('no change survived measurement/verification');
     if (job.mode === 'game' && differences.length < count) throw new Error(`We could only create ${differences.length} of the ${count} differences for this image — please try generating again.`);
+
+    // ============ MINIMUM SEPARATION (all paths, after review) ============
+    // Accepted differences whose boxes sit closer than 6% of the smaller image
+    // side are parts of ONE change (moon field case: a red flag counted as
+    // cloth + pole + base). Fuse them — union box, union mask, description of
+    // the larger-area one — across BOTH paths (one-pass and crops). Runs after
+    // the game count check on purpose: a split change must neither count
+    // multiple times nor fail the level for "delivering short".
+    {
+      const minSeparation = 0.06 * Math.min(width, height);
+      let fused = true;
+      while (fused) {
+        fused = false;
+        outer: for (let a = 0; a < differences.length; a++) for (let b = a + 1; b < differences.length; b++) {
+          const da = differences[a]; const db = differences[b];
+          if (!da || !db) continue;
+          const gap = bboxGap(da.bbox, db.bbox);
+          if (gap >= minSeparation) continue;
+          const [keep, drop] = (da.area_px ?? 0) >= (db.area_px ?? 0) ? [da, db] : [db, da];
+          console.info(`[generate ${job.id}] minimum separation: fused "${drop.description}" into "${keep.description}" — boxes ${gap.toFixed(0)}px apart < ${minSeparation.toFixed(0)}px (6% of the smaller side), one change split into parts`);
+          keep.bbox = unionBBox(da.bbox, db.bbox);
+          keep.bbox_normalized = normalizeBBox(keep.bbox, width, height);
+          const keepMask = acceptedMasks.get(keep.id); const dropMask = acceptedMasks.get(drop.id);
+          if (keepMask && dropMask) {
+            const union = keepMask.map((v, i) => v || dropMask[i]);
+            acceptedMasks.set(keep.id, union);
+            keep.area_px = union.reduce((n2, v) => n2 + (v ? 1 : 0), 0);
+            keep.segmentation = maskToPolygon(union, width, height) ?? keep.segmentation;
+            keep.centroid = maskCentroid(union, width, height) ?? keep.centroid;
+          } else { keep.area_px = (keep.area_px ?? 0) + (drop.area_px ?? 0); }
+          keep.verifier_notes = `${keep.verifier_notes} [fused with "${drop.description}" — parts of one change]`;
+          differences.splice(differences.indexOf(drop), 1);
+          acceptedMasks.delete(drop.id);
+          fused = true; break outer;
+        }
+      }
+    }
 
     // ============ QC DEFECT CLASSIFICATION (one Spark call per level) ============
     // After measurement, Spark re-classifies each defect from its before/after crops:

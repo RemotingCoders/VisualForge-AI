@@ -24,6 +24,23 @@ export function maskToBBox(mask: Uint8Array | boolean[], w: number, h: number): 
 export function overlaps(a: BBox, b: BBox, pad = 0): boolean {
   return !(a.x + a.width + pad <= b.x || b.x + b.width + pad <= a.x || a.y + a.height + pad <= b.y || b.y + b.height + pad <= a.y);
 }
+
+/** Gap in pixels between two boxes (0 when they overlap or touch): the Euclidean
+ *  distance between their closest edges/corners. The minimum-separation merge
+ *  fuses accepted differences whose boxes sit closer than 6% of the image's
+ *  smaller side — parts of one change (a flag, its pole, its base) must never
+ *  count as separate differences. */
+export function bboxGap(a: BBox, b: BBox): number {
+  const dx = Math.max(0, Math.max(a.x - (b.x + b.width), b.x - (a.x + a.width)));
+  const dy = Math.max(0, Math.max(a.y - (b.y + b.height), b.y - (a.y + a.height)));
+  return Math.hypot(dx, dy);
+}
+
+/** Smallest box containing both boxes (the merged difference's box). */
+export function unionBBox(a: BBox, b: BBox): BBox {
+  const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+  return { x, y, width: Math.max(a.x + a.width, b.x + b.width) - x, height: Math.max(a.y + a.height, b.y + b.height) - y };
+}
 export function enforceSpacing<T extends { bbox: BBox }>(items: T[], pad = 8): T[] {
   const kept: T[] = [];
   for (const it of items) if (!kept.some(k => overlaps(k.bbox, it.bbox, pad))) kept.push(it);

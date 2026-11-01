@@ -297,8 +297,9 @@ export const SPARK_SCHEMAS = {
           properties: {
             index: { type: 'integer' }, ok: { type: 'boolean' },
             description: { type: 'string' }, type: { type: 'string' }, notes: { type: 'string' },
+            sameChangeAs: { type: 'integer' },
           },
-          required: ['index', 'ok', 'description', 'type', 'notes'], additionalProperties: false,
+          required: ['index', 'ok', 'description', 'type', 'notes', 'sameChangeAs'], additionalProperties: false,
         },
       },
     },
@@ -429,7 +430,7 @@ class MetaProvider implements SegmentationProvider, VisionReasoningProvider, Ima
     const images: string[] = [];
     for (const p of pairs) images.push(p.before, p.after);
     const out = await sparkStructured<{ reviews: DifferenceReview[] }>({
-      prompt: `You are given ${pairs.length} pairs of image crops for a spot-the-difference game, in this order: pair 0 BEFORE, pair 0 AFTER, pair 1 BEFORE, pair 1 AFTER, and so on. The measured change regions are: ${JSON.stringify(pairs.map(p => ({ index: p.index, bbox: p.bbox })))}. For EACH pair decide: ok=true only if a real, describable visual difference exists between BEFORE and AFTER inside that region (an object added, removed, recolored, swapped or altered) and it looks realistic — ok=false if the two crops are effectively the same scene re-rendered (texture/lighting noise only, no describable change). For ok pairs give a short player-facing description of the difference in PAST TENSE, describing the finished result as seen in the AFTER image (e.g. "A ladybug appeared on the stem", "The white wolf turned gray") — never an instruction or imperative ("Change the...", "Remove the..."). and a type (one of: "add object", "remove object", "change color", "replace object", "other"). Return exactly one review per pair, keeping its index.`,
+      prompt: `You are given ${pairs.length} pairs of image crops for a spot-the-difference game, in this order: pair 0 BEFORE, pair 0 AFTER, pair 1 BEFORE, pair 1 AFTER, and so on. The measured change regions are: ${JSON.stringify(pairs.map(p => ({ index: p.index, bbox: p.bbox })))}. For EACH pair decide: ok=true only if a real, describable visual difference exists between BEFORE and AFTER inside that region (an object added, removed, recolored, swapped or altered) and it looks realistic — ok=false if the two crops are effectively the same scene re-rendered (texture/lighting noise only, no describable change). For ok pairs give a short player-facing description of the difference in PAST TENSE, describing the finished result as seen in the AFTER image (e.g. "A ladybug appeared on the stem", "The white wolf turned gray") — never an instruction or imperative ("Change the...", "Remove the..."). and a type (one of: "add object", "remove object", "change color", "replace object", "other"). Also set sameChangeAs: if two pairs show parts of the same single change, such as a flag and its pole, mark the later one as sameChangeAs the earlier — sameChangeAs is the earlier pair's index, or -1 when this pair is its own change. Return exactly one review per pair, keeping its index.`,
       images, schemaName: 'DifferenceReview', schema: SPARK_SCHEMAS.differenceReview,
     });
     return out.reviews;
@@ -516,7 +517,7 @@ export class MockProviders implements SegmentationProvider, VisionReasoningProvi
   }
   async verify() { return { ok: true, notes: 'MOCK verification — not real visual verification' }; }
   async reviewDifferences(pairs: { index: number }[]): Promise<DifferenceReview[]> {
-    return pairs.map(p => ({ index: p.index, ok: true, description: `MOCK difference ${p.index + 1} — not a real visual description`, type: 'other', notes: 'MOCK review — not real visual verification' }));
+    return pairs.map(p => ({ index: p.index, ok: true, description: `MOCK difference ${p.index + 1} — not a real visual description`, type: 'other', notes: 'MOCK review — not real visual verification', sameChangeAs: -1 }));
   }
   async generateHints(differences: { index: number; bbox_normalized: BBox }[]): Promise<DifferenceHints[]> {
     // Deterministic MOCK hints derived from the measured position only (never a real

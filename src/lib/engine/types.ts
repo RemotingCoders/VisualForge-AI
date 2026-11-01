@@ -61,8 +61,11 @@ export interface SegmentationProvider {
    *  hole, flange edge…), never the whole piece, so SAM returns several usable regions. */
   segment(imageRef: string, width: number, height: number, concepts?: string[], mode?: Mode): Promise<Region[]>;
 }
-/** One batched verdict per one-pass difference, from its original/modified crop pair. */
-export interface DifferenceReview { index: number; ok: boolean; description: string; type: string; notes: string }
+/** One batched verdict per one-pass difference, from its original/modified crop pair.
+ *  sameChangeAs: index of an EARLIER pair showing parts of the SAME single change
+ *  (a flag and its pole), or -1. Optional in the type so fake providers in tests
+ *  may omit it; the real Spark schema requires it. */
+export interface DifferenceReview { index: number; ok: boolean; description: string; type: string; notes: string; sameChangeAs?: number }
 /** Capability 2: Spark's hints + difficulty rating for one measured difference. */
 export interface DifferenceHints { index: number; difficulty: number; hints: string[] }
 /** One Spark finding in the AI-inspector challenge (bbox normalized 0..1). */
