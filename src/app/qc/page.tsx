@@ -258,7 +258,8 @@ export default function QC() {
             <button type="button" onClick={partVoice.toggle} aria-pressed={partVoice.listening} aria-label={partVoice.listening ? 'Stop voice input' : 'Dictate the part description with your voice'} className={`absolute right-2 bottom-2 rounded-full px-3 py-1.5 text-sm font-bold ${partVoice.listening ? 'bg-red-500 animate-pulse' : 'bg-white/15 hover:bg-white/25'}`}>{partVoice.listening ? '⏺ Listening…' : '🎤 Voice'}</button>
           )}
         </div>
-        {partVoice.listening && <p className="text-xs text-red-300 mt-1" role="status">🎙️ Listening… speak now — dictation stops after 3 s of silence, or tap the button again.</p>}
+        {partVoice.listening && <p className="text-xs text-red-300 mt-1" role="status">🎙️ Listening… speak now — once you start talking, dictation stops after 3 s of silence, or tap the button again.</p>}
+        {partVoice.error && <p className="text-xs text-red-300 mt-1" role="alert">{partVoice.error}</p>}
         {partSuggestion && (
           <p className="text-sm mt-2 bg-indigo-500/15 border border-indigo-400/30 rounded-lg px-3 py-2">✨ Spark suggests: “{partSuggestion}”{' '}
             <button type="button" className="bg-indigo-500 px-2 py-0.5 rounded-full text-xs font-bold" onClick={() => { setPartText(partSuggestion); setPartSuggestion(null); }}>Use this</button>{' '}

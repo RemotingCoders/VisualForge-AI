@@ -70,8 +70,11 @@ export default function Play() {
   const resetGame = (t: number) => { setTotal(t); setFound([]); setMistakes(0); setHints(0); setHintUsed({}); };
   /** Load an EXISTING level (gallery / share link): stored images only, generates nothing. */
   /** Race against Spark: same /api/ai-inspect challenge as QC, on game levels —
-   *  Spark's findings (descriptions, not defect types) draw in fuchsia on Modified. */
-  const [raceMode, setRaceMode] = useState<'no-reference' | 'with-reference'>('no-reference');
+   *  Spark's findings (descriptions, not defect types) draw in fuchsia on Modified.
+   *  Play ALWAYS races with-reference (Spark sees both images): spotting
+   *  differences is a comparison task, so modified-only makes no sense here —
+   *  that choice exists only in the QC trainer ("AI sees"). Not changeable. */
+  const raceMode = 'with-reference' as const;
   const [raceBusy, setRaceBusy] = useState(false);
   const [race, setRace] = useState<{ mode: string; isMock: boolean; latencySec: number; total: number; matchedCount: number; falsePositives: number; findings: { bbox_normalized: { x: number; y: number; width: number; height: number }; label: string; confidence: number; matched: boolean; differenceId?: string }[] } | null>(null);
   const [raceMsg, setRaceMsg] = useState(''); const [raceStart, setRaceStart] = useState<number | null>(null);
@@ -79,7 +82,7 @@ export default function Play() {
   const startRace = async () => {
     if (!levelId || raceBusy || busy) return;
     resetGame(total); setRace(null); setRaceHumanTime(null); setRaceStart(Date.now()); setRaceBusy(true);
-    setRaceMsg('🤖 Spark is inspecting the modified image… find them first!');
+    setRaceMsg('🤖 Spark is comparing both images… find them first!');
     const res = await fetch('/api/ai-inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ levelId, mode: raceMode, accessCode: accessCode || undefined }) }).catch(() => null);
     const data = await res?.json().catch(() => null);
     setRaceBusy(false);
@@ -264,7 +267,8 @@ export default function Play() {
           <button type="button" onClick={voice.toggle} aria-pressed={voice.listening} aria-label={voice.listening ? 'Stop voice input' : 'Dictate the theme with your voice'} className={`absolute right-2 bottom-2 rounded-full px-3 py-1.5 text-sm font-bold ${voice.listening ? 'bg-red-500 animate-pulse' : 'bg-white/15 hover:bg-white/25'}`}>{voice.listening ? '⏺ Listening…' : '🎤 Voice'}</button>
         )}
       </div>
-      {voice.listening && <p className="text-xs text-red-300 mt-1" role="status">🎙️ Listening… speak now — dictation stops after 3 s of silence, or tap the button again.</p>}
+      {voice.listening && <p className="text-xs text-red-300 mt-1" role="status">🎙️ Listening… speak now — once you start talking, dictation stops after 3 s of silence, or tap the button again.</p>}
+      {voice.error && <p className="text-xs text-red-300 mt-1" role="alert">{voice.error}</p>}
       {themeSuggestion && (
         <p className="text-sm mt-2 bg-indigo-500/15 border border-indigo-400/30 rounded-lg px-3 py-2">✨ Spark suggests: “{themeSuggestion}”{' '}
           <button type="button" className="bg-indigo-500 px-2 py-0.5 rounded-full text-xs font-bold" onClick={() => { setTheme(themeSuggestion); setThemeSuggestion(null); }}>Use this</button>{' '}
@@ -290,7 +294,7 @@ export default function Play() {
     <div className="flex flex-wrap gap-3 my-5 text-sm"><span className="bg-white/10 px-3 py-1 rounded-full">Found {found.length}/{total}</span><span className="bg-white/10 px-3 py-1 rounded-full">Mistakes {mistakes}/5</span>
       <button className="bg-white/10 px-3 py-1 rounded-full" onClick={requestHint}>💡 Hint ({hints})</button>
       <button className="bg-fuchsia-600 px-3 py-1 rounded-full font-bold disabled:opacity-50" disabled={!levelId || raceBusy || busy} onClick={startRace}>🤖 Race against Spark</button>
-      <label className="bg-white/10 px-2 py-1 rounded-full">Spark sees <select aria-label="Spark race mode" value={raceMode} onChange={e => setRaceMode(e.target.value as 'no-reference' | 'with-reference')} className="bg-transparent text-white"><option value="no-reference">modified only</option><option value="with-reference">both images</option></select></label>
+      <span className="bg-white/10 px-3 py-1 rounded-full">Spark sees: both images</span>
       {typeof window !== 'undefined' && levelId && <button className="bg-white/10 px-3 py-1 rounded-full" onClick={() => navigator.clipboard?.writeText(`${location.origin}/play?level=${levelId}`)}>🔗 Share link</button>}</div>
     <p aria-live="polite" className="font-semibold">{done ? '' : msg}</p>
     {img?.theme && <p className="text-sm opacity-80 mt-1">🎨 Scene: “{img.revisedPrompt || img.theme}”</p>}
