@@ -86,7 +86,11 @@ export async function metaPost(path: string, body: unknown, env: Record<string, 
       if (usage && (usage.input_tokens || usage.output_tokens)) recordModelTokens(model, usage.input_tokens ?? 0, usage.output_tokens ?? 0);
     }
     void logAiCall(model, path, Date.now() - t0, false, cost);
-    if (!res.ok) throw new Error(`Meta API ${path} → HTTP ${res.status}: ${(rawText || JSON.stringify(data)).slice(0, 400)}`);
+    // content_policy_violation is named EXPLICITLY in the error (not just buried
+    // in the body, possibly past the 400-char slice): generation jobs treat it
+    // as its own case — a QC defect hint that tripped the image safety filter
+    // gets ONE retry without the hint sentence, then a clear user-facing abort.
+    if (!res.ok) throw new Error(`Meta API ${path} → HTTP ${res.status}${rawText.includes('content_policy_violation') ? ' content_policy_violation' : ''}: ${(rawText || JSON.stringify(data)).slice(0, 400)}`);
     return data;
   }
   throw lastError ?? new Error(`Meta ${path} fetch failed`);

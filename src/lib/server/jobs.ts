@@ -26,6 +26,40 @@ export const MAX_MEASURED_AREA_FRACTION = 0.15;
  *  not burn paid calls. The game keeps its own floors (VISIBILITY_FLOOR /
  *  ABSOLUTE_FLOOR in runOnePassPass). */
 export const QC_AREA_FLOOR: Record<Difficulty, number> = { easy: 0.0010, medium: 0.0005, hard: 0 };
+/** User-facing message when Muse Image's safety filter rejects an edit prompt
+ *  (400 content_policy_violation) and the job must abort: after the one retry
+ *  without the QC defect-hint sentence (when the prompt carried it), or
+ *  immediately when no hint was involved. Never a raw API error. */
+export const IMAGE_POLICY_USER_MESSAGE = 'The image safety filter rejected your defect description. Use plainer wording, e.g. ‘discolored solder joint’ instead of ‘burnt’.';
+export class ImagePolicyAbortError extends Error {
+  constructor() { super(IMAGE_POLICY_USER_MESSAGE); this.name = 'ImagePolicyAbortError'; }
+}
+export const isImagePolicyViolation = (e: unknown): boolean => /content_policy_violation/.test(e instanceof Error ? e.message : String(e));
+/** Wording Muse Image's safety filter rejects inside edit prompts, softened
+ *  BEFORE a QC defect hint reaches ANY prompt (planner, one-pass, crop edits) —
+ *  a hint like "a burnt solder joint" otherwise fails EVERY edit of the job
+ *  (field case, Render 2026-11-03). The user's original text is still what
+ *  gets moderated, stored on the level and shown as "Requested: …"; only the
+ *  prompt copy is softened, and every replacement is logged by the caller. */
+const HINT_FILTER_REPLACEMENTS: { pattern: RegExp; to: string }[] = [
+  { pattern: /\b(burnt|burned)\b/gi, to: 'overheated' },
+  { pattern: /\bscorched\b/gi, to: 'discolored' },
+  { pattern: /\bfire\b/gi, to: 'heat' },
+  { pattern: /\bsmoke\b/gi, to: 'discoloration' },
+  { pattern: /\b(exploded|destroyed)\b/gi, to: 'damaged' },
+  { pattern: /\bblood\b/gi, to: 'discolored' },
+];
+export function sanitizeDefectHintForPrompts(hint: string): { text: string; replacements: { from: string; to: string }[] } {
+  const replacements: { from: string; to: string }[] = [];
+  let text = hint;
+  for (const { pattern, to } of HINT_FILTER_REPLACEMENTS) {
+    text = text.replace(pattern, (match) => {
+      replacements.push({ from: match, to });
+      return match.charAt(0) === match.charAt(0).toUpperCase() ? to.charAt(0).toUpperCase() + to.slice(1) : to;
+    });
+  }
+  return { text, replacements };
+}
 export interface Job {
   id: string; status: JobStatus; stage: string; mode: Mode; isMock: boolean;
   error?: string; levelId?: string; requestedChanges?: number; difficulty?: Difficulty; createdAt: number; updatedAt: number;
@@ -150,6 +184,27 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       console.info(`[generate ${job.id}] defect hint accepted: "${job.defectHint}" — the planner maps it to allowed defect types in priority order`);
     }
 
+    // The PROMPT copy of the hint: filter-tripping terms softened (the original
+    // above is what was moderated and what the level stores). `let`: a Muse
+    // Image content_policy_violation on a prompt carrying the hint retries that
+    // ONE edit without the sentence, and on success the hint is disabled for
+    // the rest of the job (hintDisabledByImageFilter marks the level); a second
+    // violation — or one on a hint-less prompt — aborts the job immediately.
+    let promptHint: string | undefined;
+    let hintDisabledByImageFilter = false;
+    if (job.mode === 'qc' && job.defectHint) {
+      const sanitized = sanitizeDefectHintForPrompts(job.defectHint);
+      promptHint = sanitized.text;
+      for (const r of sanitized.replacements) console.info(`[generate ${job.id}] defect hint wording softened for prompts: "${r.from}" → "${r.to}" (the image safety filter rejects the original term)`);
+      if (sanitized.text !== job.defectHint) console.info(`[generate ${job.id}] defect hint for prompts: "${promptHint}" (stored/shown as requested: "${job.defectHint}")`);
+    }
+    const hintSentence = (): string => promptHint ? ` The inspector asked for these defects, in priority order: ${promptHint}.` : '';
+    const disableHintAfterPolicyRetry = (where: string): void => {
+      promptHint = undefined;
+      hintDisabledByImageFilter = true;
+      console.info(`[generate ${job.id}] defect hint disabled for the rest of this job: the ${where} edit only passed without it after a content_policy_violation — the level is marked "defect request could not be applied by the image model"`);
+    };
+
     const differences: Difference[] = [];
     // Measured mask per accepted difference id (one-pass AND crop paths), so the
     // final minimum-separation merge below can union masks across paths too.
@@ -225,7 +280,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       // Ask for MORE candidates than needed (count + 5, priority-ordered, with the variety
       // quota in the planner prompt): the executor walks the list and stops at `count`
       // achieved — discarded candidates no longer sink the whole level.
-      const planned = await providers.vision.plan(aiImg, regions, job.mode, count + 5, difficulty, job.defectHint); calls.spark++;
+      const planned = await providers.vision.plan(aiImg, regions, job.mode, count + 5, difficulty, promptHint); calls.spark++;
       if (!planned.length) throw new Error('planner returned no changes');
       // Hard rule (GAME mode only): remove/replace/geometric transforms on a FRAGMENT make
       // objects look broken, so downgrade those to a color change. "add object" stays: it puts
@@ -367,15 +422,32 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     };
     const runOnePassPass = async (passBase: string, want: number, label: string): Promise<string | null> => {
       if (!providers.imageEdit.editFullImage || want <= 0) return null;
-      const hintSentence = job.mode === 'qc' && job.defectHint ? ` The inspector asked for these defects, in priority order: ${job.defectHint}.` : '';
-      const prompt = job.mode === 'qc'
+      const buildPrompt = (withHint: boolean): string => job.mode === 'qc'
         ? difficulty === 'easy'
-          ? `Add exactly ${want} realistic manufacturing defects to this part (scratch, dent, crack, corrosion spot, missing screw or component, misalignment). Each defect must be a large, clearly visible defect covering a significant part of the surface, not a small mark. Keep everything else pixel-identical.${hintSentence}`
-          : `Add exactly ${want} realistic manufacturing defects to this part (scratch, dent, crack, corrosion spot, missing screw or component, misalignment). Each defect small and localized, physically plausible for this material. Keep everything else pixel-identical.${hintSentence}`
+          ? `Add exactly ${want} realistic manufacturing defects to this part (scratch, dent, crack, corrosion spot, missing screw or component, misalignment). Each defect must be a large, clearly visible defect covering a significant part of the surface, not a small mark. Keep everything else pixel-identical.${withHint ? hintSentence() : ''}`
+          : `Add exactly ${want} realistic manufacturing defects to this part (scratch, dent, crack, corrosion spot, missing screw or component, misalignment). Each defect small and localized, physically plausible for this material. Keep everything else pixel-identical.${withHint ? hintSentence() : ''}`
         : label === 'pass1'
         ? `Make exactly ${want} minimal, realistic differences for a spot-the-difference game (for example: remove a small part of an object, add a small detail to an object, add a small object in an empty area). To get variety, vary the kind of change: add a small detail, remove a small part, add a small object, change one color, swap one element. Spread the differences across different areas of the image, never two changes close to each other. Keep everything else pixel-identical: same framing, scale, colors and lighting.`
         : `Make exactly ${want} additional minimal, realistic differences for a spot-the-difference game, in places that do not already contain a difference. To get variety, vary the kind of change: add a small detail, remove a small part, add a small object, change one color, swap one element. Spread the differences across different areas of the image, never two changes close to each other. Keep everything else pixel-identical: same framing, scale, colors and lighting.`;
-      const edited = await providers.imageEdit.editFullImage(await providerImage(passBase), prompt); calls.muse++;
+      // content_policy_violation is its own case: with the hint sentence in the
+      // prompt, retry THIS edit once without it (success disables the hint for
+      // the rest of the job); failing again — or failing with no hint in the
+      // prompt — aborts the whole job instead of burning every candidate.
+      let edited: string;
+      try {
+        edited = await providers.imageEdit.editFullImage(await providerImage(passBase), buildPrompt(true)); calls.muse++;
+      } catch (e) {
+        if (!isImagePolicyViolation(e)) throw e;
+        if (!(job.mode === 'qc' && promptHint)) throw new ImagePolicyAbortError();
+        console.info(`[generate ${job.id}] onepass ${label}: content_policy_violation with the defect hint in the prompt — retrying this edit once WITHOUT the hint sentence`);
+        try {
+          edited = await providers.imageEdit.editFullImage(await providerImage(passBase), buildPrompt(false)); calls.muse++;
+        } catch (e2) {
+          if (isImagePolicyViolation(e2)) throw new ImagePolicyAbortError();
+          throw e2;
+        }
+        disableHintAfterPolicyRetry('one-pass');
+      }
       const est = await estimateAlignment(passBase, edited);
       console.info(`[generate ${job.id}] onepass ${label} alignment: shift (${est.shiftX}, ${est.shiftY})px · scale ${est.scale.toFixed(2)} · residual error ${est.error.toFixed(1)}`);
       if (!est.aligned) { console.info(`[generate ${job.id}] onepass ${label} discarded: residual alignment error ${est.error.toFixed(1)} exceeds ${ALIGNMENT_MAX_RESIDUAL}`); return null; }
@@ -525,6 +597,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
         // planned in parallel, below) tops up first; only if a GAME level is STILL
         // short does the completion block further down spend a second one-pass call.
       } catch (e) {
+        if (e instanceof ImagePolicyAbortError) throw e; // image-filter abort: no crop fallback either — every edit would be rejected
         console.info(`[generate ${job.id}] one-pass failed (${e instanceof Error ? e.message : String(e)}) — falling back to crop pipeline`);
       }
       if (differences.length) console.info(`[generate ${job.id}] one-pass delivered ${differences.length}/${count} — ${differences.length < count ? 'crop pipeline will top up' : 'no crop pipeline needed'}`);
@@ -576,7 +649,28 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       // ONE Muse call per attempt: a "keep the framing" re-prompt does not change Muse's
       // systematic shift and only doubles cost. Instead the shift/scale is measured and
       // compensated geometrically; rejection happens only on high RESIDUAL error.
-      const edited = await providers.imageEdit.editMaskedRegion(await providerImage(contextCrop), { id: region.id, bbox: relPaste }, prompt);
+      // content_policy_violation is its own case (same rule as the one-pass
+      // prompt): if THIS prompt carries the defect-hint sentence, retry the edit
+      // once without it — success disables the hint for the rest of the job;
+      // failing again, or failing with no hint in the prompt, aborts the job
+      // (ImagePolicyAbortError) instead of discarding candidate after candidate.
+      let edited: string;
+      try {
+        edited = await providers.imageEdit.editMaskedRegion(await providerImage(contextCrop), { id: region.id, bbox: relPaste }, prompt);
+      } catch (e) {
+        if (!isImagePolicyViolation(e)) throw e;
+        const sentence = hintSentence();
+        if (!(job.mode === 'qc' && sentence && prompt.includes(sentence))) throw new ImagePolicyAbortError();
+        console.info(`[generate ${job.id}] change ${ch.id}: content_policy_violation with the defect hint in the prompt — retrying this edit once WITHOUT the hint sentence`);
+        calls.muse++; // the retry is a real Muse call; the per-change budget is not re-charged (it replaces the rejected attempt)
+        try {
+          edited = await providers.imageEdit.editMaskedRegion(await providerImage(contextCrop), { id: region.id, bbox: relPaste }, prompt.replace(sentence, ''));
+        } catch (e2) {
+          if (isImagePolicyViolation(e2)) throw new ImagePolicyAbortError();
+          throw e2;
+        }
+        disableHintAfterPolicyRetry('crop');
+      }
       const est = await estimateAlignment(contextCrop, edited, relPaste);
       console.info(`[generate ${job.id}] change ${ch.id} alignment: shift (${est.shiftX}, ${est.shiftY})px · scale ${est.scale.toFixed(2)} · residual error ${est.error.toFixed(1)}`);
       if (!est.aligned) {
@@ -714,7 +808,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       // mapped this candidate to its closest allowed type).
       const editPrompt = (job.mode === 'qc' && difficulty === 'easy'
         ? `${ch.editPrompt} Make it a large, clearly visible defect covering a significant part of the surface, not a small mark.`
-        : ch.editPrompt) + (job.mode === 'qc' && job.defectHint ? ` The inspector asked for these defects, in priority order: ${job.defectHint}.` : '');
+        : ch.editPrompt) + (job.mode === 'qc' ? hintSentence() : '');
       const isColor = /colou?r/i.test(ch.type);
       const localKind = job.mode === 'game' ? LOCAL_KIND(ch.type) : null;
       let candidate: Candidate | null = null;
@@ -771,9 +865,14 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     };
     // A candidate whose edit throws must not abort the whole list — discard it and
     // move on (candidates are a priority list; the count guarantee decides at the end).
+    // EXCEPTION: an image-filter abort is job-fatal by design (it would reject
+    // every remaining candidate too) — it propagates immediately.
     const tryCandidate = async (ch: (typeof plan)[number], position: number, total: number): Promise<void> => {
       try { await executeCandidate(ch, position, total); }
-      catch (e) { console.info(`[generate ${job.id}] change ${ch.id} discarded: edit failed (${e instanceof Error ? e.message : String(e)}) — next candidate`); }
+      catch (e) {
+        if (e instanceof ImagePolicyAbortError) throw e;
+        console.info(`[generate ${job.id}] change ${ch.id} discarded: edit failed (${e instanceof Error ? e.message : String(e)}) — next candidate`);
+      }
     };
     const runList = async (list: PlannedChange[]): Promise<void> => {
       let position = 0;
@@ -805,7 +904,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
         const missing = count - differences.length;
         console.info(`[generate ${job.id}] crop candidates exhausted at ${differences.length}/${count} — replacement plan: 1 Spark call for ${missing + 2} candidates over ${freeRegions.length} free region(s)`);
         try {
-          const extra = await providers.vision.plan(aiImg, freeRegions, job.mode, missing + 2, difficulty, job.defectHint); calls.spark++;
+          const extra = await providers.vision.plan(aiImg, freeRegions, job.mode, missing + 2, difficulty, promptHint); calls.spark++;
           const freeIds = new Set(freeRegions.map(r => r.id));
           // Same hard rule as the initial plan: remove/replace/geometric transforms
           // on a FRAGMENT make objects look broken (game mode) — downgrade to color.
@@ -878,6 +977,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       const beforeCrops = differences.length;
       try { await cropTopUp(); }
       catch (e) {
+        if (e instanceof ImagePolicyAbortError) throw e; // image-filter abort is job-fatal even with differences already accepted
         if (!differences.length) throw e;
         console.info(`[generate ${job.id}] crop top-up failed (${e instanceof Error ? e.message : String(e)}) — keeping the ${differences.length} difference(s) accepted so far`);
       }
@@ -902,6 +1002,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
         if (afterCompletion) current = afterCompletion;
         if (differences.length > before) console.info(`[generate ${job.id}] completion one-pass added ${differences.length - before} difference(s) — now ${differences.length}/${count}`);
       } catch (e) {
+        if (e instanceof ImagePolicyAbortError) throw e;
         console.info(`[generate ${job.id}] completion one-pass failed (${e instanceof Error ? e.message : String(e)})`);
       }
     }
@@ -993,8 +1094,14 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     // QC count policy differs from the game's: a short QC level still publishes (the
     // trainer works with what was verified) and carries an explicit notice instead of
     // failing the job. Only zero defects at all is a hard failure (handled above).
-    const notice = job.mode === 'qc' && differences.length < count ? `Generated ${differences.length} of ${count} defects` : undefined;
-    if (notice) console.info(`[generate ${job.id}] ${notice} — publishing the partial QC level with this notice instead of failing`);
+    // A hint the image model refused (disabled after the policy retry) marks the
+    // level the same way — the defects that shipped are the planner's fallbacks,
+    // not the requested ones.
+    const noticeParts: string[] = [];
+    if (job.mode === 'qc' && differences.length < count) noticeParts.push(`Generated ${differences.length} of ${count} defects`);
+    if (hintDisabledByImageFilter) noticeParts.push('defect request could not be applied by the image model');
+    const notice = noticeParts.length ? noticeParts.join(' · ') : undefined;
+    if (notice) console.info(`[generate ${job.id}] ${notice} — publishing the QC level with this notice`);
 
     logSummary(differences);
 
