@@ -1,6 +1,7 @@
 # VisualForge AI — Diferia & QC Inspection Trainer
 
 **Live demo: https://visualforge-ai.taplinko.store** — play the gallery for free; Generating new levels calls Meta’s models on my account, so it sits behind an access code purely as a spending guard (available on request). To generate freely, run it locally with your own key — see Setup.
+![Type a theme, play a level one minute later, race Muse Spark](docs/demo.gif)
 
 **One verified visual-difference engine, three experiences.** Given any image, VisualForge produces a modified version with realistic, localized, *verified* changes — plus the exact bounding box and mask of each change.
 
