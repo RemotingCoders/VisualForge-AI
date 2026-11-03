@@ -212,7 +212,7 @@ export default function QC() {
     setJob('creating job…'); setStep(0); setJobElapsed(0); setPartUsed(usingPart); setPreviewImage('');
     const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(usingPart ? { theme: partText.trim(), themeTicket: partTicketRef.current ?? undefined, count, mode: 'qc', difficulty, defectHint: defectHint.trim() || undefined, accessCode: accessCode || undefined } : { imageDataUrl: photo || undefined, count, mode: 'qc', difficulty, defectHint: defectHint.trim() || undefined, accessCode: accessCode || undefined }) });
     const data = await res.json();
-    if (res.status === 401) { setJob(''); alert('Generating new levels needs the access code provided in the hackathon submission. You can still inspect the example QC levels in the gallery below.'); return; }
+    if (res.status === 401) { setJob(''); alert('Generating new levels needs the access code. You can still inspect the example QC levels in the gallery below.'); return; }
     if (!res.ok) { setJob(''); alert(data.error ?? 'generation failed'); return; }
     if (data.isMock) { setJob(''); setReal(null); alert('Real QC generation is off right now — you can still inspect the example QC levels in the gallery below.'); return; }
     for (let i = 0; i < 600; i++) {

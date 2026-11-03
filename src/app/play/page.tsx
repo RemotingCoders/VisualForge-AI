@@ -131,7 +131,7 @@ export default function Play() {
     const finish = () => { setBusy(false); };
     const res = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(usingTheme ? { theme: theme.trim(), themeTicket: themeTicketRef.current ?? undefined, count, mode: 'game', difficulty, accessCode: accessCode || undefined } : { imageDataUrl: photo || undefined, count, mode: 'game', difficulty, accessCode: accessCode || undefined }) });
     const data = await res.json();
-    if (res.status === 401) { finish(); setMsg('Generating new levels needs the access code provided in the hackathon submission. You can still play the levels in the gallery below.'); return; }
+    if (res.status === 401) { finish(); setMsg('Generating new levels needs the access code. You can still play the levels in the gallery below.'); return; }
     if (!res.ok) { finish(); setMsg(`❌ ${data.error ?? 'generation failed'}`); return; }
     for (let i = 0; i < 600; i++) {
       const s = await (await fetch(`/api/generate?id=${data.jobId}`)).json();
