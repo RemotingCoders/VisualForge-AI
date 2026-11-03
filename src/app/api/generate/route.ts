@@ -16,7 +16,7 @@ const MAX_IMAGE_CHARS = 12_000_000; // ~9 MB base64 — abuse/credit guard
 /** POST {imageDataUrl, count, mode} — or {theme, count, mode} with VF_THEME_GENERATION — -> {jobId, isMock, label}. Generation runs async (Meta calls take 3-17s each).
  *  Public-demo credit protection, checked BEFORE any provider work: the single
  *  access rule (requireMetaAccess, shared with /api/ai-inspect and every future
- *  Meta-calling route — 401 without the judge code when VF_ACCESS_CODE is set),
+ *  Meta-calling route — 401 without the access code when VF_ACCESS_CODE is set),
  *  the global judging-period budget (VF_SPEND_CAP_USD — 429 when exhausted),
  *  per-IP rate limit of 5 generations/hour (429), daily job cap counted from
  *  visualforge_generation_jobs (429). Playing existing levels needs none of this.
@@ -29,7 +29,7 @@ export async function POST(req: Request) {
   let body: { imageDataUrl?: string; count?: number; mode?: 'game' | 'qc'; difficulty?: string; defectHint?: string; theme?: string; accessCode?: string; themeCheck?: boolean; themeTicket?: string };
   try { body = await req.json(); } catch { return NextResponse.json({ error: 'invalid JSON' }, { status: 400 }); }
   // THE access rule: when VF_ACCESS_CODE is set, every Meta-calling route demands
-  // the judge code before any provider work — this one, /api/ai-inspect, and any
+  // the access code before any provider work — this one, /api/ai-inspect, and any
   // future one (tests/spend.test.ts walks src/app/api and fails an ungated route).
   const denied = requireMetaAccess(body.accessCode);
   if (denied) return denied;

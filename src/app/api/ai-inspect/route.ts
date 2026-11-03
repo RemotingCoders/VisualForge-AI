@@ -34,7 +34,7 @@ async function toProviderImage(ref: unknown): Promise<string | null> {
  *  center of either box inside the other; each difference claimable once,
  *  duplicates count as false positives) and every finding is logged against
  *  its nearest real box for calibration. Gated by the SAME single rule as
- *  generation (requireMetaAccess: judge code when VF_ACCESS_CODE is set) plus
+ *  generation (requireMetaAccess: access code when VF_ACCESS_CODE is set) plus
  *  the global VF_SPEND_CAP_USD budget — a Spark inspection is a paid call —
  *  and a per-IP limit of 10 challenges/hour (one Spark call each). Each challenge also
  *  accumulates per-difference Spark detectability (migration 0006). */

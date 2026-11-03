@@ -104,7 +104,7 @@ export default function QC() {
     if (lv.demo || lv.mode !== 'qc') { alert('That is not a QC level.'); return; }
     setReal(lv); // the [real] effect below scrolls the "Find the defects" heading into view
   };
-  /** Judge access code — same shared field as /play (remembered in localStorage). */
+  /** Access code — same shared field as /play (remembered in localStorage). */
   const [accessCode, setAccessCode] = useState('');
   useEffect(() => { try { setAccessCode(localStorage.getItem('vf-access-code') ?? ''); } catch { /* private window */ } }, []);
   /** Voice dictation → Spark tidy-up (same flow as /play's theme box): when dictation
@@ -290,7 +290,7 @@ export default function QC() {
         <label>Defects <select aria-label="Number of defects" value={count} onChange={e => setCount(Number(e.target.value))} className="bg-white/10 px-2 py-2 rounded text-white">{[1, 2, 3, 4, 5].map(n => <option key={n} value={n}>{n}</option>)}</select></label>
         <label>Difficulty <select aria-label="Difficulty" value={difficulty} onChange={e => setDifficulty(e.target.value as 'easy' | 'medium' | 'hard')} className="bg-white/10 px-2 py-2 rounded text-white"><option value="easy">Easy</option><option value="medium">Medium</option><option value="hard">Hard</option></select></label>
         <button className="bg-indigo-500 font-bold px-4 py-2 rounded disabled:opacity-50" disabled={!!job || (!photo && !partText.trim())} onClick={generateReal}>{job ? '⏳ Generating…' : '⚙️ Generate QC level'}</button>
-        <label>Judge access code <input type="password" aria-label="Judge access code" value={accessCode} onChange={e => { setAccessCode(e.target.value); try { localStorage.setItem('vf-access-code', e.target.value); } catch { /* private window */ } }} placeholder="for judges" className="bg-white/10 px-2 py-2 rounded text-white w-36" /></label>
+        <label>Access code <input type="password" aria-label="Access code" value={accessCode} onChange={e => { setAccessCode(e.target.value); try { localStorage.setItem('vf-access-code', e.target.value); } catch { /* private window */ } }} placeholder="for access" className="bg-white/10 px-2 py-2 rounded text-white w-36" /></label>
         {job && <span className="opacity-80">{job}</span>}
       </div>
       <p className="text-xs opacity-60 mt-2">Difficulty = inspector level: easy shows obvious defects on large surfaces, hard hides component-scale defects</p>

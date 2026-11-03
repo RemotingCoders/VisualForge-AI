@@ -21,9 +21,9 @@ export function accessCodeOk(provided: unknown, env: Record<string, string | und
   return timingSafeEqual(a, b);
 }
 
-/** Exact copy answered when a Meta-calling route is hit without the judge code:
+/** Exact copy answered when a Meta-calling route is hit without the access code:
  *  it says where the code lives AND names the free fallback (the gallery). */
-export const META_ACCESS_MESSAGE = "This action uses Meta's models and needs the judge access code from the hackathon submission. The gallery is free to play.";
+export const META_ACCESS_MESSAGE = "This action uses Meta's models and needs the access code. The gallery is free to play.";
 
 /** THE single access rule for every route that calls Meta's models — level/scene
  *  generation, theme moderation, "Race against Spark", "Challenge the AI

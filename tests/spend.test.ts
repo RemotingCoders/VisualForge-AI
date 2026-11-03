@@ -94,7 +94,7 @@ describe('requireMetaAccess — the single gate', () => {
     const denied = requireMetaAccess(undefined, env);
     expect(denied?.status).toBe(401);
     expect((await denied!.json()).error).toBe(META_ACCESS_MESSAGE);
-    expect(META_ACCESS_MESSAGE).toBe("This action uses Meta's models and needs the judge access code from the hackathon submission. The gallery is free to play.");
+    expect(META_ACCESS_MESSAGE).toBe("This action uses Meta's models and needs the access code. The gallery is free to play.");
     expect(requireMetaAccess('wrong', env)?.status).toBe(401);
     expect(requireMetaAccess('judges-2026', env)).toBeNull();
     expect(requireMetaAccess(undefined, {})).toBeNull();
@@ -159,7 +159,7 @@ describe('every Meta-calling API route uses the single gates', () => {
       const src = readFileSync(join(apiDir, rel), 'utf8');
       if (!META_TOKENS.some(t => src.includes(t))) continue; // free route: gallery, level, clicks, saved hints, exports…
       metaRoutes.push(rel.replaceAll('\\', '/'));
-      expect(src, `${rel} calls Meta but does not gate on the judge access code`).toContain('requireMetaAccess(');
+      expect(src, `${rel} calls Meta but does not gate on the access code`).toContain('requireMetaAccess(');
       expect(src, `${rel} calls Meta but does not check the spend cap`).toContain('enforceSpendCap(');
     }
     // The known Meta surface today. A NEW Meta-calling route must be added here
