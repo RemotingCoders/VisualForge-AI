@@ -26,7 +26,7 @@ const MAX_IMAGE_CHARS = 12_000_000; // ~9 MB base64 — abuse/credit guard
  *  reuses it instead of moderating twice. A check creates no job and burns no
  *  generation quota — it runs before the rate-limit/daily-cap guards below. */
 export async function POST(req: Request) {
-  let body: { imageDataUrl?: string; count?: number; mode?: 'game' | 'qc'; difficulty?: string; theme?: string; accessCode?: string; themeCheck?: boolean; themeTicket?: string };
+  let body: { imageDataUrl?: string; count?: number; mode?: 'game' | 'qc'; difficulty?: string; defectHint?: string; theme?: string; accessCode?: string; themeCheck?: boolean; themeTicket?: string };
   try { body = await req.json(); } catch { return NextResponse.json({ error: 'invalid JSON' }, { status: 400 }); }
   // THE access rule: when VF_ACCESS_CODE is set, every Meta-calling route demands
   // the judge code before any provider work — this one, /api/ai-inspect, and any
@@ -71,6 +71,11 @@ export async function POST(req: Request) {
   const count = Math.max(1, Math.min(10, body.count ?? 5));
   const mode = body.mode === 'qc' ? 'qc' : 'game';
   const difficulty: Difficulty = body.difficulty === 'easy' || body.difficulty === 'hard' ? body.difficulty : 'medium';
+  // QC only: the inspector's optional free-text defect request ("What defects
+  // should appear?", max 300 characters) — ignored entirely outside QC mode.
+  // Empty/absent keeps today's behavior; the job moderates it like a theme.
+  const defectHint = mode === 'qc' && typeof body.defectHint === 'string' ? body.defectHint.trim() : '';
+  if (defectHint.length > 300) return NextResponse.json({ error: 'defectHint too long (max 300 characters)' }, { status: 400 });
   // Daily cap counted from today's visualforge_generation_jobs rows (durable across
   // restarts/instances); in-memory count only as fallback when Supabase is unavailable.
   const dbJobsToday = await countJobsToday();
@@ -80,7 +85,7 @@ export async function POST(req: Request) {
   const { providers, label } = selectProviders();
   if (providers.segmentation.isMock) {
     // Honest offline path: labeled demo scene level, instantly playable. No silent fake "AI generation".
-    const job = createJob(mode, true, count, difficulty);
+    const job = createJob(mode, true, count, difficulty, defectHint || undefined);
     const demo = createDemoLevel(Math.floor(Math.random() * 9999));
     job.status = 'done'; job.stage = 'done'; job.levelId = demo.levelId; job.updatedAt = Date.now(); void persistJob(job);
     return NextResponse.json({ jobId: job.id, isMock: true, label, levelId: demo.levelId });
@@ -88,7 +93,7 @@ export async function POST(req: Request) {
 
   try { assertMetaConfigured(); } catch (e) { return NextResponse.json({ error: e instanceof Error ? e.message : 'meta not configured' }, { status: 400 }); }
   if (theme) {
-    const job = createJob(mode, false, count, difficulty);
+    const job = createJob(mode, false, count, difficulty, defectHint || undefined);
     // A dictation pre-check ticket for THIS exact text means Spark already moderated
     // it — the job skips its own moderation call (exactly one per theme, total).
     const themePreModerated = consumeThemeTicket(body.themeTicket, theme);
@@ -99,7 +104,7 @@ export async function POST(req: Request) {
   if (!imageDataUrl.startsWith('data:image/') || imageDataUrl.length > MAX_IMAGE_CHARS)
     return NextResponse.json({ error: 'imageDataUrl required (data:image/..., max ~9MB)' }, { status: 400 });
 
-  const job = createJob(mode, false, count, difficulty);
+  const job = createJob(mode, false, count, difficulty, defectHint || undefined);
   void runGeneration(job, { imageDataUrl }, count, providers); // async by design — poll GET
   return NextResponse.json({ jobId: job.id, isMock: false, label });
 }

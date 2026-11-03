@@ -82,7 +82,7 @@ export interface VisionReasoningProvider {
    *  when a provider does not implement it. cleanTheme: the same call's tidied rewrite of
    *  the theme (voice-dictation "Spark suggests"); providers may omit it. */
   moderateTheme?(text: string): Promise<{ ok: boolean; reason: string; cleanTheme?: string }>;
-  plan(imageRef: string, regions: Region[], mode: Mode, count: number, difficulty?: Difficulty): Promise<PlannedChange[]>;
+  plan(imageRef: string, regions: Region[], mode: Mode, count: number, difficulty?: Difficulty, defectHint?: string): Promise<PlannedChange[]>;
   verify(imageRef: string, modifiedRef: string, change: PlannedChange, measured: BBox): Promise<{ ok: boolean; notes: string }>;
   /** ONE call reviewing N crop pairs (before/after interleaved in `pairs` order). Used by one-pass mode. */
   reviewDifferences?(pairs: { index: number; before: string; after: string; bbox: BBox }[]): Promise<DifferenceReview[]>;

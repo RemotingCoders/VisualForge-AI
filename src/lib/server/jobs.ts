@@ -29,6 +29,11 @@ export const QC_AREA_FLOOR: Record<Difficulty, number> = { easy: 0.0010, medium:
 export interface Job {
   id: string; status: JobStatus; stage: string; mode: Mode; isMock: boolean;
   error?: string; levelId?: string; requestedChanges?: number; difficulty?: Difficulty; createdAt: number; updatedAt: number;
+  /** QC only: the inspector's free-text defect request ("What defects should
+   *  appear?", <= 300 chars). Moderated like a theme, then steers the planner
+   *  and the edit prompts (priority order); descriptions/classification still
+   *  come from what is measured. Stored on the level (migration 0008). */
+  defectHint?: string;
   /** VF_THEME_GENERATION: the generated scene, exposed while the rest of the pipeline
    *  runs so Play can preview it. In-memory only (not persisted with the job row). */
   previewImage?: string;
@@ -45,8 +50,8 @@ export async function resolveJob(id: string): Promise<Job | null> {
   return job;
 }
 export const jobsToday = () => { const day = new Date().toDateString(); return [...g.__vfJobs!.values()].filter(j => new Date(j.createdAt).toDateString() === day).length; };
-export function createJob(mode: Mode, isMock: boolean, requestedChanges?: number, difficulty: Difficulty = 'medium'): Job {
-  const job: Job = { id: randomUUID(), status: 'queued', stage: 'queued', mode, isMock, requestedChanges, difficulty, createdAt: Date.now(), updatedAt: Date.now() };
+export function createJob(mode: Mode, isMock: boolean, requestedChanges?: number, difficulty: Difficulty = 'medium', defectHint?: string): Job {
+  const job: Job = { id: randomUUID(), status: 'queued', stage: 'queued', mode, isMock, requestedChanges, difficulty, defectHint: defectHint?.trim() ? defectHint.trim() : undefined, createdAt: Date.now(), updatedAt: Date.now() };
   g.__vfJobs!.set(job.id, job);
   void persistJob(job);
   return job;
@@ -134,6 +139,17 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     const mod = await providers.vision.moderate(aiImg); calls.spark++;
     if (!mod.ok) throw new Error(`moderation rejected: ${mod.reason}`);
 
+    // QC defectHint: the SAME text moderation as themes (moderateTheme), run
+    // before any planning/editing spend — a request the theme moderation
+    // would reject fails the job here instead of reaching the planner.
+    if (job.defectHint) {
+      if (!providers.vision.moderateTheme) throw new Error('defect hint moderation is not available on this provider (moderateTheme missing)');
+      setStage('moderating requested defects');
+      const hintMod = await providers.vision.moderateTheme(job.defectHint); calls.spark++;
+      if (!hintMod.ok) throw new Error(`the requested defects were rejected by moderation (${hintMod.reason}) — rephrase them and try again`);
+      console.info(`[generate ${job.id}] defect hint accepted: "${job.defectHint}" — the planner maps it to allowed defect types in priority order`);
+    }
+
     const differences: Difference[] = [];
     // Measured mask per accepted difference id (one-pass AND crop paths), so the
     // final minimum-separation merge below can union masks across paths too.
@@ -209,7 +225,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       // Ask for MORE candidates than needed (count + 5, priority-ordered, with the variety
       // quota in the planner prompt): the executor walks the list and stops at `count`
       // achieved — discarded candidates no longer sink the whole level.
-      const planned = await providers.vision.plan(aiImg, regions, job.mode, count + 5, difficulty); calls.spark++;
+      const planned = await providers.vision.plan(aiImg, regions, job.mode, count + 5, difficulty, job.defectHint); calls.spark++;
       if (!planned.length) throw new Error('planner returned no changes');
       // Hard rule (GAME mode only): remove/replace/geometric transforms on a FRAGMENT make
       // objects look broken, so downgrade those to a color change. "add object" stays: it puts
@@ -351,10 +367,11 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     };
     const runOnePassPass = async (passBase: string, want: number, label: string): Promise<string | null> => {
       if (!providers.imageEdit.editFullImage || want <= 0) return null;
+      const hintSentence = job.mode === 'qc' && job.defectHint ? ` The inspector asked for these defects, in priority order: ${job.defectHint}.` : '';
       const prompt = job.mode === 'qc'
         ? difficulty === 'easy'
-          ? `Add exactly ${want} realistic manufacturing defects to this part (scratch, dent, crack, corrosion spot, missing screw or component, misalignment). Each defect must be a large, clearly visible defect covering a significant part of the surface, not a small mark. Keep everything else pixel-identical.`
-          : `Add exactly ${want} realistic manufacturing defects to this part (scratch, dent, crack, corrosion spot, missing screw or component, misalignment). Each defect small and localized, physically plausible for this material. Keep everything else pixel-identical.`
+          ? `Add exactly ${want} realistic manufacturing defects to this part (scratch, dent, crack, corrosion spot, missing screw or component, misalignment). Each defect must be a large, clearly visible defect covering a significant part of the surface, not a small mark. Keep everything else pixel-identical.${hintSentence}`
+          : `Add exactly ${want} realistic manufacturing defects to this part (scratch, dent, crack, corrosion spot, missing screw or component, misalignment). Each defect small and localized, physically plausible for this material. Keep everything else pixel-identical.${hintSentence}`
         : label === 'pass1'
         ? `Make exactly ${want} minimal, realistic differences for a spot-the-difference game (for example: remove a small part of an object, add a small detail to an object, add a small object in an empty area). To get variety, vary the kind of change: add a small detail, remove a small part, add a small object, change one color, swap one element. Spread the differences across different areas of the image, never two changes close to each other. Keep everything else pixel-identical: same framing, scale, colors and lighting.`
         : `Make exactly ${want} additional minimal, realistic differences for a spot-the-difference game, in places that do not already contain a difference. To get variety, vary the kind of change: add a small detail, remove a small part, add a small object, change one color, swap one element. Spread the differences across different areas of the image, never two changes close to each other. Keep everything else pixel-identical: same framing, scale, colors and lighting.`;
@@ -692,9 +709,12 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       setStage(`editing ${position}/${total} · ${differences.length}/${count} done`);
       const budget: MuseBudget = { calls: 0 };
       // QC easy: the edit itself asks for LARGE defects (same phrase as the planner).
-      const editPrompt = job.mode === 'qc' && difficulty === 'easy'
+      // QC defectHint: the edit prompt also carries the inspector's request, so
+      // the painted defect is the one that was asked for (the planner already
+      // mapped this candidate to its closest allowed type).
+      const editPrompt = (job.mode === 'qc' && difficulty === 'easy'
         ? `${ch.editPrompt} Make it a large, clearly visible defect covering a significant part of the surface, not a small mark.`
-        : ch.editPrompt;
+        : ch.editPrompt) + (job.mode === 'qc' && job.defectHint ? ` The inspector asked for these defects, in priority order: ${job.defectHint}.` : '');
       const isColor = /colou?r/i.test(ch.type);
       const localKind = job.mode === 'game' ? LOCAL_KIND(ch.type) : null;
       let candidate: Candidate | null = null;
@@ -785,7 +805,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
         const missing = count - differences.length;
         console.info(`[generate ${job.id}] crop candidates exhausted at ${differences.length}/${count} — replacement plan: 1 Spark call for ${missing + 2} candidates over ${freeRegions.length} free region(s)`);
         try {
-          const extra = await providers.vision.plan(aiImg, freeRegions, job.mode, missing + 2, difficulty); calls.spark++;
+          const extra = await providers.vision.plan(aiImg, freeRegions, job.mode, missing + 2, difficulty, job.defectHint); calls.spark++;
           const freeIds = new Set(freeRegions.map(r => r.id));
           // Same hard rule as the initial plan: remove/replace/geometric transforms
           // on a FRAGMENT make objects look broken (game mode) — downgrade to color.
@@ -978,7 +998,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
 
     logSummary(differences);
 
-    const levelId = saveImageLevel({ differences, original: img.dataUrl, modified: current, width, height, isMock: providers.segmentation.isMock, mode: job.mode, jobId: job.id, theme, revisedPrompt, notice, difficulty });
+    const levelId = saveImageLevel({ differences, original: img.dataUrl, modified: current, width, height, isMock: providers.segmentation.isMock, mode: job.mode, jobId: job.id, theme, revisedPrompt, notice, difficulty, defectHint: job.defectHint });
     job.levelId = levelId;
     job.status = 'done'; setStage('done');
 

@@ -56,6 +56,9 @@ export interface PersistLevelArgs {
   theme?: string; revisedPrompt?: string;
   /** The job's difficulty (QC: the inspector level). Needs migration 0007. */
   difficulty?: Difficulty;
+  /** QC: the inspector's optional free-text defect request ("What defects should
+   *  appear?", max 300 chars). Needs migration 0008. */
+  defectHint?: string;
 }
 
 /** Upload both images to Storage, insert image/level/difference rows. Returns nothing —
@@ -81,13 +84,17 @@ export async function persistImageLevel(levelId: string, args: PersistLevelArgs)
       id: levelId, job_id: args.jobId ?? null, original_image_id: origRow.id, modified_image_id: modRow.id,
       mode: args.mode, is_mock: args.isMock, published: true,
     };
-    // The generated Database types predate migration 0003 (theme/revised_prompt)
-    // and 0007 (difficulty): assert the pre-0003 row shape — the extra properties
-    // still travel at runtime, and an older database errors the insert so we retry
-    // narrower below (widest first: theme + difficulty, then difficulty, then base).
+    // The generated Database types predate migration 0003 (theme/revised_prompt),
+    // 0007 (difficulty) and 0008 (defect_hint): assert the pre-0003 row shape — the
+    // extra properties still travel at runtime, and an older database errors the
+    // insert so we retry narrower below (widest first: theme + defect_hint, then
+    // theme + difficulty, then difficulty, then base).
     const diffRow = { ...levelRow, difficulty: args.difficulty ?? null } as typeof levelRow;
     const themedRow = { ...diffRow, theme: args.theme, revised_prompt: args.revisedPrompt ?? null } as typeof levelRow;
-    let e3 = (await sb.from('visualforge_levels').insert(args.theme ? themedRow : diffRow)).error;
+    const hintRow = { ...themedRow, defect_hint: args.defectHint ?? null } as typeof levelRow;
+    let e3 = (await sb.from('visualforge_levels').insert(args.theme || args.defectHint ? hintRow : diffRow)).error;
+    if (e3 && args.defectHint) // pre-0008 database without the defect_hint column — persist without it
+      e3 = (await sb.from('visualforge_levels').insert(args.theme ? themedRow : diffRow)).error;
     if (e3 && args.theme) // pre-0003 database without theme columns — persist without them
       e3 = (await sb.from('visualforge_levels').insert(diffRow)).error;
     if (e3) // pre-0007 database without the difficulty column — persist without it
@@ -224,6 +231,8 @@ export async function loadLevelPayload(levelId: string) {
       theme: (level as { theme?: string | null }).theme ?? undefined, revisedPrompt: (level as { revised_prompt?: string | null }).revised_prompt ?? undefined,
       // Level difficulty (migration 0007): absent on pre-0007 rows.
       difficulty: rawDifficulty === 'easy' || rawDifficulty === 'medium' || rawDifficulty === 'hard' ? rawDifficulty : undefined,
+      // QC defect hint (migration 0008): absent on pre-0008 rows.
+      defectHint: (level as { defect_hint?: string | null }).defect_hint ?? undefined,
     };
   } catch (e) { console.error('[db] loadLevelPayload failed:', e); return null; }
 }
@@ -244,7 +253,7 @@ export async function countJobsToday(): Promise<number | null> {
 }
 
 export interface GalleryLevel {
-  levelId: string; original: string; total: number; mode: Mode; isMock: boolean; theme?: string; difficulty?: Difficulty;
+  levelId: string; original: string; total: number; mode: Mode; isMock: boolean; theme?: string; difficulty?: Difficulty; defectHint?: string;
 }
 
 /** The level gallery: the most recent PUBLISHED levels (newest first), with the
@@ -255,10 +264,19 @@ export async function listPublishedLevels(limit = 12, mode?: Mode): Promise<Gall
   const sb = getServiceClient(); if (!sb) return [];
   try {
     let query = sb.from('visualforge_levels')
-      .select('id, mode, is_mock, theme, difficulty, original_image_id, created_at')
+      .select('id, mode, is_mock, theme, difficulty, defect_hint, original_image_id, created_at')
       .eq('published', true).order('created_at', { ascending: false }).limit(limit);
     if (mode) query = query.eq('mode', mode);
     let { data: levels, error } = await query;
+    if (error) { // pre-0008 database without the defect_hint column — retry without it
+      let retry = sb.from('visualforge_levels')
+        .select('id, mode, is_mock, theme, difficulty, original_image_id, created_at')
+        .eq('published', true).order('created_at', { ascending: false }).limit(limit);
+      if (mode) retry = retry.eq('mode', mode);
+      const retried = await retry;
+      error = retried.error;
+      levels = retried.data as typeof levels; // narrower rows: no defect_hint column yet
+    }
     if (error) { // pre-0007 database without the difficulty column — retry without it
       let retry = sb.from('visualforge_levels')
         .select('id, mode, is_mock, theme, original_image_id, created_at')
@@ -281,6 +299,7 @@ export async function listPublishedLevels(limit = 12, mode?: Mode): Promise<Gall
         total: count ?? 0, mode: l.mode as Mode, isMock: Boolean(l.is_mock),
         theme: (l as { theme?: string | null }).theme ?? undefined,
         difficulty: (l as { difficulty?: Difficulty | null }).difficulty ?? undefined,
+        defectHint: (l as { defect_hint?: string | null }).defect_hint ?? undefined,
       });
     }
     return out;

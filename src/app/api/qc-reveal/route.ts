@@ -20,6 +20,10 @@ export async function GET(req: Request) {
     levelId,
     // The level's difficulty is its inspector level ("Inspector level: Easy").
     difficulty: payload.difficulty ?? null,
+    // The inspector's optional free-text request (migration 0008), shown as
+    // "Requested: …" — it steered planning only; the defect descriptions
+    // below still come from what was measured and classified.
+    defectHint: payload.defectHint ?? null,
     differences: diffs.map(d => ({
       id: d.id,
       type: d.classifiedType ?? d.type,
