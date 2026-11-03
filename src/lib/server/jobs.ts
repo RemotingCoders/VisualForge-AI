@@ -7,7 +7,7 @@ import { normalizeImage, imageInfo, cropDataUrl, expandBox, expandMask, diffMask
 import { saveImageLevel } from '../serverStore';
 import { ThemeRejectedError } from '../engine/providers';
 import { persistJob, loadJob, persistDifferenceHints } from './db';
-import { spendCapConfig, spendTotalUsd } from './spend';
+import { spendCapConfig, spendTotalUsd, modelTokenTotals } from './spend';
 
 export type JobStatus = 'queued' | 'running' | 'done' | 'failed';
 /** Size criteria are AREA-based, not side-based: a SAM box is a WHOLE object if it occupies
@@ -16,12 +16,16 @@ export type JobStatus = 'queued' | 'running' | 'done' | 'failed';
  *  expansion² ≈ 8% x 1.69 ≈ 13.5%, rounded up) or max-size changes die by construction. */
 export const MAX_REGION_AREA_FRACTION = 0.08;
 export const MAX_MEASURED_AREA_FRACTION = 0.15;
-/** QC inspector-level visibility floor: the minimum MEASURED defect area as a
- *  fraction of the image, by job difficulty. Easy/medium defects below the floor
- *  are discarded and replaced by the next candidate; hard has no floor
- *  (component-scale defects are the point). The game keeps its own one-pass
- *  floors (VISIBILITY_FLOOR / ABSOLUTE_FLOOR in runOnePassPass). */
-export const QC_AREA_FLOOR: Record<Difficulty, number> = { easy: 0.0025, medium: 0.0012, hard: 0 };
+/** QC inspector-level visibility floor: the preferred minimum MEASURED defect
+ *  area as a fraction of the image, by job difficulty (easy 0.10%, medium
+ *  0.05%, hard none — component-scale defects are the point). A PRIORITY, not
+ *  a gate (same rule as the game's one-pass floors): below-floor defects are
+ *  HELD and, once every candidate is exhausted, the best held ones deliver
+ *  instead of failing the level. Three consecutive below-floor candidates
+ *  relax the floor one tier for the rest of the job, so a stingy image does
+ *  not burn paid calls. The game keeps its own floors (VISIBILITY_FLOOR /
+ *  ABSOLUTE_FLOOR in runOnePassPass). */
+export const QC_AREA_FLOOR: Record<Difficulty, number> = { easy: 0.0010, medium: 0.0005, hard: 0 };
 export interface Job {
   id: string; status: JobStatus; stage: string; mode: Mode; isMock: boolean;
   error?: string; levelId?: string; requestedChanges?: number; difficulty?: Difficulty; createdAt: number; updatedAt: number;
@@ -63,16 +67,25 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
   const setStage = (s: string) => { flushStage(); stageName = s.replace(/\d+/g, 'n'); job.stage = s; job.updatedAt = Date.now(); console.info(`[generate ${job.id}] stage: ${s}`); void persistJob(job); };
   let modeUsed = job.mode === 'qc' ? 'crops (qc)' : 'crops';
   // Spend accounting against the VF_SPEND_CAP_USD window: snapshot the running
-  // total now; the summary (and the failure path) log this job's estimated spend
-  // (the delta — an estimate if jobs overlap), the accumulated total and what
-  // remains of the budget. Every real call already recorded its price via
-  // logAiCall (Spark tokens / SAM image / Muse image — engine/pricing.ts).
+  // total (and the per-model token totals) now; the summary — and the failure
+  // path — log this job's estimated spend (the delta — an estimate if jobs
+  // overlap), the accumulated total, what remains of the budget, and the
+  // tokens consumed per model. Every real call already recorded its price and
+  // usage via logAiCall / metaPost (engine/pricing.ts, server/spend.ts).
   const spendAtStart = await spendTotalUsd();
+  const tokensAtStart = modelTokenTotals();
   const logSpend = async () => {
     try {
       const cfg = spendCapConfig();
       const total = await spendTotalUsd();
       console.info(`[generate ${job.id}] spend: job≈$${Math.max(0, total - spendAtStart).toFixed(4)} · accumulated $${total.toFixed(4)}${cfg ? ` · remaining $${Math.max(0, cfg.capUsd - total).toFixed(2)} of $${cfg.capUsd.toFixed(2)} cap` : ' · no cap set (VF_SPEND_CAP_USD unset)'}`);
+      const endTokens = modelTokenTotals();
+      const tokenDelta = Object.entries(endTokens).map(([m, t]) => {
+        const dIn = t.input - (tokensAtStart[m]?.input ?? 0);
+        const dOut = t.output - (tokensAtStart[m]?.output ?? 0);
+        return dIn > 0 || dOut > 0 ? `${m}: ${dIn} input / ${dOut} output tokens` : '';
+      }).filter(Boolean).join(' · ');
+      console.info(`[generate ${job.id}] tokens: ${tokenDelta || 'no token usage reported this job'}`);
     } catch { /* spend logging must never break a job */ }
   };
   const logSummary = (differences: Difference[]) => {
@@ -126,10 +139,22 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     // final minimum-separation merge below can union masks across paths too.
     const acceptedMasks = new Map<string, boolean[]>();
     const difficulty = job.difficulty ?? 'medium';
-    // QC only: defects measured smaller than this fraction of the image are
-    // discarded and replaced by the next candidate (0 = no floor: hard, and
-    // game mode, which applies its own floors in the one-pass selection).
-    const qcAreaFloor = job.mode === 'qc' ? QC_AREA_FLOOR[difficulty] : 0;
+    // QC only: the inspector-level visibility floor (QC_AREA_FLOOR) as a
+    // PRIORITY — defects measured below it are held as the last resort, not
+    // discarded (0 = no floor: hard, and game mode, which applies its own
+    // floors in the one-pass selection). `let`: three CONSECUTIVE below-floor
+    // candidates relax it one tier for the rest of the job (logged), so a
+    // small-featured part does not burn paid calls chasing the floor.
+    let qcAreaFloor = job.mode === 'qc' ? QC_AREA_FLOOR[difficulty] : 0;
+    let belowFloorStreak = 0;
+    const noteBelowFloorCandidate = (): void => {
+      if (job.mode !== 'qc' || qcAreaFloor <= 0) return;
+      belowFloorStreak++;
+      if (belowFloorStreak < 3) return;
+      qcAreaFloor = qcAreaFloor > QC_AREA_FLOOR.medium ? QC_AREA_FLOOR.medium : 0;
+      belowFloorStreak = 0;
+      console.info(`[generate ${job.id}] QC visibility floor relaxed for this job after 3 consecutive below-floor candidates: ${difficulty} floor → ${qcAreaFloor > 0 ? `${(qcAreaFloor * 100).toFixed(2)}%` : 'no floor'} (already-held candidates stay available as last resort)`);
+    };
 
     // VF_SAM_MASKS: real SAM masks via the official parser. The object's mask as a
     // full-frame boolean[], or null with the reason logged — callers fall back to the
@@ -311,6 +336,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     };
     type KeptMeasured = Measured & { comp: OnePassComponent; description: string; type: string; notes: string };
     const pushKept = (kept: KeptMeasured[], tagOf: (k: KeptMeasured) => string): void => {
+      if (kept.length) belowFloorStreak = 0; // an acceptance breaks the below-floor streak
       for (const k of kept) {
         const id = `onepass-${differences.length + 1}`;
         acceptedMasks.set(id, k.mask);
@@ -326,7 +352,9 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     const runOnePassPass = async (passBase: string, want: number, label: string): Promise<string | null> => {
       if (!providers.imageEdit.editFullImage || want <= 0) return null;
       const prompt = job.mode === 'qc'
-        ? `Add exactly ${want} realistic manufacturing defects to this part (scratch, dent, crack, corrosion spot, missing screw or component, misalignment). Each defect small and localized, physically plausible for this material. Keep everything else pixel-identical.`
+        ? difficulty === 'easy'
+          ? `Add exactly ${want} realistic manufacturing defects to this part (scratch, dent, crack, corrosion spot, missing screw or component, misalignment). Each defect must be a large, clearly visible defect covering a significant part of the surface, not a small mark. Keep everything else pixel-identical.`
+          : `Add exactly ${want} realistic manufacturing defects to this part (scratch, dent, crack, corrosion spot, missing screw or component, misalignment). Each defect small and localized, physically plausible for this material. Keep everything else pixel-identical.`
         : label === 'pass1'
         ? `Make exactly ${want} minimal, realistic differences for a spot-the-difference game (for example: remove a small part of an object, add a small detail to an object, add a small object in an empty area). To get variety, vary the kind of change: add a small detail, remove a small part, add a small object, change one color, swap one element. Spread the differences across different areas of the image, never two changes close to each other. Keep everything else pixel-identical: same framing, scale, colors and lighting.`
         : `Make exactly ${want} additional minimal, realistic differences for a spot-the-difference game, in places that do not already contain a difference. To get variety, vary the kind of change: add a small detail, remove a small part, add a small object, change one color, swap one element. Spread the differences across different areas of the image, never two changes close to each other. Keep everything else pixel-identical: same framing, scale, colors and lighting.`;
@@ -383,12 +411,14 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
           continue;
         }
         if (job.mode === 'qc') {
-          // QC inspector floor (AREA only): a below-floor defect is DISCARDED, not
-          // held as a last-resort filler as in the game — the crop path's next
-          // candidate replaces it. Hard has no floor, so nothing is discarded here.
+          // QC inspector floor (AREA only): a below-floor defect is HELD as the
+          // last resort (into belowFloor, below), not discarded — the next
+          // candidate is tried first, and only an exhausted level falls back
+          // to the best held defects. Hard has no floor, so nothing is held.
           if (areaFraction < qcAreaFloor) {
-            console.info(`[generate ${job.id}] onepass ${label} component discarded BELOW the QC ${difficulty} floor: ${c.area}px bbox (${c.bbox.x},${c.bbox.y}) ${c.bbox.width}x${c.bbox.height} (area ${(areaFraction * 100).toFixed(3)}% vs ${(qcAreaFloor * 100).toFixed(2)}% of the image) — replaced by the next candidate`);
-            continue;
+            console.info(`[generate ${job.id}] onepass ${label} component below the QC ${difficulty} floor: ${c.area}px bbox (${c.bbox.x},${c.bbox.y}) ${c.bbox.width}x${c.bbox.height} (area ${(areaFraction * 100).toFixed(3)}% vs ${(qcAreaFloor * 100).toFixed(2)}% of the image) — held as last resort, next candidate first`);
+            noteBelowFloorCandidate();
+            belowFloor.push(c); continue;
           }
           aboveFloor.push(c); continue;
         }
@@ -401,7 +431,10 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
         if (heldBelowFloor.some(h => overlaps(h.comp.bbox, c.bbox, 4))) continue;
         heldBelowFloor.push({ comp: c, aligned, fromPass: label }); heldNow++;
         const areaFraction = c.area / (width * height);
-        console.info(`[generate ${job.id}] onepass ${label} component held BELOW the ${difficulty} visibility floor as last resort: ${c.area}px amp ${c.meanAmp.toFixed(1)} bbox (${c.bbox.x},${c.bbox.y}) ${c.bbox.width}x${c.bbox.height} (area ${(areaFraction * 100).toFixed(3)}% vs ${(floor.minAreaFraction * 100).toFixed(2)}% · amp ${c.meanAmp.toFixed(1)} vs ${floor.minAmp})`);
+        const floorDesc = job.mode === 'qc'
+          ? `QC ${difficulty} area floor ${(qcAreaFloor * 100).toFixed(2)}%`
+          : `${difficulty} visibility floor ${(floor.minAreaFraction * 100).toFixed(2)}% · amp ${c.meanAmp.toFixed(1)} vs ${floor.minAmp}`;
+        console.info(`[generate ${job.id}] onepass ${label} component held BELOW the floor as last resort: ${c.area}px amp ${c.meanAmp.toFixed(1)} bbox (${c.bbox.x},${c.bbox.y}) ${c.bbox.width}x${c.bbox.height} (area ${(areaFraction * 100).toFixed(3)}% vs ${floorDesc})`);
       }
       // Review up to 2 EXTRA above-floor candidates in the same single batched Spark
       // call, so a rejection or a duplicate can be replaced from this very call —
@@ -434,7 +467,8 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     const applyLastResort = async (): Promise<void> => {
       const missing = count - differences.length;
       if (missing <= 0) return;
-      const pool = heldBelowFloor.filter(h => !differences.some(d => overlaps(d.bbox, h.comp.bbox, 4))).slice(0, missing + 2);
+      // Best held first (highest extraction score), deduped against accepted differences.
+      const pool = heldBelowFloor.filter(h => !differences.some(d => overlaps(d.bbox, h.comp.bbox, 4))).sort((a, b) => b.comp.score - a.comp.score).slice(0, missing + 2);
       if (!pool.length) { console.info(`[generate ${job.id}] last resort: no held below-floor components available — level stays at ${differences.length}/${count}`); return; }
       setStage('one-pass: last-resort below-floor components');
       console.info(`[generate ${job.id}] last resort: trying ${pool.length} held below-floor component(s) for the missing ${missing} (crop path, replacement plan and completion pass already exhausted)`);
@@ -490,15 +524,23 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
     // verified locally with ΔE + mask, never via Spark.)
     type Candidate = { next: string; mask: boolean[]; bbox: NonNullable<ReturnType<typeof maskToBBox>>; local: boolean; notes: string };
     const measuredOk = (bbox: Candidate['bbox']) => bbox.width * bbox.height <= width * height * MAX_MEASURED_AREA_FRACTION;
-    // QC inspector-level floor: a defect whose MEASURED mask area is below the
-    // difficulty floor (easy 0.25% / medium 0.12% of the image; hard: none) is
-    // discarded — runList simply moves on to the next candidate.
-    const belowQcFloor = (changeId: string, cand: Candidate): boolean => {
-      if (qcAreaFloor <= 0) return false;
-      const areaPx = cand.mask.reduce((a, v) => a + (v ? 1 : 0), 0);
-      if (areaPx >= qcAreaFloor * width * height) return false;
-      console.info(`[generate ${job.id}] change ${changeId} discarded: measured defect ${areaPx}px (area ${(areaPx / (width * height) * 100).toFixed(3)}% of the image) is below the QC ${difficulty} floor (${(qcAreaFloor * 100).toFixed(2)}%) — replaced by the next candidate`);
-      return true;
+    // QC inspector-level floor (easy 0.10% / medium 0.05% of the image; hard:
+    // none) — a PRIORITY, not a gate: a defect whose MEASURED mask area is
+    // below the floor is HELD (best = largest measured first) while runList
+    // moves on to the next candidate; held defects are the last resort at the
+    // bottom of this function, so an exhausted level still delivers instead of
+    // failing with "no change survived". Three consecutive below-floor
+    // candidates relax the floor one tier for the job (noteBelowFloorCandidate).
+    type HeldQcCandidate = { ch: PlannedChange; cand: Candidate; areaPx: number; notes: string };
+    const heldQcCandidates: HeldQcCandidate[] = [];
+    const qcDefectAreaPx = (cand: Candidate): number => cand.mask.reduce((a, v) => a + (v ? 1 : 0), 0);
+    const isBelowQcFloor = (cand: Candidate): boolean => qcAreaFloor > 0 && qcDefectAreaPx(cand) < qcAreaFloor * width * height;
+    const holdBelowQcFloor = (changeId: string, ch: PlannedChange, cand: Candidate, notes = ''): void => {
+      const areaPx = qcDefectAreaPx(cand);
+      const floorAtHold = qcAreaFloor; // noteBelowFloorCandidate may relax it — log the floor the defect actually missed
+      heldQcCandidates.push({ ch, cand, areaPx, notes });
+      noteBelowFloorCandidate();
+      console.info(`[generate ${job.id}] change ${changeId} held: measured defect ${areaPx}px (area ${(areaPx / (width * height) * 100).toFixed(3)}% of the image) is below the QC ${difficulty} floor (${(floorAtHold * 100).toFixed(2)}%) — next candidate first, held defects are the last resort`);
     };
 
     // Max 2 Muse calls per change (initial edit + one verifier-driven re-edit); when the
@@ -616,6 +658,21 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       return { next, mask, bbox, local: true, notes: `local deterministic ${detail}: ${changedPixels}px changed (no Spark call)` };
     };
 
+    // Spark verification of ONE candidate IN ISOLATION: the image as it is right
+    // now (`current`) vs the candidate, BOTH cropped to the context box around
+    // the anchor. Comparing the original against the accumulated image made the
+    // verifier reject changes for "differences outside the region" that were
+    // earlier, already-accepted changes. Used by the executor AND by the QC
+    // last resort below (held candidates never verified when first tried).
+    const verifyCandidate = async (ch: PlannedChange, anchorBox: BBox, cand: Candidate): Promise<{ ok: boolean; notes: string }> => {
+      const contextBox = squareContextBox(anchorBox, width, height);
+      const rel = { x: cand.bbox.x - contextBox.x, y: cand.bbox.y - contextBox.y, width: cand.bbox.width, height: cand.bbox.height };
+      const { cropDataUrl: beforeCrop } = await cropDataUrl(current, contextBox);
+      const { cropDataUrl: afterCrop } = await cropDataUrl(cand.next, contextBox);
+      const verdict = await providers.vision.verify(await providerImage(beforeCrop), await providerImage(afterCrop), ch, rel); calls.spark++;
+      return verdict;
+    };
+
     // Executes ONE planned candidate end-to-end (edit -> measure -> verify -> accept).
     // Used by the initial plan AND by the replacement plan below.
     const executeCandidate = async (ch: (typeof plan)[number], position: number, total: number): Promise<void> => {
@@ -634,6 +691,10 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       } else if (differences.some(d => overlaps(d.bbox, region.bbox, 4))) { console.info(`[generate ${job.id}] change ${ch.id} discarded: region overlaps an already-accepted difference`); return; }
       setStage(`editing ${position}/${total} · ${differences.length}/${count} done`);
       const budget: MuseBudget = { calls: 0 };
+      // QC easy: the edit itself asks for LARGE defects (same phrase as the planner).
+      const editPrompt = job.mode === 'qc' && difficulty === 'easy'
+        ? `${ch.editPrompt} Make it a large, clearly visible defect covering a significant part of the surface, not a small mark.`
+        : ch.editPrompt;
       const isColor = /colou?r/i.test(ch.type);
       const localKind = job.mode === 'game' ? LOCAL_KIND(ch.type) : null;
       let candidate: Candidate | null = null;
@@ -641,7 +702,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       else if (localKind) candidate = await applyLocalTransform(current, ch, region, localKind);
       // Muse is reserved for remove / replace / add / QC defects, plus color changes the
       // deterministic recolor could not do. Local geometric transforms get no Muse fallback.
-      if (!candidate && !localKind) candidate = await applyMuse(current, ch, region, ch.editPrompt, budget, anchorBox);
+      if (!candidate && !localKind) candidate = await applyMuse(current, ch, region, editPrompt, budget, anchorBox);
       if (!candidate) { console.info(`[generate ${job.id}] change ${ch.id} discarded: no aligned, measurable edit (next candidate)`); return; }
       // Typed alias for the accepted candidate (TS loses the null narrowing on the
       // `let` across awaits); the verifier re-edit below may still swap it once.
@@ -650,24 +711,16 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
       // accepted one either — same measured-box rule, 8px margin.
       if (job.mode === 'qc' && differences.some(d => overlaps(d.bbox, finalCandidate.bbox, 8))) { console.info(`[generate ${job.id}] change ${ch.id} discarded: measured defect overlaps an already-accepted defect (8px margin)`); return; }
       // QC inspector-level floor on the MEASURED defect, before spending a Spark
-      // verify call: below-floor defects are replaced by the next candidate.
-      if (job.mode === 'qc' && belowQcFloor(ch.id, finalCandidate)) return;
+      // verify call: a below-floor defect is HELD (last resort) and the next
+      // candidate is tried first.
+      if (job.mode === 'qc' && isBelowQcFloor(finalCandidate)) { holdBelowQcFloor(ch.id, ch, finalCandidate); return; }
 
       let notes = finalCandidate.notes;
       if (!finalCandidate.local) {
         setStage(`verifying ${position}/${total} · ${differences.length}/${count} done`);
-        // Verify the change IN ISOLATION: the image as it was JUST BEFORE this change
-        // (current) vs the candidate, BOTH cropped to the context box. Comparing the
-        // original against the accumulated image made the verifier reject changes for
-        // "differences outside the region" that were earlier, already-accepted changes.
-        const verifyChange = async (cand: Candidate): Promise<{ ok: boolean; notes: string }> => {
-          const contextBox = squareContextBox(anchorBox, width, height);
-          const rel = { x: cand.bbox.x - contextBox.x, y: cand.bbox.y - contextBox.y, width: cand.bbox.width, height: cand.bbox.height };
-          const { cropDataUrl: beforeCrop } = await cropDataUrl(current, contextBox);
-          const { cropDataUrl: afterCrop } = await cropDataUrl(cand.next, contextBox);
-          const verdict = await providers.vision.verify(await providerImage(beforeCrop), await providerImage(afterCrop), ch, rel); calls.spark++;
-          return verdict;
-        };
+        // Verify the change IN ISOLATION against the image as it was JUST BEFORE
+        // this change (see verifyCandidate above).
+        const verifyChange = (cand: Candidate) => verifyCandidate(ch, anchorBox, cand);
         let verdict = await verifyChange(finalCandidate);
         if (!verdict.ok) {
           // E: re-edit ONCE within the same Muse budget (never re-ask the verifier the
@@ -680,7 +733,8 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
           if (!verdict.ok) { console.info(`[generate ${job.id}] change ${ch.id} discarded after re-edit: ${verdict.notes}`); return; }
         }
         // A verifier-driven re-edit may have shrunk the defect under the QC floor.
-        if (job.mode === 'qc' && belowQcFloor(ch.id, finalCandidate)) return;
+        // It already passed verification, so it is held WITH its verdict notes.
+        if (job.mode === 'qc' && isBelowQcFloor(finalCandidate)) { holdBelowQcFloor(ch.id, ch, finalCandidate, verdict.notes); return; }
         notes = verdict.notes;
       }
       differences.push({
@@ -692,6 +746,7 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
         verification_status: 'verified', verifier_notes: notes,
       });
       acceptedMasks.set(ch.id, finalCandidate.mask);
+      belowFloorStreak = 0; // an acceptance breaks the below-floor streak
       current = finalCandidate.next;
     };
     // A candidate whose edit throws must not abort the whole list — discard it and
@@ -750,6 +805,51 @@ export async function runGeneration(job: Job, input: { imageDataUrl?: string; th
         }
       }
       if (differences.length < count) console.info(`[generate ${job.id}] crop top-up ends at ${differences.length}/${count} requested changes`);
+    }
+
+    // ============ QC LAST RESORT: held below-floor crop candidates ============
+    // Only once every above-floor candidate (initial list + replacement plan)
+    // is exhausted — same rule as the game's held one-pass components. Best
+    // (largest measured area) first. Each candidate was edited onto an EARLIER
+    // state of the image, so its measured pixels are transplanted onto the
+    // CURRENT image and re-measured; candidates never Spark-verified when
+    // first tried (held before the verify call) are verified now, against the
+    // current image. Local deterministic candidates carry their own notes.
+    if (job.mode === 'qc' && differences.length < count && heldQcCandidates.length) {
+      const held = [...heldQcCandidates].sort((a, b) => b.areaPx - a.areaPx);
+      console.info(`[generate ${job.id}] QC last resort: trying ${held.length} held below-floor candidate(s) for the missing ${count - differences.length} (all above-floor candidates exhausted)`);
+      for (const h of held) {
+        if (differences.length >= count) break;
+        const ch = h.ch;
+        if (differences.some(d => d.id === ch.id)) continue;
+        const comp: OnePassComponent = { mask: h.cand.mask, bbox: h.cand.bbox, area: h.areaPx, meanAmp: 0, score: h.areaPx, meanLp: 0, meanNewEdge: 0, meanTex: 0 };
+        const next = await compositeOnePassComponents(current, h.cand.next, [comp]);
+        const mask = await diffMask(current, next, width, height);
+        const bbox = maskToBBox(mask, width, height);
+        if (!bbox) { console.info(`[generate ${job.id}] QC last resort: change ${ch.id} produced no measurable diff after transplant — skipped`); continue; }
+        if (differences.some(d => overlaps(d.bbox, bbox, 8))) { console.info(`[generate ${job.id}] QC last resort: change ${ch.id} would overlap an accepted defect (8px margin) — skipped`); continue; }
+        let notes = h.notes;
+        if (!h.cand.local && !notes) {
+          const region = regions.find(r => r.id === ch.regionId);
+          if (!region) continue;
+          const anchorBox: BBox = ch.targetBox ? clampBox(ch.targetBox, width, height) : region.bbox;
+          const verdict = await verifyCandidate(ch, anchorBox, { next, mask, bbox, local: false, notes: '' });
+          if (!verdict.ok) { console.info(`[generate ${job.id}] QC last resort: change ${ch.id} rejected by verification (${verdict.notes}) — skipped`); continue; }
+          notes = verdict.notes;
+        }
+        differences.push({
+          id: ch.id, type: ch.type, description: ch.description, bbox, bbox_normalized: normalizeBBox(bbox, width, height),
+          segmentation: maskToPolygon(mask, width, height) ?? undefined,
+          area_px: mask.reduce((a, v) => a + (v ? 1 : 0), 0),
+          centroid: maskCentroid(mask, width, height) ?? { x: bbox.x + bbox.width / 2, y: bbox.y + bbox.height / 2 },
+          mask_url: null, severity: ch.severity ?? 'medium',
+          verification_status: 'verified', verifier_notes: notes || h.cand.notes,
+        });
+        acceptedMasks.set(ch.id, mask);
+        belowFloorStreak = 0;
+        current = next;
+        console.info(`[generate ${job.id}] QC last resort delivered held change ${ch.id} (${h.areaPx}px, below the ${difficulty} floor) — now ${differences.length}/${count}`);
+      }
     }
     }; // end cropTopUp
 

@@ -289,11 +289,13 @@ export async function listPublishedLevels(limit = 12, mode?: Mode): Promise<Gall
 
 /** Every real Meta call lands in visualforge_ai_calls with its REAL estimated cost
  *  (src/lib/engine/pricing.ts, verified on dev.meta.ai: Spark per token from the
- *  response usage, SAM per image, Muse Image per returned image). The row feeds
- *  the VF_SPEND_CAP_USD budget sum; recordSpend mirrors it into the in-memory
- *  ledger that stands in when Supabase is not configured. */
+ *  response usage, SAM per image, Muse Image per returned image — edits at the
+ *  dashboard-calibrated $0.50 fallback, the page lists no Muse Image token
+ *  price). The row feeds the VF_SPEND_CAP_USD budget sum; recordSpend mirrors it
+ *  into the in-memory ledger that stands in when Supabase is not configured, with
+ *  the operation so historical edit rows can be repriced at read time (spend.ts). */
 export async function logAiCall(model: string, operation: string, latencyMs: number, isMock = false, estimatedCostUsd = 0): Promise<void> {
-  if (!isMock) recordSpend(estimatedCostUsd);
+  if (!isMock) recordSpend(estimatedCostUsd, Date.now(), operation);
   const sb = getServiceClient(); if (!sb) return;
   try { await sb.from('visualforge_ai_calls').insert({ model, operation, latency_ms: Math.round(latencyMs), is_mock: isMock, estimated_cost_usd: estimatedCostUsd }); }
   catch (e) { console.error('[db] logAiCall failed:', e); }

@@ -8,12 +8,15 @@ import { GET as qcRevealGET } from '../src/app/api/qc-reveal/route';
 import type { Difference, PlannedChange, Providers } from '../src/lib/engine/types';
 
 // QC difficulty = inspector level (fake providers only — no real calls):
-//  - easy/medium discard defects whose MEASURED area is below the floor
-//    (0.25% / 0.12% of the image) and the next candidate replaces them;
-//  - hard has no floor (component-scale defects are accepted);
-//  - the difficulty reaches the QC planner, whose prompt (easy/medium) demands
-//    defects clearly visible at normal viewing size on the largest surfaces;
-//  - the difficulty is stored on the level and exposed by the QC reveal.
+//  - the floor is a PRIORITY, not a gate: defects whose MEASURED area is below
+//    it (easy 0.10% / medium 0.05% of the image; hard: none) are HELD and the
+//    next candidate is tried first; once candidates are exhausted, the best
+//    held defects deliver as the last resort instead of failing the level;
+//  - three consecutive below-floor candidates relax the floor one tier for
+//    the rest of the job (logged), so paid calls are not burned on the floor;
+//  - easy asks for LARGE defects in the planner prompt and the edit prompts;
+//  - the difficulty reaches the QC planner, is stored on the level and is
+//    exposed by the QC reveal.
 
 const solidPng = async (w: number, h: number, rgb: [number, number, number]) =>
   bufferToDataUrl(await sharp({ create: { width: w, height: h, channels: 3, background: { r: rgb[0], g: rgb[1], b: rgb[2] } } }).png().toBuffer());
@@ -43,15 +46,16 @@ const paintPatternBlue = async (imageRef: string, region?: { bbox: { x: number; 
 
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
 
-// 200x160 = 32000 px: medium floor = 38.4 measured px, easy floor = 80 px.
-// targetBox 3x3 -> paste ~4x4 (<=16 px, below both floors); 6x6 -> ~8x8 (<=64 px,
-// below easy only); 24x18 -> ~31x23 (hundreds of px, above both floors).
+// 320x240 = 76800 px: medium floor = 38.4 measured px, easy floor = 76.8 px.
+// targetBox 3x3 -> paste ~4x4 (<=16 px, below both floors); 6x6 -> ~8x8
+// (~49-64 px, below easy only); 24x18 -> ~31x23 (hundreds of px, above both).
 const TINY: PlannedChange = { id: 'tiny', regionId: 'part', type: 'scratch', description: 'tiny scratch on the rim', editPrompt: 'add a scratch', targetBox: { x: 20, y: 20, width: 3, height: 3 }, partConcept: 'outer rim' };
 const SMALL: PlannedChange = { id: 'small', regionId: 'part', type: 'scratch', description: 'small scratch on the face', editPrompt: 'add a scratch', targetBox: { x: 20, y: 20, width: 6, height: 6 }, partConcept: 'flat face' };
-const BIG: PlannedChange = { id: 'big', regionId: 'part', type: 'scratch', description: 'long scratch across the flange', editPrompt: 'add a scratch', targetBox: { x: 90, y: 60, width: 24, height: 18 }, partConcept: 'flange face' };
+const BIG: PlannedChange = { id: 'big', regionId: 'part', type: 'scratch', description: 'long scratch across the flange', editPrompt: 'add a scratch', targetBox: { x: 150, y: 110, width: 24, height: 18 }, partConcept: 'flange face' };
+const tinyAt = (id: string, x: number): PlannedChange => ({ id, regionId: 'part', type: 'scratch', description: `tiny scratch ${id}`, editPrompt: 'add a scratch', targetBox: { x, y: 20, width: 3, height: 3 }, partConcept: 'outer rim' });
 
 const cropProviders = (candidates: PlannedChange[], seen: { planDifficulty?: string; verifyCalls: number }): Providers => ({
-  segmentation: { name: 'fake', isMock: true, segment: async () => [{ id: 'part', bbox: { x: 10, y: 10, width: 180, height: 140 } }] },
+  segmentation: { name: 'fake', isMock: true, segment: async () => [{ id: 'part', bbox: { x: 10, y: 10, width: 300, height: 220 } }] },
   vision: {
     name: 'fake', isMock: true,
     moderate: async () => ({ ok: true, reason: 'ok' }),
@@ -63,29 +67,41 @@ const cropProviders = (candidates: PlannedChange[], seen: { planDifficulty?: str
 });
 
 describe('QC area floor constants', () => {
-  it('easy 0.25%, medium 0.12%, hard none', () => {
-    expect(QC_AREA_FLOOR).toEqual({ easy: 0.0025, medium: 0.0012, hard: 0 });
+  it('easy 0.10%, medium 0.05%, hard none', () => {
+    expect(QC_AREA_FLOOR).toEqual({ easy: 0.0010, medium: 0.0005, hard: 0 });
   });
 });
 
 describe('QC inspector floor in candidate selection (fake providers)', () => {
-  it('medium: a below-floor defect is discarded and the next candidate replaces it', async () => {
+  it('medium: a below-floor defect is held back and the next candidate replaces it', async () => {
     const seen = { verifyCalls: 0 } as { planDifficulty?: string; verifyCalls: number };
     const job = createJob('qc', true, 1, 'medium');
-    await runGeneration(job, { imageDataUrl: await solidPng(200, 160, [120, 120, 120]) }, 1, cropProviders([TINY, BIG], seen));
+    await runGeneration(job, { imageDataUrl: await solidPng(320, 240, [120, 120, 120]) }, 1, cropProviders([TINY, BIG], seen));
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     const diffs = getDifferences(job.levelId!)!;
     expect(diffs).toHaveLength(1);
-    expect(diffs[0].description).toBe(BIG.description); // the tiny one never landed
-    expect(seen.verifyCalls).toBe(1); // discarded BEFORE spending a Spark verify call
+    expect(diffs[0].description).toBe(BIG.description); // the held tiny one was NOT used — count was reached without it
+    expect(seen.verifyCalls).toBe(1); // held BEFORE spending a Spark verify call on it
     expect(seen.planDifficulty).toBe('medium'); // difficulty reached the QC planner
     expect(getLevelPayload(job.levelId!)!.difficulty).toBe('medium'); // stored on the level
   });
 
-  it('easy: a medium-sized defect (above the medium floor, below easy) is discarded too', async () => {
+  it('medium last resort: with no above-floor candidate left, the best held defect delivers instead of failing', async () => {
+    const seen = { verifyCalls: 0 } as { planDifficulty?: string; verifyCalls: number };
+    const job = createJob('qc', true, 1, 'medium');
+    await runGeneration(job, { imageDataUrl: await solidPng(320, 240, [120, 120, 120]) }, 1, cropProviders([TINY], seen));
+    expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done'); // NOT "no change survived"
+    const diffs = getDifferences(job.levelId!)!;
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0].description).toBe(TINY.description); // the held defect, delivered last
+    expect(diffs[0].verification_status).toBe('verified'); // verified at last-resort time
+    expect(seen.verifyCalls).toBe(1); // exactly one verify, spent only when the held defect is used
+  });
+
+  it('easy: a medium-sized defect (above the medium floor, below easy) is held back too', async () => {
     const seen = { verifyCalls: 0 } as { planDifficulty?: string; verifyCalls: number };
     const job = createJob('qc', true, 1, 'easy');
-    await runGeneration(job, { imageDataUrl: await solidPng(200, 160, [120, 120, 120]) }, 1, cropProviders([SMALL, BIG], seen));
+    await runGeneration(job, { imageDataUrl: await solidPng(320, 240, [120, 120, 120]) }, 1, cropProviders([SMALL, BIG], seen));
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     const diffs = getDifferences(job.levelId!)!;
     expect(diffs).toHaveLength(1);
@@ -95,10 +111,37 @@ describe('QC inspector floor in candidate selection (fake providers)', () => {
     expect(getLevelPayload(job.levelId!)!.difficulty).toBe('easy');
   });
 
+  it('easy last resort: a lone below-floor defect still delivers the level', async () => {
+    const seen = { verifyCalls: 0 } as { planDifficulty?: string; verifyCalls: number };
+    const job = createJob('qc', true, 1, 'easy');
+    await runGeneration(job, { imageDataUrl: await solidPng(320, 240, [120, 120, 120]) }, 1, cropProviders([SMALL], seen));
+    expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
+    const diffs = getDifferences(job.levelId!)!;
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0].description).toBe(SMALL.description);
+    expect(seen.verifyCalls).toBe(1);
+  });
+
+  it('three consecutive below-floor candidates relax the floor for the rest of the job (logged)', async () => {
+    const seen = { verifyCalls: 0 } as { planDifficulty?: string; verifyCalls: number };
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {});
+    try {
+      const job = createJob('qc', true, 1, 'medium');
+      const candidates = [tinyAt('t1', 20), tinyAt('t2', 60), tinyAt('t3', 100), tinyAt('t4', 140)];
+      await runGeneration(job, { imageDataUrl: await solidPng(320, 240, [120, 120, 120]) }, 1, cropProviders(candidates, seen));
+      expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
+      const diffs = getDifferences(job.levelId!)!;
+      expect(diffs).toHaveLength(1);
+      expect(diffs[0].description).toBe('tiny scratch t4'); // accepted through the relaxed floor, not the last resort
+      expect(seen.verifyCalls).toBe(1); // t1–t3 were held without burning verify calls
+      expect(infoSpy.mock.calls.some(args => String(args[0]).includes('floor relaxed'))).toBe(true);
+    } finally { infoSpy.mockRestore(); }
+  });
+
   it('hard: no floor — a component-scale defect is accepted', async () => {
     const seen = { verifyCalls: 0 } as { planDifficulty?: string; verifyCalls: number };
     const job = createJob('qc', true, 1, 'hard');
-    await runGeneration(job, { imageDataUrl: await solidPng(200, 160, [120, 120, 120]) }, 1, cropProviders([TINY], seen));
+    await runGeneration(job, { imageDataUrl: await solidPng(320, 240, [120, 120, 120]) }, 1, cropProviders([TINY], seen));
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     const diffs = getDifferences(job.levelId!)!;
     expect(diffs).toHaveLength(1);
@@ -109,50 +152,80 @@ describe('QC inspector floor in candidate selection (fake providers)', () => {
 });
 
 describe('QC inspector floor in the one-pass path (fake providers)', () => {
-  it('medium: a below-floor painted defect is never published; the big one is', async () => {
-    const RED: [number, number, number] = [230, 30, 30];
-    const descriptions = ['a long scratch across the flange face', 'a tiny scratch on the rim'];
-    const fake: Providers = {
-      segmentation: { name: 'fake', isMock: true, segment: async () => [] }, // crop prep unused: one-pass is the path under test
-      vision: {
-        name: 'fake', isMock: true,
-        moderate: async () => ({ ok: true, reason: 'ok' }),
-        plan: async () => [],
-        verify: async () => ({ ok: true, notes: 'ok' }),
-        reviewDifferences: async (pairs: { index: number }[]) => pairs.map(p => ({ index: p.index, ok: true, description: descriptions[p.index] ?? descriptions[0], type: 'scratch', notes: 'fake review ok', sameChangeAs: -1 })),
+  const RED: [number, number, number] = [230, 30, 30];
+  const BIG_DESC = 'a long scratch across the flange face';
+  const SMALL_DESC = 'a tiny scratch on the rim edge';
+  // 800x600 = 480000 px: easy QC floor = 480 measured px, absolute speck floor
+  // = 384 px. A painted 17x17 square measures ~420 px (blur halo included) —
+  // between the two, so ONLY the QC inspector floor can hold it. The 40x30
+  // square measures ~1400 px, comfortably above. The fake review keys its
+  // description on the measured bbox width so the two reviews never dedupe.
+  const onePassProviders = (seen: { editPrompt?: string }): Providers => ({
+    segmentation: { name: 'fake', isMock: true, segment: async () => [] }, // crop prep unused: one-pass is the path under test
+    vision: {
+      name: 'fake', isMock: true,
+      moderate: async () => ({ ok: true, reason: 'ok' }),
+      plan: async () => [],
+      verify: async () => ({ ok: true, notes: 'ok' }),
+      reviewDifferences: async (pairs: { index: number; bbox: { width: number } }[]) => pairs.map(p => ({ index: p.index, ok: true, description: p.bbox.width >= 25 ? BIG_DESC : SMALL_DESC, type: 'scratch', notes: 'fake review ok', sameChangeAs: -1 })),
+    },
+    imageEdit: {
+      name: 'fake', isMock: true,
+      editMaskedRegion: paintPatternBlue, generateScene: async () => ({ image: '' }),
+      editFullImage: async (imageRef: string, prompt: string) => {
+        seen.editPrompt = prompt;
+        return paintRects(imageRef, [
+          { x: 40, y: 40, width: 17, height: 17, rgb: RED },
+          { x: 400, y: 300, width: 40, height: 30, rgb: RED },
+        ]);
       },
-      imageEdit: {
-        name: 'fake', isMock: true,
-        editMaskedRegion: paintPatternBlue, generateScene: async () => ({ image: '' }),
-        // 400x320 = 128000 px: medium floor = 154 measured px, absolute speck floor
-        // = 102 px. An 8x8 painted square measures ~125 px (blur halo included) —
-        // between the two, so ONLY the QC inspector floor can discard it. The
-        // 30x20 square measures ~600 px, comfortably above. Distinct descriptions
-        // keep the description dedupe out of the way: the floor must do the work.
-        editFullImage: async (imageRef: string) => paintRects(imageRef, [
-          { x: 30, y: 30, width: 8, height: 8, rgb: RED },
-          { x: 240, y: 180, width: 30, height: 20, rgb: RED },
-        ]),
-      },
-    };
-    const job = createJob('qc', true, 2, 'medium');
-    await runGeneration(job, { imageDataUrl: await solidPng(400, 320, [120, 120, 120]) }, 2, fake);
+    },
+  });
+  const isRed = (data: Buffer, width: number, x: number, y: number) => {
+    const o = (y * width + x) * 3; return data[o] > 200 && data[o + 1] < 80 && data[o + 2] < 80;
+  };
+  // Sample points come from the RETURNED bboxes (alignment compensation can
+  // shift the painted rects by a few dozen px — the bboxes are the truth).
+  const bboxCenterIsRed = (d: Difference, data: Buffer, width: number) =>
+    isRed(data, width, Math.round(d.bbox.x + d.bbox.width / 2), Math.round(d.bbox.y + d.bbox.height / 2));
+  const countRedOutside = (data: Buffer, width: number, height: number, box: Difference['bbox'], margin: number) => {
+    let n = 0;
+    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+      if (x >= box.x - margin && x < box.x + box.width + margin && y >= box.y - margin && y < box.y + box.height + margin) continue;
+      if (isRed(data, width, x, y)) n++;
+    }
+    return n;
+  };
+
+  it('easy, count not reached otherwise: the held below-floor defect delivers as last resort', async () => {
+    const seen: { editPrompt?: string } = {};
+    const job = createJob('qc', true, 2, 'easy');
+    await runGeneration(job, { imageDataUrl: await solidPng(800, 600, [120, 120, 120]) }, 2, onePassProviders(seen));
     expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
     const diffs = getDifferences(job.levelId!)!;
-    expect(diffs).toHaveLength(1); // asked for 2: the below-floor one was discarded, not counted
-    expect(diffs[0].description).toBe(descriptions[0]);
-    expect(diffs[0].bbox.x).toBeLessThanOrEqual(252); // the big square (240..270), ± alignment slack
-    expect(diffs[0].bbox.x + diffs[0].bbox.width).toBeGreaterThanOrEqual(258);
-    // The below-floor defect's pixels never reached the published image:
+    expect(diffs).toHaveLength(2); // the below-floor defect was NOT discarded — it completed the level
+    expect(diffs[0].description).toBe(BIG_DESC); // above-floor first
+    expect(diffs[1].description).toBe(SMALL_DESC); // held one, via the last resort
     const payload = getLevelPayload(job.levelId!)!;
-    expect(payload.difficulty).toBe('medium');
-    expect(payload.notice).toBe('Generated 1 of 2 defects'); // partial QC level — the discard is visible
+    expect(payload.difficulty).toBe('easy');
+    expect(payload.notice).toBeFalsy(); // full count — no partial-level notice
     const { data, width } = await rawPixels(payload.modified);
-    const px = (x: number, y: number) => { const o = (y * width + x) * 3; return [data[o], data[o + 1], data[o + 2]] as const; };
-    const [sr, sg, sb] = px(34, 34); // center of the small painted square
-    expect(sr > 200 && sg < 80 && sb < 80).toBe(false);
-    const [br, bg, bb] = px(255, 190); // center of the big painted square
-    expect(br > 200 && bg < 80 && bb < 80).toBe(true);
+    expect(bboxCenterIsRed(diffs[0], data, width)).toBe(true);
+    expect(bboxCenterIsRed(diffs[1], data, width)).toBe(true); // the held defect's pixels ARE published
+    expect(seen.editPrompt).toContain('a large, clearly visible defect covering a significant part of the surface, not a small mark');
+  });
+
+  it('easy, count reached: the held below-floor defect stays unpublished', async () => {
+    const seen: { editPrompt?: string } = {};
+    const job = createJob('qc', true, 1, 'easy');
+    await runGeneration(job, { imageDataUrl: await solidPng(800, 600, [120, 120, 120]) }, 1, onePassProviders(seen));
+    expect(getJob(job.id)?.status, getJob(job.id)?.error).toBe('done');
+    const diffs = getDifferences(job.levelId!)!;
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0].description).toBe(BIG_DESC);
+    const { data, width, height } = await rawPixels(getLevelPayload(job.levelId!)!.modified);
+    expect(bboxCenterIsRed(diffs[0], data, width)).toBe(true);
+    expect(countRedOutside(data, width, height, diffs[0].bbox, 4)).toBe(0); // held ≠ published when not needed
   });
 });
 
@@ -178,6 +251,13 @@ describe('QC planner prompt rule (fake fetch — no real call)', () => {
     expect(await capturePlanPrompt('qc', 'medium')).toContain(RULE);
     expect(await capturePlanPrompt('qc', 'hard')).not.toContain(RULE);
     expect(await capturePlanPrompt('game', 'easy')).not.toContain(RULE);
+  });
+
+  it('easy asks for large defects, not small marks; medium and hard do not', async () => {
+    const LARGE = 'a large, clearly visible defect covering a significant part of the surface, not a small mark';
+    expect(await capturePlanPrompt('qc', 'easy')).toContain(LARGE);
+    expect(await capturePlanPrompt('qc', 'medium')).not.toContain(LARGE);
+    expect(await capturePlanPrompt('qc', 'hard')).not.toContain(LARGE);
   });
 });
 

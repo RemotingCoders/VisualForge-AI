@@ -4,6 +4,7 @@ import { QC_DEFECT_CATEGORIES } from './types';
 import { META_BASE_URL, META_MODELS, META_ENDPOINTS, metaApiKey, parseSamOutput, parseSseOutputText, type SamObject } from './meta';
 import { sparkCostUsd, museImageCostUsd, SAM_USD_PER_IMAGE, MUSE_IMAGE_USD_PER_IMAGE, type SparkUsage } from './pricing';
 import { logAiCall } from '../server/db';
+import { recordModelTokens } from '../server/spend';
 
 export class MetaNotConfiguredError extends Error {
   constructor(missing: string[]) { super(`Meta provider not configured (missing: ${missing.join(', ')})`); this.name = 'MetaNotConfiguredError'; }
@@ -64,16 +65,25 @@ export async function metaPost(path: string, body: unknown, env: Record<string, 
       }
     }
     // Real prices (pricing.ts, verified on dev.meta.ai): Spark bills per token
-    // from the response usage, Muse Image per returned image — edits included.
-    // Failed calls are not billed, so errors log $0; the caller's flat estimate
-    // is only the fallback for success bodies without usage/data.
+    // from the response usage; Muse Image generations bill per returned image,
+    // while EDITS use the dashboard-calibrated $0.50 fallback (the page lists
+    // no Muse Image token price, so the edit usage — 20k–28k input tokens —
+    // cannot be priced per token, only counted). Failed calls are not billed,
+    // so errors log $0; the caller's flat estimate is only the fallback for
+    // success bodies without usage/data.
     let cost = 0;
     if (res.ok) {
       cost = estimatedCostUsd;
       if (data && typeof data === 'object') {
         if (model === META_MODELS.spark) cost = sparkCostUsd((data as { usage?: SparkUsage }).usage);
-        else cost = museImageCostUsd(data) ?? estimatedCostUsd;
+        else cost = museImageCostUsd(data, path.includes('images/edits')) ?? estimatedCostUsd;
       }
+    }
+    // Per-model token accounting (Spark AND Muse Image carry `usage`): feeds the
+    // per-job token summary each generation logs at the end (spend.ts ledger).
+    if (res.ok && data && typeof data === 'object') {
+      const usage = (data as { usage?: SparkUsage }).usage;
+      if (usage && (usage.input_tokens || usage.output_tokens)) recordModelTokens(model, usage.input_tokens ?? 0, usage.output_tokens ?? 0);
     }
     void logAiCall(model, path, Date.now() - t0, false, cost);
     if (!res.ok) throw new Error(`Meta API ${path} → HTTP ${res.status}: ${(rawText || JSON.stringify(data)).slice(0, 400)}`);
@@ -404,7 +414,7 @@ class MetaProvider implements SegmentationProvider, VisionReasoningProvider, Ima
         ? 'Difficulty HARD: prefer the SMALLEST suitable objects and the subtlest version of each change that is still real and measurable.'
         : 'Difficulty MEDIUM: balance object size and change visibility — noticeable when compared side by side, not obvious at a glance.';
     const rules = mode === 'qc'
-      ? `Change types allowed (QC defects): scratch, crack, dent, missing component, corrosion, misalignment, wrong color, foreign object. Defects must be localized and realistic, not covering the whole part${difficulty === 'hard' ? '' : '; defects must be clearly visible at normal viewing size, on the largest surfaces of the part — prefer the largest parts and surfaces of the piece for every defect'}. ${difficultyRule}`
+      ? `Change types allowed (QC defects): scratch, crack, dent, missing component, corrosion, misalignment, wrong color, foreign object. Defects must be localized and realistic, not covering the whole part${difficulty === 'hard' ? '' : '; defects must be clearly visible at normal viewing size, on the largest surfaces of the part — prefer the largest parts and surfaces of the piece for every defect'}${difficulty === 'easy' ? '. Each defect must be a large, clearly visible defect covering a significant part of the surface, not a small mark' : ''}. ${difficultyRule}`
       : `Change types allowed (game) — ONLY these: "change color", "remove object", "replace object", "add object", "flip", "resize", "rotate", "duplicate". ${difficultyRule} Never use shape deformation or partially transform an object. "change color": same object, same shape, clearly different color (can use ANY region). "remove object": the whole object disappears and the background is filled naturally — ONLY on regions with wholeObject=true. "replace object": the whole object is swapped for a DIFFERENT but similar object of similar size in the same place — ONLY on wholeObject=true. "add object": add ONE small, plausible object similar to the scene inside the region (allowed on any region, in visibly empty space). "flip", "resize", "rotate" and "duplicate" (deterministic local transforms of the whole object) — ONLY on wholeObject=true. VARIETY QUOTA across this ordered candidate list: at most 40% may be "change color"; include at least one "remove object" and at least one "replace object" or "add object" (when a suitable wholeObject region exists). Order candidates by priority: best, most reliable changes first. Each editPrompt must describe the change applied COMPLETELY and cleanly to the entire object — never a half-changed, split or broken-looking result.`;
     const common = ' EVERY editPrompt must be exactly ONE sentence and must explicitly name the object/part using its region label (e.g. "Change the red mug to blue."). Each description must be a short PAST-TENSE statement of the finished change as the player sees it in the modified image (e.g. "The white wolf turned gray", "A red mushroom appeared on the log", "The orange butterfly disappeared") — NEVER an instruction or imperative ("Change the...", "Remove the...", "Add a..."). The player sees ONLY the description, never the editPrompt. For "change color" or "wrong color", set targetColor to one simple color name clearly different from the object\'s current color and make the description/editPrompt use that same color; for all other types set targetColor to "".';
     const placement = mode === 'qc'

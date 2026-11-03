@@ -14,10 +14,20 @@ export const SPARK_USD_PER_1M_TOKENS = { input: 1.25, cachedInput: 0.15, output:
  *  samSegmentConcept call sends exactly ONE image, so this is the per-call price. */
 export const SAM_USD_PER_IMAGE = 0.0025;
 
-/** Muse Image (muse-image-1.0): flat $0.01 per generated image — generations AND
- *  edits (the docs list no separate edit price; an edit call returns generated
- *  images under the same model). Failures/safety-filtered images are not billed. */
+/** Muse Image (muse-image-1.0) GENERATIONS: flat $0.01 per generated image.
+ *  Failures/safety-filtered images are not billed. EDITS are priced separately
+ *  below — the page lists no per-token price for this model at all. */
 export const MUSE_IMAGE_USD_PER_IMAGE = 0.01;
+
+/** Muse Image EDITS: the pricing page (re-verified 2026-11-02) lists NO
+ *  per-token price for Muse Image — only the flat $0.01 per generated image
+ *  above, with edit `usage` returned "for reference" only. But edits return
+ *  20k–28k input tokens and the Meta dashboard shows ≈ $0.50 per edit
+ *  (~$122 over ~50 generated levels), so this constant is EMPIRICAL —
+ *  calibrated against the dashboard, not a published price. Every
+ *  /images/edits call is costed with it, so `estimated_cost_usd` — and the
+ *  VF_SPEND_CAP_USD accumulated total that sums it — reflects real spend. */
+export const MUSE_IMAGE_EDIT_USD_FALLBACK = 0.50;
 
 export interface SparkUsage {
   input_tokens?: number;
@@ -36,9 +46,13 @@ export function sparkCostUsd(usage?: SparkUsage | null): number {
     + output * SPARK_USD_PER_1M_TOKENS.output) / 1_000_000;
 }
 
-/** USD cost of one Muse Image response: $0.01 per returned image. Returns null
- *  when the response carries no image list (caller falls back to its estimate). */
-export function museImageCostUsd(res: unknown): number | null {
+/** USD cost of one Muse Image response: generations $0.01 per returned image;
+ *  edits the dashboard-calibrated $0.50 fallback per returned image (the page
+ *  lists no Muse Image token price, so the edit `usage` cannot be priced
+ *  per token). Returns null when the response carries no image list (caller
+ *  falls back to its estimate). */
+export function museImageCostUsd(res: unknown, isEdit = false): number | null {
   const data = (res as { data?: unknown[] } | null)?.data;
-  return Array.isArray(data) && data.length > 0 ? data.length * MUSE_IMAGE_USD_PER_IMAGE : null;
+  if (!Array.isArray(data) || data.length === 0) return null;
+  return data.length * (isEdit ? MUSE_IMAGE_EDIT_USD_FALLBACK : MUSE_IMAGE_USD_PER_IMAGE);
 }

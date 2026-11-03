@@ -1,11 +1,11 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { sparkCostUsd, museImageCostUsd, SAM_USD_PER_IMAGE, MUSE_IMAGE_USD_PER_IMAGE } from '../src/lib/engine/pricing';
+import { sparkCostUsd, museImageCostUsd, SAM_USD_PER_IMAGE, MUSE_IMAGE_USD_PER_IMAGE, MUSE_IMAGE_EDIT_USD_FALLBACK } from '../src/lib/engine/pricing';
 import { metaPost } from '../src/lib/engine/providers';
 import { META_MODELS } from '../src/lib/engine/meta';
 import { requireMetaAccess, META_ACCESS_MESSAGE } from '../src/lib/server/access';
-import { spendCapConfig, recordSpend, spendTotalUsd, SPEND_CAP_EXHAUSTED_MESSAGE } from '../src/lib/server/spend';
+import { spendCapConfig, recordSpend, spendTotalUsd, modelTokenTotals, SPEND_CAP_EXHAUSTED_MESSAGE } from '../src/lib/server/spend';
 import { POST as generatePOST } from '../src/app/api/generate/route';
 import { POST as aiInspectPOST } from '../src/app/api/ai-inspect/route';
 
@@ -26,17 +26,23 @@ describe('real Meta prices (dev.meta.ai/docs/pricing-rate-limits)', () => {
     expect(sparkCostUsd({})).toBe(0);
   });
 
-  it('SAM is $0.0025 per image and Muse Image $0.01 per returned image', () => {
+  it('SAM is $0.0025 per image; Muse Image $0.01 per GENERATED image, edits the $0.50 dashboard fallback', () => {
     expect(SAM_USD_PER_IMAGE).toBe(0.0025);
     expect(MUSE_IMAGE_USD_PER_IMAGE).toBe(0.01);
     expect(museImageCostUsd({ data: [{ b64_json: 'a' }, { b64_json: 'b' }] })).toBeCloseTo(0.02, 10);
+    // The pricing page lists NO Muse Image token price (only the flat $0.01),
+    // so edits are costed with the empirical fallback calibrated against the
+    // Meta dashboard (~20k–28k input tokens per edit, ~$122 over ~50 levels).
+    expect(MUSE_IMAGE_EDIT_USD_FALLBACK).toBe(0.5);
+    expect(museImageCostUsd({ data: [{ b64_json: 'a' }] }, true)).toBeCloseTo(0.5, 10);
     expect(museImageCostUsd({ data: [] })).toBeNull();
     expect(museImageCostUsd(null)).toBeNull();
   });
 
-  it('metaPost records the REAL cost of a Spark call (from usage) and of a Muse edit (per image)', async () => {
+  it('metaPost records the REAL cost of a Spark call (from usage) and of a Muse edit ($0.50 fallback), plus per-model tokens', async () => {
     const env = { META_REAL_CALLS_ENABLED: 'true', MODEL_API_KEY: 'test-key', VF_NETWORK_RETRY_DELAY_MS: '0' };
     const before = await spendTotalUsd({ VF_SPEND_CAP_USD: '1000' });
+    const tokensBefore = modelTokenTotals();
     const sparkFetch = (async () => ({
       ok: true, status: 200,
       text: async () => JSON.stringify({ output: [], usage: { input_tokens: 1000, output_tokens: 1000 } }),
@@ -44,12 +50,27 @@ describe('real Meta prices (dev.meta.ai/docs/pricing-rate-limits)', () => {
     await metaPost('/responses', { model: META_MODELS.spark }, env, sparkFetch);
     const editFetch = (async () => ({
       ok: true, status: 200,
-      text: async () => JSON.stringify({ data: [{ b64_json: 'x' }] }),
+      // A real edit's usage (spike: 26273 in / 1527 out) — counted as tokens,
+      // but NOT priced per token: the page lists no Muse Image token price.
+      text: async () => JSON.stringify({ data: [{ b64_json: 'x' }], usage: { input_tokens: 26273, output_tokens: 1527 } }),
     })) as unknown as typeof fetch;
     await metaPost('/images/edits', { model: META_MODELS.image }, env, editFetch);
     const after = await spendTotalUsd({ VF_SPEND_CAP_USD: '1000' });
-    // Spark: (1000×1.25 + 1000×4.25)/1M = $0.0055 · Muse edit: 1 image × $0.01
-    expect(after - before).toBeCloseTo(0.0055 + 0.01, 10);
+    // Spark: (1000×1.25 + 1000×4.25)/1M = $0.0055 · Muse edit: $0.50 fallback
+    expect(after - before).toBeCloseTo(0.0055 + 0.5, 10);
+    const tokensAfter = modelTokenTotals();
+    const sparkDelta = { input: (tokensAfter[META_MODELS.spark]?.input ?? 0) - (tokensBefore[META_MODELS.spark]?.input ?? 0), output: (tokensAfter[META_MODELS.spark]?.output ?? 0) - (tokensBefore[META_MODELS.spark]?.output ?? 0) };
+    const imageDelta = { input: (tokensAfter[META_MODELS.image]?.input ?? 0) - (tokensBefore[META_MODELS.image]?.input ?? 0), output: (tokensAfter[META_MODELS.image]?.output ?? 0) - (tokensBefore[META_MODELS.image]?.output ?? 0) };
+    expect(sparkDelta).toEqual({ input: 1000, output: 1000 });
+    expect(imageDelta).toEqual({ input: 26273, output: 1527 });
+  });
+
+  it('the accumulated cap total reprices historical edits logged at $0.01 to the $0.50 fallback', async () => {
+    const before = await spendTotalUsd({ VF_SPEND_CAP_USD: '1000' });
+    recordSpend(0.01, Date.now(), '/images/edits'); // an edit logged BEFORE the pricing fix
+    recordSpend(0.01, Date.now(), '/images/generations'); // a generation stays $0.01
+    const after = await spendTotalUsd({ VF_SPEND_CAP_USD: '1000' });
+    expect(after - before).toBeCloseTo(0.5 + 0.01, 10); // edit repriced, generation untouched
   });
 });
 
